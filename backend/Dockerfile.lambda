@@ -1,0 +1,18 @@
+# Control-plane image for every Lambda (API, arrival, route, finalize, scheduler, migrate). Loan data is processed by Glue.
+FROM public.ecr.aws/lambda/python:3.12
+WORKDIR ${LAMBDA_TASK_ROOT}
+# hadolint ignore=DL3041
+RUN dnf install -y unixODBC && curl -fsSL https://packages.microsoft.com/config/rhel/9/prod.repo -o /etc/yum.repos.d/mssql.repo \
+ && ACCEPT_EULA=Y dnf install -y msodbcsql18 && dnf clean all
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt pyodbc==5.2.0 "psycopg[binary]==3.3.6"
+COPY backend/lbp ${LAMBDA_TASK_ROOT}/lbp
+# the migrate function applies Alembic migrations from the same image
+COPY backend/migrations ${LAMBDA_TASK_ROOT}/migrations
+COPY backend/alembic.ini ${LAMBDA_TASK_ROOT}/
+COPY aws/glue ${LAMBDA_TASK_ROOT}/aws/glue
+COPY aws/stepfunctions ${LAMBDA_TASK_ROOT}/aws/stepfunctions
+COPY aws/lambdas ${LAMBDA_TASK_ROOT}/aws/lambdas
+COPY aws/lambdas/handlers.py ${LAMBDA_TASK_ROOT}/
+ENV LBP_REPO_ROOT=${LAMBDA_TASK_ROOT}
+CMD ["handlers.api"]

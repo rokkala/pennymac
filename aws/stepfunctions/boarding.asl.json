@@ -1,0 +1,112 @@
+{
+  "Comment": "Loan boarding: route -> Glue (standard or Spark, .sync) -> finalize -> notify. Lambdas never touch loan data; Glue reads only the feed's signed, published configuration.",
+  "StartAt": "Route",
+  "States": {
+    "Route": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${route_fn_arn}", "Payload.$": "$" },
+      "OutputPath": "$.Payload",
+      "Retry": [{ "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "Engine"
+    },
+    "Engine": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.engine", "StringEquals": "spark", "Next": "GlueSpark" }],
+      "Default": "GlueStandard"
+    },
+    "GlueStandard": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "${feed_job}", "Arguments": { "--batch_id.$": "$.batch_id", "--mode": "batch" } },
+      "ResultPath": "$.glue",
+      "ResultSelector": { "run_id.$": "$.Id", "state.$": "$.JobRunState", "seconds.$": "$.ExecutionTime" },
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 60, "MaxAttempts": 30, "BackoffRate": 1.2, "MaxDelaySeconds": 300 },
+        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 1, "BackoffRate": 1 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "Finalize"
+    },
+    "GlueSpark": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "${spark_job}", "Arguments": { "--batch_id.$": "$.batch_id" } },
+      "ResultPath": "$.glue",
+      "ResultSelector": { "run_id.$": "$.Id", "state.$": "$.JobRunState", "seconds.$": "$.ExecutionTime" },
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 120, "MaxAttempts": 20, "BackoffRate": 1.2, "MaxDelaySeconds": 600 }
+      ],
+      "Comment": "A failed Spark run resumes on the standard engine from the last checkpoint (rows already loaded are skipped)",
+      "Catch": [{ "ErrorEquals": ["States.TaskFailed"], "ResultPath": "$.spark_error", "Next": "GlueStandard" },
+                { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "Finalize"
+    },
+    "Finalize": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${finalize_fn_arn}", "Payload": { "batch_id.$": "$.batch_id" } },
+      "ResultSelector": { "status.$": "$.Payload.status", "balanced.$": "$.Payload.balanced", "error.$": "$.Payload.error" },
+      "ResultPath": "$.outcome",
+      "Retry": [{ "ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "Outcome"
+    },
+    "Outcome": {
+      "Type": "Choice",
+      "Choices": [
+        { "And": [{ "Variable": "$.outcome.status", "StringEquals": "completed" }, { "Variable": "$.outcome.balanced", "BooleanEquals": true }], "Next": "NotifyCompleted" },
+        { "Variable": "$.outcome.status", "StringEquals": "waiting", "Next": "WaitingForEarlierFile" },
+        { "Variable": "$.outcome.status", "StringEquals": "out_of_order", "Next": "NotifyAttention" },
+        { "Variable": "$.outcome.status", "StringEquals": "blocked", "Next": "NotifyAttention" },
+        { "Variable": "$.outcome.status", "StringEquals": "paused", "Next": "NotifyAttention" }
+      ],
+      "Default": "NotifyFailed"
+    },
+    "WaitingForEarlierFile": {
+      "Type": "Succeed",
+      "Comment": "Held by the vendor's sequencing gate; the earlier file's run starts this one when it completes"
+    },
+    "NotifyCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": { "TopicArn": "${sns_topic_arn}", "Subject": "Loan boarding batch completed",
+        "Message": { "batch_id.$": "$.batch_id", "source_id.$": "$.source_id", "engine.$": "$.engine", "status.$": "$.outcome.status" } },
+      "ResultPath": null,
+      "End": true
+    },
+    "NotifyAttention": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": { "TopicArn": "${sns_topic_arn}", "Subject": "Loan boarding batch needs attention",
+        "Message": { "batch_id.$": "$.batch_id", "source_id.$": "$.source_id", "status.$": "$.outcome.status", "detail.$": "$.outcome.error" } },
+      "ResultPath": null,
+      "End": true
+    },
+    "NotifyFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": { "TopicArn": "${sns_topic_arn}", "Subject": "Loan boarding batch FAILED",
+        "Message": { "batch_id.$": "$.batch_id", "source_id.$": "$.source_id", "status.$": "$.outcome.status", "detail.$": "$.outcome.error" } },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${failed_fn_arn}", "Payload": { "batch_id.$": "$.batch_id", "error.$": "$.error" } },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "Next": "NotifyMarkedFailed"
+    },
+    "NotifyMarkedFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": { "TopicArn": "${sns_topic_arn}", "Subject": "Loan boarding batch FAILED", "Message": { "batch_id.$": "$.batch_id", "error.$": "$.error" } },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "BatchFailed", "Cause": "See the batch in the Import Monitor and the Glue run logs" }
+  }
+}

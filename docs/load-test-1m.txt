@@ -1,0 +1,20 @@
+1M-loan end-to-end load test (2026-11-02)
+
+Environment : 2 vCPU sandbox, PostgreSQL 16 (local), 2 worker processes, 10,000-row micro-batches
+Command     : LBP_DATABASE_URL=postgresql+psycopg://... python scripts/load_test.py --rows 1000000 --workers 2 --micro-batch 10000
+Pipeline    : parse -> schema pre-flight -> map/transform -> 22 rules + SSE schema checks -> duplicate check
+              -> triage (T1 auto-fix, T2-T5 routing) -> typed SSE load -> atomic checkpoint, per micro-batch
+
+Result
+  rows processed          1,000,000
+  boarded into SSE          954,976   (count(*) sse_loans = 954,976)
+  held as exceptions         45,024   (54,453 exception rows; ~6% injected defects)
+  reconciliation           balanced  (source = boarded + held + rejected)
+  elapsed                  345 s     (5 min 45 s)
+  throughput               2,895 loans/s  -> 250M loans / 24h projected (250x the 1M/24h target)
+  database size            2.45 GB
+  audit chain              valid
+
+Interpretation: the platform itself is not the constraint. Production throughput will be set by
+what the SSE intake can absorb; tune map_max_concurrency (Step Functions / Lambda reserved
+concurrency) and LBP_SSE_THROTTLE_RPS during the performance test against real SSE.

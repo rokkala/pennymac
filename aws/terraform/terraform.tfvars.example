@@ -1,0 +1,7 @@
+env                 = "poc"
+region              = "us-west-2"
+image_tag           = "0.1.0"
+ai_provider         = "bedrock"
+glue_feed_concurrency = 20
+alert_email         = "loan-boarding-alerts@example.com"
+# saml_metadata_url = "https://login.microsoftonline.com/<tenant>/federationmetadata/2007-06/federationmetadata.xml"

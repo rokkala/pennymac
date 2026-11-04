@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.sqlite3
+*.db
+
+# Node
+node_modules/
+dist/
+frontend/dist/
+*.local
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+*_override.tf
+# Env / secrets
+.env
+.env.*
+!.env.example
+**/secrets/
+*.pem
+
+# Local data / caches
+sample_data/_generated/
+backend/data/
+backend/.lbp_data/
+*.log
+graphify-out/cache/
+graphify-out/*/
+!graphify-out/graph.json
+!graphify-out/GRAPH_REPORT.md
+!graphify-out/graph.html
+!graphify-out/manifest.json
+!graphify-out/cost.json
+.github/workflows/
