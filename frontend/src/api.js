@@ -1,19 +1,19 @@
 // API client. In demo builds (VITE_DEMO=1) every call is served by the in-browser mock.
 export const DEMO = import.meta.env.VITE_DEMO === "1";
 
-/** Fallback cast until GET /api/personas/cast loads (one Cognito role each). */
+/** Fallback cast until GET /api/personas/cast loads (one Cognito group each). */
 export const FALLBACK_CAST = [
-  { id: "priya.analyst", label: "Priya · Data Analyst", roles: ["analyst"] },
-  { id: "dan.sme", label: "Dan · SME", roles: ["sme"] },
-  { id: "maria.ops", label: "Maria · Boarding Ops", roles: ["ops"] },
-  { id: "lee.reviewer", label: "Lee · Exception Reviewer", roles: ["reviewer"] },
-  { id: "ana.compliance", label: "Ana · Compliance", roles: ["compliance"] },
+  { id: "onboarding", label: "Onboarding", roles: ["onboarding"] },
+  { id: "onboarding.reviewer", label: "Onboarding · Reviewer", roles: ["onboarding_reviewer"] },
+  { id: "monitoring", label: "Monitoring", roles: ["monitoring"] },
+  { id: "monitoring.reviewer", label: "Monitoring · Reviewer", roles: ["monitoring_reviewer"] },
+  { id: "compliance.reviewer", label: "Compliance · Reviewer", roles: ["compliance_reviewer"] },
   { id: "admin", label: "Platform Admin", roles: ["admin"] },
 ];
 /** @deprecated Prefer cast from /api/personas/cast; kept as FALLBACK_CAST alias. */
 export const PERSONAS = FALLBACK_CAST;
 
-let persona = FALLBACK_CAST[3];
+let persona = FALLBACK_CAST[2];
 export let SIGNED_IN = null; // set when Cognito sign-in is active (no persona switching)
 export const setSignedIn = (u) => { SIGNED_IN = u; persona = u; };
 export const setPersona = (p) => { persona = p; };

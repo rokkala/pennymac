@@ -3,7 +3,7 @@ import { api } from "../api.js";
 import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Loading, Modal, Field, PageHeader } from "../ui.jsx";
 
-const ROLE_ORDER = ["admin", "sme", "analyst", "ops", "reviewer", "checker", "compliance"];
+const ROLE_ORDER = ["admin", "onboarding_reviewer", "onboarding", "monitoring_reviewer", "monitoring", "compliance_reviewer", "compliance"];
 
 export default function Personas({ persona, go }) {
   const act = useAction();

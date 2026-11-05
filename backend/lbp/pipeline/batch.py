@@ -286,7 +286,9 @@ def recover_stale(minutes: int = STALE_AFTER_MINUTES) -> list[str]:
 
 def override_preflight(batch_id: str, actor: str, roles: list[str], reason: str) -> None:
     """An SME/Compliance user accepts the drift risk and lets a blocked batch run on the current mapping."""
-    if not set(roles) & {"sme", "compliance", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"onboarding_reviewer", "compliance_reviewer", "admin"}:
         raise ValueError("SME or Compliance role required to override a drift block")
     if not reason:
         raise ValueError("a reason is required")

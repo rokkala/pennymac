@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { can, canCap } from "../roles.js";
+import { can, canCap, expandRoles } from "../roles.js";
 import { PageHeader } from "../ui.jsx";
 import { parseHash } from "../hash.js";
 
@@ -14,7 +14,7 @@ const SETUP = [
     page: "sources",
     youIf: "editVendors",
     ask: "Analyst or SME",
-    rolesCare: ["analyst", "sme", "admin"],
+    rolesCare: ["onboarding", "onboarding_reviewer", "admin"],
   },
   {
     id: "feed",
@@ -24,7 +24,7 @@ const SETUP = [
     page: "sources",
     youIf: "editVendors",
     ask: "Analyst or SME",
-    rolesCare: ["analyst", "sme", "admin"],
+    rolesCare: ["onboarding", "onboarding_reviewer", "admin"],
   },
   {
     id: "mapping",
@@ -35,7 +35,7 @@ const SETUP = [
     youIf: "editMapping",
     youAlt: "approveMapping",
     ask: "Analyst drafts · SME approves",
-    rolesCare: ["analyst", "sme", "admin"],
+    rolesCare: ["onboarding", "onboarding_reviewer", "admin"],
   },
   {
     id: "rules",
@@ -45,7 +45,7 @@ const SETUP = [
     page: "rules",
     youIf: "authorRules",
     ask: "SME / Compliance / Analyst (author)",
-    rolesCare: ["sme", "compliance", "analyst", "admin"],
+    rolesCare: ["onboarding", "onboarding_reviewer", "compliance", "compliance_reviewer", "admin"],
   },
   {
     id: "delivery",
@@ -56,7 +56,7 @@ const SETUP = [
     youIf: "editDelivery",
     youAlt: "approveDelivery",
     ask: "Analyst proposes · SME approves",
-    rolesCare: ["analyst", "sme", "admin"],
+    rolesCare: ["onboarding", "onboarding_reviewer", "admin"],
   },
   {
     id: "publish",
@@ -66,7 +66,7 @@ const SETUP = [
     page: "sources",
     youIf: "publishConfig",
     ask: "SME",
-    rolesCare: ["sme", "admin"],
+    rolesCare: ["onboarding_reviewer", "admin"],
     critical: true,
   },
   {
@@ -78,7 +78,7 @@ const SETUP = [
     youIf: "schedules",
     youAlt: "approveSchedule",
     ask: "Ops schedules · SME/Compliance approves",
-    rolesCare: ["ops", "sme", "compliance", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "compliance_reviewer", "admin"],
   },
   {
     id: "ready",
@@ -88,7 +88,7 @@ const SETUP = [
     page: "imports",
     youIf: "upload",
     ask: "Ops uploads · or wait for arrival/pull",
-    rolesCare: ["ops", "sme", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "admin"],
   },
 ];
 
@@ -101,7 +101,7 @@ const EXECUTION = [
     page: "imports",
     youIf: "upload",
     ask: "Ops (upload) · platform (S3/pull)",
-    rolesCare: ["ops", "sme", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "admin"],
   },
   {
     id: "batch",
@@ -111,7 +111,7 @@ const EXECUTION = [
     page: "imports",
     youIf: "upload",
     ask: "Automatic",
-    rolesCare: ["ops", "sme", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "admin"],
   },
   {
     id: "start",
@@ -121,7 +121,7 @@ const EXECUTION = [
     page: "imports",
     youIf: "resumeBatch",
     ask: "Automatic (Ops/SME can resume if paused)",
-    rolesCare: ["ops", "sme", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "admin"],
     tech: "dispatch → route_batch → lbp-feed or lbp-feed-spark",
   },
   {
@@ -132,7 +132,7 @@ const EXECUTION = [
     page: "exceptions",
     youIf: "workExceptions",
     ask: "Automatic · reviewers handle holds",
-    rolesCare: ["ops", "reviewer", "checker", "compliance", "sme", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "onboarding_reviewer", "admin"],
     tech: "Glue lbp-feed · published config only",
   },
   {
@@ -143,7 +143,7 @@ const EXECUTION = [
     page: "exceptions",
     youIf: "workExceptions",
     ask: "Reviewer → Compliance (checker) by tier",
-    rolesCare: ["reviewer", "checker", "compliance", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"],
   },
   {
     id: "finish",
@@ -153,7 +153,7 @@ const EXECUTION = [
     page: "imports",
     youIf: "pauseBatch",
     ask: "Automatic · Ops watches status",
-    rolesCare: ["ops", "sme", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "admin"],
     tech: "finalize_batch → Outcome → SNS",
   },
   {
@@ -165,13 +165,13 @@ const EXECUTION = [
     youIf: "overridePreflight",
     youAlt: "replay",
     ask: "Ops / SME / Compliance by action",
-    rolesCare: ["ops", "sme", "compliance", "admin"],
+    rolesCare: ["monitoring", "monitoring_reviewer", "onboarding_reviewer", "compliance_reviewer", "admin"],
   },
 ];
 
 function defaultMode(persona) {
-  if (can(persona, "ops") && !can(persona, "sme") && !can(persona, "analyst")) return "execution";
-  if (can(persona, "reviewer") && !can(persona, "sme") && !can(persona, "analyst")) return "execution";
+  if (can(persona, "monitoring") && !can(persona, "onboarding")) return "execution";
+  if (can(persona, "monitoring") && !can(persona, "onboarding")) return "execution";
   return "setup";
 }
 
@@ -182,7 +182,7 @@ function yourMove(step, persona) {
 }
 
 function isYourStep(step, persona) {
-  const roles = persona?.roles || [];
+  const roles = expandRoles(persona?.roles || []);
   if (roles.includes("admin")) return true;
   return (step.rolesCare || []).some((r) => roles.includes(r)) && (canCap(persona, step.youIf) || (step.youAlt && canCap(persona, step.youAlt)));
 }
@@ -329,7 +329,7 @@ export default function HowItWorks({ go, persona }) {
               <span><span className="guide-dot" /> Someone else’s</span>
             </div>
             <p className="faint" style={{ margin: 0, fontSize: ".8rem" }}>
-              Switch persona in the left rail to see how the guide changes for Ops, SME, Reviewer, and Compliance.
+              Switch team in the left rail to see how the guide changes for Onboarding, Monitoring, and Compliance.
             </p>
           </div>
         </aside>

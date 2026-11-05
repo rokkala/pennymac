@@ -56,8 +56,12 @@ from ..store import db
 log = logging.getLogger("lbp.api")
 
 PUBLIC = {("GET", "/api/health"), ("GET", "/api/ready"), ("GET", "/api/config")}
-EDIT_MAPPING = ("analyst", "sme")
-WORK_EXCEPTIONS = ("reviewer", "checker", "compliance")
+# Member roles; *_reviewer principals also carry the member role via expand_roles().
+EDIT_MAPPING = ("onboarding",)
+WORK_EXCEPTIONS = ("monitoring", "compliance")
+ONBOARDING_REVIEW = ("onboarding_reviewer",)
+MONITORING_REVIEW = ("monitoring_reviewer",)
+COMPLIANCE_REVIEW = ("compliance_reviewer",)
 ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/ai-map"): EDIT_MAPPING,
     ("POST", "/api/sources"): EDIT_MAPPING,
@@ -70,75 +74,78 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/mappings/{mapping_id}/fields/{target}/inspect"): EDIT_MAPPING,
     ("POST", "/api/mappings/{mapping_id}/accept-all"): EDIT_MAPPING,
     ("POST", "/api/mappings/{mapping_id}/submit"): EDIT_MAPPING,
-    ("POST", "/api/mappings/{mapping_id}/approve"): ("sme",),
-    ("POST", "/api/upload"): ("ops",),
-    ("POST", "/api/upload/presign"): ("ops",),
-    ("POST", "/api/batches/{batch_id}/pause"): ("ops",),
-    ("POST", "/api/batches/{batch_id}/resume"): ("ops", "sme"),
-    ("POST", "/api/batches/{batch_id}/override-preflight"): ("sme", "compliance"),
+    ("POST", "/api/mappings/{mapping_id}/approve"): ONBOARDING_REVIEW,
+    ("POST", "/api/upload"): ("monitoring",),
+    ("POST", "/api/upload/presign"): ("monitoring",),
+    ("POST", "/api/batches/{batch_id}/pause"): ("monitoring",),
+    ("POST", "/api/batches/{batch_id}/resume"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/batches/{batch_id}/override-preflight"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/remap"): EDIT_MAPPING,
-    ("POST", "/api/batches/{batch_id}/replay"): ("ops", "sme"),
+    ("POST", "/api/batches/{batch_id}/replay"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/exceptions/{exception_id}/resolve"): WORK_EXCEPTIONS,
-    ("POST", "/api/exceptions/{exception_id}/checker"): ("checker", "compliance"),
+    ("POST", "/api/exceptions/{exception_id}/checker"): MONITORING_REVIEW,
     ("POST", "/api/exceptions/{exception_id}/reject"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/escalate"): WORK_EXCEPTIONS,
-    ("POST", "/api/exceptions/{exception_id}/compliance-clear"): ("compliance",),
-    ("POST", "/api/exceptions/{exception_id}/rollback"): ("reviewer", "checker"),
+    ("POST", "/api/exceptions/{exception_id}/compliance-clear"): COMPLIANCE_REVIEW,
+    ("POST", "/api/exceptions/{exception_id}/rollback"): ("monitoring", "monitoring_reviewer"),
     ("POST", "/api/exceptions/{exception_id}/qa"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/ai-suggest"): WORK_EXCEPTIONS,
-    ("POST", "/api/exceptions/bulk-resolve"): ("reviewer", "checker"),
-    ("POST", "/api/rules"): ("sme", "compliance"),
-    ("PUT", "/api/rules/{rule_id}/{version}"): ("sme", "compliance"),
-    ("POST", "/api/rules/{rule_id}/{version}/transition"): ("sme", "compliance"),
-    ("DELETE", "/api/rules/{rule_id}"): ("sme", "compliance"),
-    ("POST", "/api/rules/author"): ("sme", "compliance", "analyst"),
-    ("POST", "/api/rules/compose"): ("sme", "compliance", "analyst"),
-    ("POST", "/api/rules/test"): ("sme", "compliance", "analyst"),
-    ("GET", "/api/rules/fields"): ("sme", "compliance", "analyst", "ops", "reviewer"),
-    ("GET", "/api/rules/shapes"): ("sme", "compliance", "analyst", "ops", "reviewer"),
-    ("GET", "/api/rules/templates"): ("sme", "compliance", "analyst", "ops", "reviewer"),
-    ("POST", "/api/maintenance/rule-templates"): ("sme", "admin"),
-    ("PUT", "/api/maintenance/rule-templates/{template_id}"): ("sme", "admin"),
-    ("POST", "/api/maintenance/rule-templates/{template_id}/hide"): ("sme", "admin"),
-    ("POST", "/api/maintenance/rule-templates/{template_id}/unhide"): ("sme", "admin"),
-    ("DELETE", "/api/maintenance/rule-templates/{template_id}"): ("sme", "admin"),
-    ("PUT", "/api/policy"): ("compliance",),
-    ("POST", "/api/analytics/ask"): ("analyst", "sme", "ops", "reviewer", "checker", "compliance"),
+    ("POST", "/api/exceptions/bulk-resolve"): ("monitoring", "monitoring_reviewer"),
+    ("POST", "/api/rules"): ("onboarding", "compliance_reviewer"),
+    ("PUT", "/api/rules/{rule_id}/{version}"): ("onboarding", "compliance_reviewer"),
+    ("POST", "/api/rules/{rule_id}/{version}/transition"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("DELETE", "/api/rules/{rule_id}"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/rules/author"): EDIT_MAPPING,
+    ("POST", "/api/rules/compose"): EDIT_MAPPING,
+    ("POST", "/api/rules/test"): EDIT_MAPPING,
+    ("GET", "/api/rules/fields"): ("onboarding", "monitoring", "compliance"),
+    ("GET", "/api/rules/shapes"): ("onboarding", "monitoring", "compliance"),
+    ("GET", "/api/rules/templates"): ("onboarding", "monitoring", "compliance"),
+    ("POST", "/api/maintenance/rule-templates"): ("onboarding_reviewer", "admin"),
+    ("PUT", "/api/maintenance/rule-templates/{template_id}"): ("onboarding_reviewer", "admin"),
+    ("POST", "/api/maintenance/rule-templates/{template_id}/hide"): ("onboarding_reviewer", "admin"),
+    ("POST", "/api/maintenance/rule-templates/{template_id}/unhide"): ("onboarding_reviewer", "admin"),
+    ("DELETE", "/api/maintenance/rule-templates/{template_id}"): ("onboarding_reviewer", "admin"),
+    ("PUT", "/api/policy"): COMPLIANCE_REVIEW,
+    ("POST", "/api/analytics/ask"): ("onboarding", "monitoring", "compliance"),
     ("POST", "/api/demo/seed"): ("admin",),
     ("POST", "/api/demo/setup"): ("admin",),
-    ("POST", "/api/admin/retention/purge"): ("compliance",),
+    ("POST", "/api/admin/retention/purge"): COMPLIANCE_REVIEW,
     # vendors
     ("POST", "/api/vendors"): EDIT_MAPPING,
-    ("PUT", "/api/vendors/{vendor_id}"): EDIT_MAPPING + ("compliance",),
-    ("POST", "/api/sources/{source_id}/vendor"): ("sme",),
-    ("POST", "/api/sources/{source_id}/publish"): ("sme",),
+    ("PUT", "/api/vendors/{vendor_id}"): EDIT_MAPPING + COMPLIANCE_REVIEW,
+    ("POST", "/api/sources/{source_id}/vendor"): ONBOARDING_REVIEW,
+    ("POST", "/api/sources/{source_id}/publish"): ONBOARDING_REVIEW,
     # incremental loads, sequencing, delivery scheduler
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
-    ("POST", "/api/sources/{source_id}/delivery/approve"): ("sme",),
-    ("POST", "/api/batches/{batch_id}/skip-gap"): ("ops", "sme"),
-    ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("sme", "compliance"),
-    ("POST", "/api/batches/{batch_id}/discard"): ("ops", "sme"),
-    ("POST", "/api/batches/{batch_id}/snapshot-reviews"): ("sme",),
-    ("POST", "/api/schedules"): ("ops", "sme"),
-    ("PUT", "/api/schedules/{schedule_id}"): ("ops", "sme"),
-    ("POST", "/api/schedules/{schedule_id}/approve"): ("sme", "compliance"),
-    ("POST", "/api/schedules/{schedule_id}/status"): ("ops", "sme"),
-    ("POST", "/api/schedules/{schedule_id}/pull-now"): ("ops", "sme"),
-    ("POST", "/api/deliveries/{delivery_id}/waive"): ("ops", "sme"),
-    ("POST", "/api/scheduler/tick"): ("ops",),
+    ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
+    ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/batches/{batch_id}/discard"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/batches/{batch_id}/snapshot-reviews"): ONBOARDING_REVIEW,
+    ("POST", "/api/schedules"): ("monitoring", "onboarding"),
+    ("PUT", "/api/schedules/{schedule_id}"): ("monitoring", "onboarding"),
+    ("POST", "/api/schedules/{schedule_id}/approve"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/schedules/{schedule_id}/status"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/schedules/{schedule_id}/pull-now"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/deliveries/{delivery_id}/waive"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/scheduler/tick"): ("monitoring",),
     # personas (Cognito-native user admin + screen matrix; matrix writes are admin-only)
     ("PUT", "/api/personas/screens"): ("admin",),
     ("POST", "/api/personas/users"): ("admin",),
     ("PUT", "/api/personas/users/{username}"): ("admin",),
     ("POST", "/api/personas/users/{username}/reset-password"): ("admin",),
+    # any authenticated user (empty need → authorize skips role check)
+    ("POST", "/api/notifications/{notif_id}/read"): (),
+    ("POST", "/api/notifications/read-all"): (),
 }
 READ_RESTRICTED: dict[str, tuple[str, ...]] = {
-    "/api/audit": ("compliance", "sme"),
-    "/api/audit/verify": ("compliance",),
-    "/api/maintenance/artifacts": ("sme", "admin"),
-    "/api/maintenance/artifacts/{artifact_id}": ("sme", "admin"),
-    "/api/maintenance/rule-templates": ("sme", "admin"),
-    "/api/maintenance/rule-templates/{template_id}": ("sme", "admin"),
+    "/api/audit": ("compliance_reviewer", "onboarding_reviewer"),
+    "/api/audit/verify": COMPLIANCE_REVIEW,
+    "/api/maintenance/artifacts": ("onboarding_reviewer", "admin"),
+    "/api/maintenance/artifacts/{artifact_id}": ("onboarding_reviewer", "admin"),
+    "/api/maintenance/rule-templates": ("onboarding_reviewer", "admin"),
+    "/api/maintenance/rule-templates/{template_id}": ("onboarding_reviewer", "admin"),
     "/api/personas/screens": ("admin",),
     "/api/personas/users": ("admin",),
     # /api/personas/me/screens is any authenticated user (not listed → open to all roles)
@@ -796,8 +803,8 @@ def replay(batch_id: str, dry_run: bool = True, user: User = Depends(current_use
     """Re-run held loans through the source's current mapping and rules (dry_run previews the outcome)."""
     from ..pipeline.replay import replay_batch
 
-    if not dry_run and not set(user.roles) & {"ops", "sme", "admin"}:
-        raise HTTPException(403, "Ops or SME role required to replay a batch")
+    if not dry_run and not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
+        raise HTTPException(403, "Monitoring or Onboarding reviewer role required to replay a batch")
     if not dry_run and aws_mode():
         run_id = start_glue(get_settings().glue_feed_job, {"mode": "replay", "batch_id": batch_id, "actor": user.name})
         with db.get_engine().begin() as c:
@@ -1087,8 +1094,8 @@ def schedules_pull(schedule_id: str, user: User = Depends(current_user)):
     from ..scheduling import service as sched
 
     if aws_mode():
-        if not set(user.roles) & {"ops", "sme", "admin"}:
-            raise HTTPException(403, "requires one of: ops, sme")
+        if not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
+            raise HTTPException(403, "requires one of: monitoring, onboarding_reviewer")
         run_id = start_glue(get_settings().glue_pull_job, {"schedule_id": schedule_id})
         with db.get_engine().begin() as c:
             db.audit(c, user.name, "schedule.pull_submitted", "schedule", schedule_id, {"glue_run_id": run_id})
@@ -1623,10 +1630,10 @@ def demo_seed(rows_per_source: int = 2000, user: User = Depends(current_user)):
     results = []
     for key, path in files.items():
         label = samples.SOURCES[key][0]
-        reg = mapping_svc.register_source(label, path, "analyst.demo", f"Synthetic {label} loan tape")
-        mapping_svc.accept_all(reg["mapping_id"], "analyst.demo", 0.0)
-        mapping_svc.submit(reg["mapping_id"], "analyst.demo")
-        mapping_svc.approve(reg["mapping_id"], "sme.demo", ["sme"], True, "Demo approval")
+        reg = mapping_svc.register_source(label, path, "onboarding", f"Synthetic {label} loan tape")
+        mapping_svc.accept_all(reg["mapping_id"], "onboarding", 0.0)
+        mapping_svc.submit(reg["mapping_id"], "onboarding")
+        mapping_svc.approve(reg["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Demo approval")
         bid = pipeline.create_batch(reg["source_id"], path, path.name, user.name)
         results.append(pipeline.run_batch(bid))
     return {"seeded": results}

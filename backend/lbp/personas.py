@@ -36,14 +36,14 @@ SCREENS: dict[str, str] = {
 DEFAULT_ACCESS: dict[str, tuple[str, ...]] = {
     "overview": ROLES,
     "guide": ROLES,
-    "imports": ("ops", "sme", "admin"),
-    "deliveries": ("ops", "sme", "analyst", "admin"),
-    "sources": ("analyst", "sme", "admin"),
-    "exceptions": ("reviewer", "checker", "compliance", "admin"),
-    "rules": ("sme", "compliance", "analyst", "admin"),
-    "analytics": ("analyst", "sme", "ops", "reviewer", "checker", "compliance", "admin"),
-    "governance": ("compliance", "sme", "admin"),
-    "maintenance": ("sme", "admin"),
+    "imports": ("monitoring", "monitoring_reviewer", "admin"),
+    "deliveries": ("monitoring", "monitoring_reviewer", "onboarding", "onboarding_reviewer", "admin"),
+    "sources": ("onboarding", "onboarding_reviewer", "admin"),
+    "exceptions": ("monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"),
+    "rules": ("onboarding", "onboarding_reviewer", "compliance", "compliance_reviewer", "admin"),
+    "analytics": ROLES,
+    "governance": ("compliance", "compliance_reviewer", "onboarding_reviewer", "admin"),
+    "maintenance": ("onboarding_reviewer", "admin"),
     "personas": ("admin",),
 }
 
@@ -51,14 +51,14 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MATRIX_KEY = "screen_matrix"
 _USERS_KEY = "persona_users"
 
-# Demo / local training cast — one Cognito role each; also listed on Personas → Users.
-# Dual-control: Lee (reviewer) makes; Ana (compliance) checks via CAPS.checkerApprove.
+# Demo / local training cast — one Cognito group each; also listed on Personas → Users.
+# Dual-control: mapping approve = onboarding_reviewer ≠ preparer; T4 checker = monitoring_reviewer ≠ maker.
 DEMO_CAST: tuple[dict[str, str], ...] = (
-    {"id": "priya.analyst", "email": "priya.analyst@demo.lbp.local", "label": "Priya · Data Analyst", "role": "analyst"},
-    {"id": "dan.sme", "email": "dan.sme@demo.lbp.local", "label": "Dan · SME", "role": "sme"},
-    {"id": "maria.ops", "email": "maria.ops@demo.lbp.local", "label": "Maria · Boarding Ops", "role": "ops"},
-    {"id": "lee.reviewer", "email": "lee.reviewer@demo.lbp.local", "label": "Lee · Exception Reviewer", "role": "reviewer"},
-    {"id": "ana.compliance", "email": "ana.compliance@demo.lbp.local", "label": "Ana · Compliance", "role": "compliance"},
+    {"id": "onboarding", "email": "onboarding@demo.lbp.local", "label": "Onboarding", "role": "onboarding"},
+    {"id": "onboarding.reviewer", "email": "onboarding.reviewer@demo.lbp.local", "label": "Onboarding · Reviewer", "role": "onboarding_reviewer"},
+    {"id": "monitoring", "email": "monitoring@demo.lbp.local", "label": "Monitoring", "role": "monitoring"},
+    {"id": "monitoring.reviewer", "email": "monitoring.reviewer@demo.lbp.local", "label": "Monitoring · Reviewer", "role": "monitoring_reviewer"},
+    {"id": "compliance.reviewer", "email": "compliance.reviewer@demo.lbp.local", "label": "Compliance · Reviewer", "role": "compliance_reviewer"},
     {"id": "admin", "email": "admin@demo.lbp.local", "label": "Platform Admin", "role": "admin"},
 )
 

@@ -28,6 +28,9 @@ class VendorError(ValueError):
 
 
 def _role(roles, *need):
+    from .security import expand_roles
+
+    roles = expand_roles(roles or [])
     if not set(roles) & set(need + ("admin",)):
         raise VendorError(f"requires one of: {', '.join(need)}")
 
@@ -47,7 +50,7 @@ def _clean(fields: dict) -> dict:
 
 
 def create_vendor(fields: dict, actor: str, roles: list[str]) -> dict:
-    _role(roles, "analyst", "sme")
+    _role(roles, "onboarding", "onboarding_reviewer")
     vals = _clean(fields)
     if not vals.get("name"):
         raise VendorError("vendor name is required")
@@ -73,14 +76,14 @@ def ensure_vendor(name: str, actor: str, vendor_type: str = "other") -> str:
 
 
 def update_vendor(vendor_id: str, fields: dict, actor: str, roles: list[str]) -> dict:
-    _role(roles, "analyst", "sme")
+    _role(roles, "onboarding", "onboarding_reviewer")
     vals = _clean(fields)
     status = fields.get("status")
     if status is not None:
         if status not in STATUSES:
             raise VendorError(f"status must be one of {', '.join(STATUSES)}")
         if status in ("suspended", "offboarded"):
-            _role(roles, "sme", "compliance")
+            _role(roles, "onboarding_reviewer", "compliance_reviewer")
         vals["status"] = status
     if status in ("suspended", "offboarded") and not fields.get("reason"):
         raise VendorError("a reason is required to suspend or offboard a vendor")
@@ -99,7 +102,7 @@ def update_vendor(vendor_id: str, fields: dict, actor: str, roles: list[str]) ->
 
 def move_feed(source_id: str, vendor_id: str, actor: str, roles: list[str], reason: str) -> dict:
     """Re-home a feed under another vendor (e.g. grouping backfilled feeds, or an acquisition)."""
-    _role(roles, "sme")
+    _role(roles, "onboarding_reviewer")
     if not reason:
         raise VendorError("a reason is required")
     with db.get_engine().begin() as c:

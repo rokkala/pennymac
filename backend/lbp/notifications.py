@@ -11,8 +11,8 @@ from .store import db
 
 # Fallback when the Personas directory is empty (mirrors DEMO_CAST one-role users).
 PEER_DIRECTORY = [
-    {"id": "dan.sme", "roles": ["sme"]},
-    {"id": "ana.compliance", "roles": ["compliance"]},
+    {"id": "onboarding.reviewer", "roles": ["onboarding_reviewer"]},
+    {"id": "compliance.reviewer", "roles": ["compliance_reviewer"]},
     {"id": "admin", "roles": ["admin"]},
 ]
 
@@ -27,7 +27,8 @@ def _directory() -> list[dict]:
             uid = u.get("username") or u.get("email") or u.get("id")
             roles = u.get("roles") or ([u["role"]] if u.get("role") else [])
             if uid and roles:
-                out.append({"id": uid, "roles": list(roles)})
+                from .security import expand_roles
+                out.append({"id": uid, "roles": list(expand_roles(roles))})
         if out:
             return out
     except Exception:  # noqa: BLE001 - fall back to demo directory
@@ -35,7 +36,7 @@ def _directory() -> list[dict]:
     return PEER_DIRECTORY
 
 
-def peer_user_ids(*, exclude: str | None = None, roles: tuple[str, ...] = ("sme", "compliance")) -> list[str]:
+def peer_user_ids(*, exclude: str | None = None, roles: tuple[str, ...] = ("onboarding_reviewer", "compliance_reviewer")) -> list[str]:
     """Eligible reviewers in the peer pool (not the author)."""
     ids = []
     for u in _directory():
@@ -130,7 +131,7 @@ def on_rule_transition(body: dict, to: str, actor: str, *, pending: str | None =
 
     if pending:
         # Peer signed off; Compliance still required
-        comps = peer_user_ids(exclude=author, roles=("compliance",))
+        comps = peer_user_ids(exclude=author, roles=("compliance_reviewer", "compliance"))
         notify_many(
             comps,
             "rule.peer_approved",

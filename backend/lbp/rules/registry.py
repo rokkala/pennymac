@@ -233,7 +233,7 @@ class RuleRegistry:
                 raise RuleError("maker-checker: the submitter cannot approve their own submission")
             body["approvals"] = [*body.get("approvals", []), {"actor": actor, "roles": roles, "ts": db.now().isoformat(), "comment": comment}]
             approver_roles = {r for a in body["approvals"] for r in a.get("roles", [])}
-            if body.get("regulatory_tag") and "compliance" not in approver_roles:
+            if body.get("regulatory_tag") and "compliance_reviewer" not in approver_roles and "compliance" not in approver_roles:
                 self.store.put(body, cur)
                 self._audit(actor, "rule.peer_approved", body)
                 out = {**body, "status": cur, "pending": "compliance approval required"}

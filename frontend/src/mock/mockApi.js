@@ -39,11 +39,26 @@ export function createMockApi() {
     if (details[ex.exception_id]) Object.assign(details[ex.exception_id], { status, ...extra });
   };
 
-  const has = (user, ...roles) => user.roles.some((r) => roles.includes(r) || r === "admin");
+  const LEGACY = { analyst: "onboarding", sme: "onboarding_reviewer", ops: "monitoring", reviewer: "monitoring", checker: "monitoring_reviewer" };
+  const REVIEWER_MEMBER = { onboarding_reviewer: "onboarding", monitoring_reviewer: "monitoring", compliance_reviewer: "compliance" };
+  const expandRoles = (roles) => {
+    const out = [];
+    for (const raw of roles || []) {
+      const r = LEGACY[raw] || raw;
+      if (!out.includes(r)) out.push(r);
+      const m = REVIEWER_MEMBER[r];
+      if (m && !out.includes(m)) out.push(m);
+    }
+    return out;
+  };
+  const has = (user, ...roles) => {
+    const rs = expandRoles(user.roles || []);
+    return rs.includes("admin") || roles.some((r) => rs.includes(r));
+  };
   const notifications = []; // in-app review inbox (demo)
   const PEERS = [
-    { id: "dan.sme", roles: ["sme"] },
-    { id: "ana.compliance", roles: ["compliance"] },
+    { id: "onboarding.reviewer", roles: ["onboarding_reviewer"] },
+    { id: "compliance.reviewer", roles: ["compliance_reviewer"] },
     { id: "admin", roles: ["admin"] },
   ];
   const pushNtf = (userId, kind, title, body, entity_id) => {
@@ -52,7 +67,8 @@ export function createMockApi() {
   const notifyPeers = (exclude, kind, title, body, entity_id) => {
     PEERS.forEach((p) => {
       if (p.id === exclude) return;
-      if (p.roles.includes("sme") || p.roles.includes("compliance") || p.roles.includes("admin")) {
+      const rs = expandRoles(p.roles);
+      if (rs.includes("onboarding_reviewer") || rs.includes("compliance_reviewer") || rs.includes("admin")) {
         pushNtf(p.id, kind, title, body, entity_id);
       }
     });
@@ -171,7 +187,7 @@ export function createMockApi() {
     };
   }
 
-  const PERSONA_ROLES = ["analyst", "sme", "ops", "reviewer", "checker", "compliance", "admin"];
+  const PERSONA_ROLES = ["onboarding", "onboarding_reviewer", "monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"];
   const PERSONA_SCREENS = [
     { id: "overview", label: "Overview" }, { id: "guide", label: "How it works" }, { id: "imports", label: "Import Monitor" },
     { id: "deliveries", label: "Vendor Deliveries" }, { id: "sources", label: "Vendors & Mapping" }, { id: "exceptions", label: "Exception Manager" },
@@ -180,18 +196,23 @@ export function createMockApi() {
   ];
   const personaAccess = {
     overview: PERSONA_ROLES, guide: PERSONA_ROLES,
-    imports: ["ops", "sme", "admin"], deliveries: ["ops", "sme", "analyst", "admin"], sources: ["analyst", "sme", "admin"],
-    exceptions: ["reviewer", "checker", "compliance", "admin"], rules: ["sme", "compliance", "analyst", "admin"],
-    analytics: PERSONA_ROLES, governance: ["compliance", "sme", "admin"], maintenance: ["sme", "admin"], personas: ["admin"],
+    imports: ["monitoring", "monitoring_reviewer", "admin"],
+    deliveries: ["monitoring", "monitoring_reviewer", "onboarding", "onboarding_reviewer", "admin"],
+    sources: ["onboarding", "onboarding_reviewer", "admin"],
+    exceptions: ["monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"],
+    rules: ["onboarding", "onboarding_reviewer", "compliance", "compliance_reviewer", "admin"],
+    analytics: PERSONA_ROLES,
+    governance: ["compliance", "compliance_reviewer", "onboarding_reviewer", "admin"],
+    maintenance: ["onboarding_reviewer", "admin"], personas: ["admin"],
   };
   const personaDefaults = Object.fromEntries(PERSONA_ROLES.map((r) => [r, PERSONA_SCREENS.map((x) => x.id).filter((id) => personaAccess[id].includes(r))]));
   const personaMatrix = clone(personaDefaults);
   const DEMO_CAST = [
-    { id: "priya.analyst", email: "priya.analyst@demo.lbp.local", label: "Priya · Data Analyst", role: "analyst" },
-    { id: "dan.sme", email: "dan.sme@demo.lbp.local", label: "Dan · SME", role: "sme" },
-    { id: "maria.ops", email: "maria.ops@demo.lbp.local", label: "Maria · Boarding Ops", role: "ops" },
-    { id: "lee.reviewer", email: "lee.reviewer@demo.lbp.local", label: "Lee · Exception Reviewer", role: "reviewer" },
-    { id: "ana.compliance", email: "ana.compliance@demo.lbp.local", label: "Ana · Compliance", role: "compliance" },
+    { id: "onboarding", email: "onboarding@demo.lbp.local", label: "Onboarding", role: "onboarding" },
+    { id: "onboarding.reviewer", email: "onboarding.reviewer@demo.lbp.local", label: "Onboarding · Reviewer", role: "onboarding_reviewer" },
+    { id: "monitoring", email: "monitoring@demo.lbp.local", label: "Monitoring", role: "monitoring" },
+    { id: "monitoring.reviewer", email: "monitoring.reviewer@demo.lbp.local", label: "Monitoring · Reviewer", role: "monitoring_reviewer" },
+    { id: "compliance.reviewer", email: "compliance.reviewer@demo.lbp.local", label: "Compliance · Reviewer", role: "compliance_reviewer" },
     { id: "admin", email: "admin@demo.lbp.local", label: "Platform Admin", role: "admin" },
   ];
   const personaUsers = DEMO_CAST.map((r) => ({
@@ -205,7 +226,7 @@ export function createMockApi() {
   const screensPayload = () => ({ screens: PERSONA_SCREENS, roles: PERSONA_ROLES, defaults: personaDefaults, matrix: personaMatrix });
   const visibleScreens = (user) => {
     if (has(user, "admin")) return PERSONA_SCREENS.map((x) => x.id);
-    return PERSONA_SCREENS.map((x) => x.id).filter((id) => (user.roles || []).some((r) => (personaMatrix[r] || []).includes(id)));
+    return PERSONA_SCREENS.map((x) => x.id).filter((id) => expandRoles(user.roles).some((r) => (personaMatrix[r] || []).includes(id)));
   };
 
   const routes = [
@@ -214,7 +235,7 @@ export function createMockApi() {
     ["GET", /^\/api\/vendors$/, () => s.vendors],
     ["GET", /^\/api\/vendors\/([^/]+)$/, (m) => s.vendor_details[m[1]] || fail("vendor not found")],
     ["POST", /^\/api\/vendors$/, (m, b, user) => {
-      if (!has(user, "analyst", "sme")) fail("requires one of: analyst, sme");
+      if (!has(user, "onboarding")) fail("requires one of: analyst, sme");
       if (!b.name) fail("vendor name is required");
       if (s.vendors.vendors.some((v) => v.name.toLowerCase() === b.name.toLowerCase())) fail(`a vendor named '${b.name}' already exists`);
       const vid = uid("ven");
@@ -227,16 +248,16 @@ export function createMockApi() {
       return s.vendor_details[vid];
     }],
     ["PUT", /^\/api\/vendors\/([^/]+)$/, (m, b, user) => {
-      if (!has(user, "analyst", "sme", "compliance")) fail("requires one of: analyst, sme, compliance");
+      if (!has(user, "onboarding", "compliance_reviewer")) fail("requires one of: analyst, sme, compliance");
       const d = s.vendor_details[m[1]] || fail("vendor not found");
-      if (b.status && ["suspended", "offboarded"].includes(b.status)) { if (!has(user, "sme", "compliance")) fail("requires one of: sme, compliance"); if (!b.reason) fail("a reason is required to suspend or offboard a vendor"); }
+      if (b.status && ["suspended", "offboarded"].includes(b.status)) { if (!has(user, "onboarding_reviewer", "compliance_reviewer")) fail("requires one of: sme, compliance"); if (!b.reason) fail("a reason is required to suspend or offboard a vendor"); }
       const { reason, ...vals } = b;
       Object.assign(d, vals); const row = s.vendors.vendors.find((x) => x.vendor_id === m[1]); if (row) Object.assign(row, vals);
       log(user.id, b.status ? `vendor.${b.status}` : "vendor.update", "vendor", m[1], { ...vals, reason });
       return d;
     }],
     ["POST", /^\/api\/sources\/([^/]+)\/vendor$/, (m, b, user) => {
-      if (!has(user, "sme")) fail("requires one of: sme");
+      if (!has(user, "onboarding_reviewer")) fail("requires one of: sme");
       if (!b.reason) fail("a reason is required");
       const from = Object.values(s.vendor_details).find((v) => v.feeds.some((f) => f.source_id === m[1])) || fail("feed not found");
       const to = s.vendor_details[b.vendor_id] || fail("vendor not found");
@@ -256,7 +277,7 @@ export function createMockApi() {
       return { now: s.generated_at, deliveries: list };
     }],
     ["POST", /^\/api\/deliveries\/([^/]+)\/waive$/, (m, b, user) => {
-      if (!has(user, "ops", "sme")) fail("requires one of: ops, sme");
+      if (!has(user, "monitoring", "onboarding_reviewer")) fail("requires one of: ops, sme");
       if (!b.reason) fail("a reason is required");
       let hit = null;
       [s.deliveries_board, s.deliveries_hist].forEach((L) => L.deliveries.forEach((d) => {
@@ -269,7 +290,7 @@ export function createMockApi() {
     ["GET", /^\/api\/schedules\/preview$/, (m, b, u, q) => cronPreview(q.get("cron"), q.get("timezone"), q.get("calendar"), q.get("holiday_rule"), +(q.get("n") || 8))],
     ["GET", /^\/api\/schedules$/, (m, b, u, q) => ({ schedules: s.schedules.schedules.filter((x) => !q.get("source_id") || x.source_id === q.get("source_id")) })],
     ["POST", /^\/api\/schedules$/, (m, b, user) => {
-      if (!has(user, "ops", "sme")) fail("requires one of: ops, sme");
+      if (!has(user, "monitoring", "onboarding_reviewer")) fail("requires one of: ops, sme");
       const pv = cronPreview(b.config.cron, b.config.timezone, b.config.calendar, b.config.holiday_rule, 1);
       if (!pv.valid) fail(pv.errors.join("; "));
       const src = s.sources.sources.find((x) => x.source_id === b.source_id) || fail("unknown source");
@@ -280,7 +301,7 @@ export function createMockApi() {
       return x;
     }],
     ["PUT", /^\/api\/schedules\/([^/]+)$/, (m, b, user) => {
-      if (!has(user, "ops", "sme")) fail("requires one of: ops, sme");
+      if (!has(user, "monitoring", "onboarding_reviewer")) fail("requires one of: ops, sme");
       const x = s.schedules.schedules.find((y) => y.schedule_id === m[1]) || fail("schedule not found");
       const pv = cronPreview(b.config.cron, b.config.timezone, b.config.calendar, b.config.holiday_rule, 1);
       if (!pv.valid) fail(pv.errors.join("; "));
@@ -289,7 +310,7 @@ export function createMockApi() {
       return x;
     }],
     ["POST", /^\/api\/schedules\/([^/]+)\/approve$/, (m, b, user) => {
-      if (!has(user, "sme", "compliance")) fail("requires one of: sme, compliance");
+      if (!has(user, "onboarding_reviewer", "compliance_reviewer")) fail("requires one of: sme, compliance");
       const x = s.schedules.schedules.find((y) => y.schedule_id === m[1]) || fail("schedule not found");
       if (!x.proposed) fail("nothing is awaiting approval");
       if (x.proposed_by === user.id) fail("maker-checker: the approver must be a different user from the proposer");
@@ -302,7 +323,7 @@ export function createMockApi() {
       return x;
     }],
     ["POST", /^\/api\/schedules\/([^/]+)\/status$/, (m, b, user) => {
-      if (!has(user, "ops", "sme")) fail("requires one of: ops, sme");
+      if (!has(user, "monitoring", "onboarding_reviewer")) fail("requires one of: ops, sme");
       const x = s.schedules.schedules.find((y) => y.schedule_id === m[1]) || fail("schedule not found");
       if (!x.config) fail("schedule has never been approved");
       x.status = b.status; if (b.status !== "active") x.next_due_local = null;
@@ -310,13 +331,13 @@ export function createMockApi() {
       return x;
     }],
     ["POST", /^\/api\/schedules\/([^/]+)\/pull-now$/, (m, b, user) => {
-      if (!has(user, "ops", "sme")) fail("requires one of: ops, sme");
+      if (!has(user, "monitoring", "onboarding_reviewer")) fail("requires one of: ops, sme");
       return { schedule_id: m[1], fetched: [], batches: [], skipped: [], error: "demo: outbound SFTP/S3 connectors don't run in the browser" };
     }],
     ["POST", /^\/api\/scheduler\/tick$/, () => ({ materialized: 0, late: [], missed: [], pulled: [], batches: [] })],
     ["GET", /^\/api\/sources\/([^/]+)\/config$/, (m) => feedConfig(m[1])],
     ["POST", /^\/api\/sources\/([^/]+)\/publish$/, (m, b, user) => {
-      if (!has(user, "sme")) fail("requires one of: sme");
+      if (!has(user, "onboarding_reviewer")) fail("requires one of: sme");
       const c = feedConfig(m[1]);
       if (!c.current.verified) fail("feed has no approved mapping");
       return publishCfg(m[1], user.id, b.reason || "manual republish");
@@ -324,7 +345,7 @@ export function createMockApi() {
     ["GET", /^\/api\/sources\/([^/]+)\/delivery\/test$/, (m, b, u, q) => filenameTest(m[1], q.get("filename") || "", q.get("draft") === "true")],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery$/, (m) => s.delivery_profiles[m[1]] || { ...clone(Object.values(s.delivery_profiles)[0]), source_id: m[1], delivery: clone(Object.values(s.delivery_profiles)[0].defaults), configured: false, draft: null, proposed_by: null, last_sequence: null }],
     ["PUT", /^\/api\/sources\/([^/]+)\/delivery$/, (m, b, user) => {
-      if (!has(user, "analyst", "sme")) fail("requires one of: analyst, sme");
+      if (!has(user, "onboarding")) fail("requires one of: analyst, sme");
       if (b.load_type === "incremental" && b.action?.mode === "column" && !b.action?.column) fail("action.column is required for mode=column");
       const d = s.delivery_profiles[m[1]] || (s.delivery_profiles[m[1]] = clone(routesGet(`/api/sources/${m[1]}/delivery`)));
       Object.assign(d, { draft: { ...d.delivery, ...b }, proposed_by: user.id });
@@ -333,7 +354,7 @@ export function createMockApi() {
       return { source_id: m[1], delivery_draft: d.draft, proposed_by: user.id };
     }],
     ["POST", /^\/api\/sources\/([^/]+)\/delivery\/approve$/, (m, b, user) => {
-      if (!has(user, "sme")) fail("requires one of: sme");
+      if (!has(user, "onboarding_reviewer")) fail("requires one of: sme");
       const d = s.delivery_profiles[m[1]];
       if (!d?.draft) fail("no delivery profile change is awaiting approval");
       if (d.proposed_by === user.id) fail("maker-checker: the approver must be a different user from the proposer");
@@ -346,7 +367,7 @@ export function createMockApi() {
     }],
     ["GET", /^\/api\/batches\/([^/]+)\/changes$/, (m) => s.batch_changes[m[1]] || { total_applied: 0, by_action: {}, applied: [], held: [] }],
     ["POST", /^\/api\/batches\/([^/]+)\/(skip-gap|apply-out-of-order|discard)$/, (m, b, user) => {
-      const need = m[2] === "apply-out-of-order" ? ["sme", "compliance"] : ["ops", "sme"];
+      const need = m[2] === "apply-out-of-order" ? ["onboarding_reviewer", "compliance_reviewer"] : ["monitoring", "onboarding_reviewer"];
       if (!has(user, ...need)) fail(`requires one of: ${need.join(", ")}`);
       if (!b.reason) fail("a reason is required");
       const d = s.batch_details[m[1]] || fail("batch not found");
@@ -465,8 +486,8 @@ export function createMockApi() {
     ["POST", /^\/api\/mappings\/([^/]+)\/approve$/, (m, b, user) => {
       const mp = s.mappings[m[1]];
       if (mp.status !== "in_review") fail("mapping is not awaiting approval");
-      if (!user.roles.some((r) => ["sme", "admin"].includes(r))) fail("SME role required to approve mappings");
-      if ([mp.created_by, mp.reviewed_by].includes(user.id)) fail("approver must differ from the analyst who prepared the mapping");
+      if (!has(user, "onboarding_reviewer")) fail("Onboarding reviewer role required to approve mappings");
+      if ([mp.created_by, mp.reviewed_by].includes(user.id)) fail("approver must differ from the person who prepared the mapping");
       if (!b.approve) { mp.status = "draft"; log(user.id, "mapping.send_back", "mapping", m[1], { comment: b.comment }); return mp; }
       mp.status = "approved"; mp.approved_by = user.id; mp.approved_at = now(); mp.source.status = "live";
       const src = s.sources.sources.find((x) => x.source_id === mp.source_id);
@@ -501,7 +522,7 @@ export function createMockApi() {
       if (!prev) return { batch_id: m[1], dry_run: true, mapping_version: 1, replayed: 0, now_boarded: 0, still_held: 0, exceptions_before: 0, exceptions_after: 0, by_rule_before: {}, by_rule_after: {},
         message: "Nothing would change: the current mapping produces the same exceptions." };
       if (q.get("dry_run") !== "false") return prev;
-      if (!user.roles.some((r) => ["ops", "sme", "admin"].includes(r))) fail("Ops or SME role required to replay a batch");
+      if (!has(user, "monitoring", "onboarding_reviewer")) fail("Monitoring or Onboarding reviewer role required to replay a batch");
       const done = { ...prev, dry_run: false };
       const hist = { ts: now(), actor: user.id, mapping_version: prev.mapping_version, replayed: prev.replayed, now_boarded: prev.now_boarded, still_held: prev.still_held };
       for (const target of [bd, s.batches.batches.find((x) => x.batch_id === m[1])]) {
@@ -532,7 +553,7 @@ export function createMockApi() {
       log(user.id, "mapping.remap_drift", "mapping", mp.mapping_id, b); return mp;
     }],
     ["POST", /^\/api\/batches\/([^/]+)\/override-preflight$/, (m, b, user) => {
-      if (!user.roles.some((r) => ["sme", "compliance", "admin"].includes(r))) fail("SME or Compliance role required to override a drift block");
+      if (!has(user, "onboarding_reviewer", "compliance_reviewer")) fail("Onboarding or Compliance reviewer role required to override a drift block");
       if (!b.reason) fail("a reason is required");
       const bd = s.batch_details[m[1]]; if (!bd || bd.status !== "blocked") fail("batch is not blocked");
       startSim(m[1], bd, { ...bd.preflight, override: { actor: user.id, reason: b.reason, ts: now() } });
@@ -589,16 +610,16 @@ export function createMockApi() {
       if (act === "checker") {
         if (ex.status !== "pending_checker") fail("exception is not awaiting a checker");
         if (user.id === ex.maker) fail("maker-checker: checker must be a different user from the maker");
-        if (!has("checker", "compliance", "admin")) fail("checker role required");
+        if (!has(user, "monitoring_reviewer")) fail("monitoring reviewer role required");
         if (!b.approve) { setStatus(ex, "open", { checker: user.id }); log(user.id, "exception.checker_reject", "exception", ex.exception_id); return { status: "open" }; }
         setStatus(ex, "resolved", { checker: user.id, resolved_at: now() }); log(user.id, "exception.checker_approve", "exception", ex.exception_id); return { status: "resolved", loan_boarded: true };
       }
       if (act === "reject") {
-        if (ex.tier === "T5" && !has("compliance")) fail("only Compliance can act on T5 exceptions");
+        if (ex.tier === "T5" && !has(user, "compliance_reviewer")) fail("only Compliance can act on T5 exceptions");
         setStatus(ex, "rejected", { maker: user.id }); log(user.id, "loan.reject", "exception", ex.exception_id, { reason: b.reason }); return { status: "rejected" };
       }
       if (act === "compliance-clear") {
-        if (!has("compliance")) fail("Compliance role required");
+        if (!has(user, "compliance_reviewer")) fail("Compliance role required");
         if (!b.reason) fail("an investigation note is required");
         setStatus(ex, "resolved", { checker: user.id, resolved_value: b.value, resolved_at: now() }); log(user.id, "exception.compliance_clear", "exception", ex.exception_id, { note: b.reason }); return { status: "resolved" };
       }
@@ -651,7 +672,7 @@ export function createMockApi() {
     ["POST", /^\/api\/rules\/author$/, (m, b) => s.author_examples[b.text] || demoAuthor(b.text)],
     ["POST", /^\/api\/rules\/test$/, () => ({ valid: true })],
     ["POST", /^\/api\/rules$/, (m, b, user) => {
-      if (!has(user, "sme", "compliance")) fail("requires one of: sme, compliance");
+      if (!has(user, "onboarding_reviewer", "compliance_reviewer")) fail("requires one of: sme, compliance");
       const existing = b.rule_id && s.rule_versions[b.rule_id];
       if (existing) {
         const ver = Math.max(...existing.versions.map((x) => x.version)) + 1;
@@ -669,7 +690,7 @@ export function createMockApi() {
       s.rules.rules.push(body); s.rule_versions[id] = { rule_id: id, versions: [body] }; log(user.id, "rule.draft", "rule", `${id}:v1`); return body;
     }],
     ["PUT", /^\/api\/rules\/([^/]+)\/(\d+)$/, (m, b, user) => {
-      if (!has(user, "sme", "compliance")) fail("requires one of: sme, compliance");
+      if (!has(user, "onboarding_reviewer", "compliance_reviewer")) fail("requires one of: sme, compliance");
       const vs = s.rule_versions[m[1]]?.versions || fail("rule not found");
       const r = vs.find((x) => x.version === +m[2]) || fail("version not found");
       if (r.status !== "draft") fail("only drafts can be edited; create a new version instead");
@@ -677,7 +698,7 @@ export function createMockApi() {
       log(user.id, "rule.edit", "rule", `${m[1]}:v${m[2]}`); return r;
     }],
     ["DELETE", /^\/api\/rules\/([^/]+)$/, (m, b, user, q) => {
-      if (!has(user, "sme", "compliance")) fail("requires one of: sme, compliance");
+      if (!has(user, "onboarding_reviewer", "compliance_reviewer")) fail("requires one of: sme, compliance");
       const rid = m[1];
       const pack = s.rule_versions[rid] || fail("rule not found");
       const wasLive = pack.versions.some((v) => ["active", "canary", "shadow"].includes(v.status));
@@ -699,7 +720,7 @@ export function createMockApi() {
         const submittedBy = [...(r.history || [])].reverse().find((h) => h.to === "in_review")?.actor;
         if (submittedBy && user.id === submittedBy) fail("maker-checker: the submitter cannot approve their own submission");
         r.approvals = [...(r.approvals || []), { actor: user.id, roles: user.roles }];
-        if (r.regulatory_tag && !r.approvals.some((a) => a.roles.includes("compliance"))) {
+        if (r.regulatory_tag && !r.approvals.some((a) => expandRoles(a.roles || []).includes("compliance_reviewer"))) {
           log(user.id, "rule.peer_approved", "rule", `${m[1]}:v${m[2]}`);
           notifyPeers(r.author, "rule.peer_approved", `Compliance review needed: ${r.name || m[1]}`, `${user.id} peer-approved; Compliance still required.`, m[1]);
           if (r.author && r.author !== user.id) pushNtf(r.author, "rule.peer_approved", `Peer approved ${r.name || m[1]} — waiting on Compliance`, "", m[1]);
@@ -724,7 +745,7 @@ export function createMockApi() {
     // ---------------- policy, analytics, audit
     ["GET", /^\/api\/policy$/, () => s.policy],
     ["PUT", /^\/api\/policy$/, (m, b, user) => {
-      if (!user.roles.includes("compliance") && !user.roles.includes("admin")) fail("policy changes require Compliance approval");
+      if (!has(user, "compliance_reviewer")) fail("policy changes require Compliance approval");
       const emergencyOff = JSON.stringify(b.changes) === JSON.stringify({ t1_enabled: false });
       if (b.requested_by === user.id && !emergencyOff) fail("requester and approver must be different users");
       if (b.changes.t1_min_confidence !== undefined && +b.changes.t1_min_confidence < 0.9) fail("t1_min_confidence below 0.90 is not permitted");
@@ -743,11 +764,11 @@ export function createMockApi() {
     }],
     ["GET", /^\/api\/audit/, () => ({ items: audit.slice(0, 200) })],
     ["GET", /^\/api\/maintenance\/artifacts\/([^/]+)$/, (m, b, user) => {
-      if (!has(user, "sme", "admin")) fail("requires one of: sme, admin");
+      if (!has(user, "onboarding_reviewer", "admin")) fail("requires one of: sme, admin");
       try { return getMaintenanceArtifact(m[1]); } catch (e) { fail(e.message); }
     }],
     ["GET", /^\/api\/maintenance\/artifacts$/, (m, b, user) => {
-      if (!has(user, "sme", "admin")) fail("requires one of: sme, admin");
+      if (!has(user, "onboarding_reviewer", "admin")) fail("requires one of: sme, admin");
       return { artifacts: listMaintenanceArtifacts() };
     }],
     ["GET", /^\/api\/personas\/me\/screens$/, (m, b, user) => ({ screens: visibleScreens(user) })],

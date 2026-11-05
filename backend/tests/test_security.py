@@ -35,13 +35,13 @@ def test_role_enforcement_dev_mode(client):
     def h(roles):
         return {"X-User": "u1", "X-Roles": roles}
 
-    assert client.put("/api/policy", json={"changes": {}, "requested_by": "x"}, headers=h("ops")).status_code == 403
-    assert client.post("/api/mappings/m/approve", json={"approve": True}, headers=h("analyst")).status_code == 403
-    assert client.post("/api/exceptions/x/compliance-clear", json={"reason": "r"}, headers=h("reviewer")).status_code == 403
-    assert client.post("/api/rules", json={}, headers=h("reviewer")).status_code == 403
-    assert client.get("/api/audit", headers=h("reviewer")).status_code == 403
-    assert client.get("/api/audit", headers=h("compliance")).status_code == 200
-    assert client.get("/api/exceptions", headers=h("reviewer")).status_code == 200  # reads are open to any role
+    assert client.put("/api/policy", json={"changes": {}, "requested_by": "x"}, headers=h("monitoring")).status_code == 403
+    assert client.post("/api/mappings/m/approve", json={"approve": True}, headers=h("onboarding")).status_code == 403
+    assert client.post("/api/exceptions/x/compliance-clear", json={"reason": "r"}, headers=h("monitoring")).status_code == 403
+    assert client.post("/api/rules", json={}, headers=h("monitoring")).status_code == 403
+    assert client.get("/api/audit", headers=h("monitoring")).status_code == 403
+    assert client.get("/api/audit", headers=h("compliance_reviewer")).status_code == 200
+    assert client.get("/api/exceptions", headers=h("monitoring")).status_code == 200  # reads are open to any role
     r = client.get("/api/health")
     assert r.headers["X-Content-Type-Options"] == "nosniff" and r.headers["X-Request-ID"]
 
@@ -56,7 +56,7 @@ def _token(key, **claims):
     import jwt
 
     base = {"iss": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_TEST", "token_use": "id", "aud": "client123",
-            "email": "ana@pennymac.com", "cognito:groups": ["compliance"], "exp": int(time.time()) + 600}
+            "email": "ana@pennymac.com", "cognito:groups": ["compliance_reviewer"], "exp": int(time.time()) + 600}
     return jwt.encode({**base, **claims}, key, algorithm="RS256", headers={"kid": "k1"})
 
 
@@ -82,8 +82,8 @@ def test_jwt_mode(env, monkeypatch):
         assert client.get("/api/me", headers={"Authorization": f"Bearer {_token(key, exp=int(time.time()) - 5)}"}).status_code == 401
         assert client.get("/api/me", headers={"Authorization": f"Bearer {_token(_rsa())}"}).status_code == 401  # wrong signer
         assert client.get("/api/me", headers={"Authorization": f"Bearer {_token(key, **{'cognito:groups': []})}"}).status_code == 403
-        reviewer = {"Authorization": f"Bearer {_token(key, **{'cognito:groups': ['reviewer']})}"}
-        assert client.put("/api/policy", json={"changes": {}, "requested_by": "x"}, headers=reviewer).status_code == 403
+        monitoring = {"Authorization": f"Bearer {_token(key, **{'cognito:groups': ['monitoring']})}"}
+        assert client.put("/api/policy", json={"changes": {}, "requested_by": "x"}, headers=monitoring).status_code == 403
         assert client.get("/api/health").status_code == 200 and client.get("/api/config").json()["auth"] == "cognito"
 
 
@@ -95,7 +95,7 @@ def test_production_refuses_unsafe_config(env, monkeypatch):
 
 
 def test_upload_validation(client, monkeypatch):
-    h = {"X-User": "a", "X-Roles": "analyst"}
+    h = {"X-User": "a", "X-Roles": "onboarding"}
     r = client.post("/api/sources", data={"name": "x"}, files={"file": ("tape.exe", b"MZ....")}, headers=h)
     assert r.status_code == 415
     r = client.post("/api/sources", data={"name": "x"}, files={"file": ("tape.csv", b"\x7fELF\x00\x00")}, headers=h)

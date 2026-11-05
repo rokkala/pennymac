@@ -1,20 +1,21 @@
 import assert from "node:assert/strict";
-import { can, canCap, CAPS } from "../src/roles.js";
+import { can, canCap, CAPS, expandRoles } from "../src/roles.js";
 
-const lee = { id: "lee.reviewer", roles: ["reviewer"] };
-const maria = { id: "maria.ops", roles: ["ops"] };
+const monitoring = { id: "monitoring", roles: ["monitoring"] };
+const monReview = { id: "monitoring.reviewer", roles: ["monitoring_reviewer"] };
 const admin = { id: "admin", roles: ["admin"] };
 
-assert.equal(canCap(lee, "replay"), false);
-assert.equal(canCap(maria, "replay"), true);
+assert.equal(canCap(monitoring, "replay"), true);
+assert.equal(canCap(monitoring, "upload"), true);
+assert.equal(canCap(monitoring, "checkerApprove"), false);
+assert.equal(canCap(monReview, "checkerApprove"), true);
+assert.equal(canCap(monReview, "upload"), true); // reviewer ⊇ member
 assert.equal(canCap(admin, "replay"), true);
-assert.equal(canCap(lee, "upload"), false);
-assert.equal(canCap(maria, "upload"), true);
-assert.equal(can(lee, "reviewer"), true);
-assert.equal(can(lee, "ops"), false);
-assert.ok(CAPS.replay.includes("ops"));
-assert.equal(canCap(lee, "readMaintenance"), false);
-assert.equal(canCap({ id: "dan.sme", roles: ["sme"] }, "readMaintenance"), true);
-assert.equal(canCap({ id: "ana.compliance", roles: ["compliance"] }, "checkerApprove"), true);
-assert.equal(canCap(admin, "readMaintenance"), true);
+assert.equal(can(monitoring, "monitoring"), true);
+assert.equal(can(monitoring, "onboarding"), false);
+assert.ok(CAPS.replay.includes("monitoring"));
+assert.equal(canCap({ id: "onboarding.reviewer", roles: ["onboarding_reviewer"] }, "readMaintenance"), true);
+assert.equal(canCap({ id: "compliance.reviewer", roles: ["compliance_reviewer"] }, "editPolicy"), true);
+assert.deepEqual(expandRoles(["onboarding_reviewer"]).sort(), ["onboarding", "onboarding_reviewer"].sort());
+assert.deepEqual(expandRoles(["sme"]).sort(), ["onboarding", "onboarding_reviewer"].sort());
 console.log("check-can ok");

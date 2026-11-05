@@ -246,14 +246,17 @@ class ExceptionManager:
         return {"exception_id": exception_id, "status": "resolved", "loan_boarded": boarded}
 
     def checker_decision(self, exception_id: str, actor: str, roles: list[str], approve: bool, comment: str | None = None) -> dict:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
             if ex["status"] != "pending_checker":
                 raise ExceptionActionError("exception is not awaiting a checker")
             if actor == ex["maker"]:
                 raise ExceptionActionError("maker-checker: checker must be a different user from the maker")
-            if not set(roles) & {"checker", "compliance", "admin"}:
-                raise ExceptionActionError("checker role required")
+            if not set(roles) & {"monitoring_reviewer", "admin"}:
+                raise ExceptionActionError("monitoring reviewer role required")
             if not approve:
                 self._set(c, exception_id, status="open", checker=actor)
                 db.audit(c, actor, "exception.checker_reject", "exception", exception_id, {"comment": comment})
@@ -265,9 +268,12 @@ class ExceptionManager:
         return {"exception_id": exception_id, "status": "resolved", "loan_boarded": boarded}
 
     def reject_loan(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
-            if ex["tier"] == "T5" and "compliance" not in roles:
+            if ex["tier"] == "T5" and "compliance_reviewer" not in roles and "admin" not in roles:
                 raise ExceptionActionError("only Compliance can act on T5 exceptions")
             c.execute(db.exceptions.update().where(and_(db.exceptions.c.staging_id == ex["staging_id"],
                                                         db.exceptions.c.status.in_(OPEN_STATES)))
@@ -285,7 +291,10 @@ class ExceptionManager:
 
     def compliance_clear(self, exception_id: str, actor: str, roles: list[str], value, comment: str) -> dict:
         """Compliance has investigated outside EM (e.g. OFAC false positive) and records the outcome."""
-        if "compliance" not in roles:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
+        if "compliance_reviewer" not in roles and "admin" not in roles:
             raise ExceptionActionError("Compliance role required")
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
