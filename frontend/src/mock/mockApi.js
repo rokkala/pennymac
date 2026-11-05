@@ -40,6 +40,23 @@ export function createMockApi() {
   };
 
   const has = (user, ...roles) => user.roles.some((r) => roles.includes(r) || r === "admin");
+  const notifications = []; // in-app review inbox (demo)
+  const PEERS = [
+    { id: "dan.sme", roles: ["sme", "analyst"] },
+    { id: "ana.compliance", roles: ["compliance", "checker"] },
+    { id: "admin", roles: ["admin", "sme", "compliance"] },
+  ];
+  const pushNtf = (userId, kind, title, body, entity_id) => {
+    notifications.unshift({ id: uid("ntf"), user_id: userId, kind, title, body: body || "", entity_type: "rule", entity_id, read_at: null, created_at: now() });
+  };
+  const notifyPeers = (exclude, kind, title, body, entity_id) => {
+    PEERS.forEach((p) => {
+      if (p.id === exclude) return;
+      if (p.roles.includes("sme") || p.roles.includes("compliance") || p.roles.includes("admin")) {
+        pushNtf(p.id, kind, title, body, entity_id);
+      }
+    });
+  };
 
   // Published feed configurations (what Glue runs). Approvals publish a new signed version, as on the server.
   const hex = (n) => Array.from({ length: n }, () => "0123456789abcdef"[Math.floor(Math.random() * 16)]).join("");
@@ -579,8 +596,42 @@ export function createMockApi() {
       if (act === "escalate") { setStatus(ex, "escalated"); log(user.id, "exception.escalate", "exception", ex.exception_id, { reason: b.reason }); return { status: "escalated" }; }
       if (act === "ai-suggest") return { exception_id: ex.exception_id, proposal: ex.proposal, note: "Demo uses the heuristic engine; configure Bedrock for LLM suggestions." };
     }],
+    // ---------------- notifications
+    ["GET", /^\/api\/notifications$/, (m, b, user) => {
+      const items = notifications.filter((n) => n.user_id === user.id);
+      return { notifications: items, unread: items.filter((n) => !n.read_at).length };
+    }],
+    ["POST", /^\/api\/notifications\/read-all$/, (m, b, user) => {
+      let updated = 0;
+      notifications.forEach((n) => { if (n.user_id === user.id && !n.read_at) { n.read_at = now(); updated += 1; } });
+      return { ok: true, updated };
+    }],
+    ["POST", /^\/api\/notifications\/([^/]+)\/read$/, (m, b, user) => {
+      const n = notifications.find((x) => x.id === m[1] && x.user_id === user.id) || fail("notification not found");
+      n.read_at = n.read_at || now();
+      return n;
+    }],
     // ---------------- rules
-    ["GET", /^\/api\/rules$/, () => s.rules],
+    ["GET", /^\/api\/rules$/, (m, b, user, q) => {
+      const queue = q?.get("queue");
+      if (!queue) return s.rules;
+      const all = Object.values(s.rule_versions || {}).flatMap((rv) => rv.versions);
+      let filtered = all;
+      if (queue === "awaiting_review") filtered = all.filter((r) => r.status === "in_review" && r.author !== user.id);
+      else if (queue === "my_drafts") filtered = all.filter((r) => r.status === "draft" && r.author === user.id);
+      const latest = {};
+      filtered.forEach((r) => {
+        const cur = latest[r.rule_id];
+        if (!cur || r.version > cur.version) latest[r.rule_id] = r;
+      });
+      return {
+        rules: Object.values(latest).map((r) => {
+          const vs = s.rule_versions[r.rule_id]?.versions || [r];
+          const listed = s.rules.rules.find((x) => x.rule_id === r.rule_id);
+          return { ...r, exception_count: listed?.exception_count || 0, versions: vs.map((x) => [x.version, x.status]) };
+        }),
+      };
+    }],
     ["GET", /^\/api\/rules\/([^/]+)$/, (m) => s.rule_versions[m[1]] || fail("rule not found")],
     ["POST", /^\/api\/rules\/author$/, (m, b) => s.author_examples[b.text] || demoAuthor(b.text)],
     ["POST", /^\/api\/rules\/test$/, () => ({ valid: true })],
@@ -610,24 +661,49 @@ export function createMockApi() {
       Object.assign(r, Object.fromEntries(Object.entries(b || {}).filter(([k]) => !["rule_id", "version", "status", "approvals", "history"].includes(k))));
       log(user.id, "rule.edit", "rule", `${m[1]}:v${m[2]}`); return r;
     }],
+    ["DELETE", /^\/api\/rules\/([^/]+)$/, (m, b, user, q) => {
+      if (!has(user, "sme", "compliance")) fail("requires one of: sme, compliance");
+      const rid = m[1];
+      const pack = s.rule_versions[rid] || fail("rule not found");
+      const wasLive = pack.versions.some((v) => ["active", "canary", "shadow"].includes(v.status));
+      const n = pack.versions.length;
+      delete s.rule_versions[rid];
+      s.rules.rules = s.rules.rules.filter((x) => x.rule_id !== rid);
+      log(user.id, "rule.delete", "rule", rid, { versions_removed: n, reason: q?.get("reason") });
+      if (wasLive) publishAll(user.id, `rule ${rid} deleted`);
+      return { ok: true, rule_id: rid, versions_removed: n, republished: wasLive };
+    }],
     ["POST", /^\/api\/rules\/([^/]+)\/(\d+)\/transition$/, (m, b, user) => {
       const vs = s.rule_versions[m[1]].versions; const r = vs.find((x) => x.version === +m[2]) || fail("version not found");
       if (!(LIFECYCLE[r.status] || []).includes(b.to)) fail(`cannot move ${m[1]} v${m[2]} from ${r.status} to ${b.to}`);
       if (b.to === "in_review" && !(r.tests || []).length) fail("rule has no test cases; add at least one passing and one failing case");
       if (b.to === "approved") {
-        if (user.id === r.author) fail("maker-checker: the author cannot approve their own rule");
+        const author = r.author || r.owner;
+        if (!author) fail("maker-checker: rule has no author recorded; cannot approve");
+        if (user.id === author) fail("maker-checker: the author cannot approve their own rule");
+        const submittedBy = [...(r.history || [])].reverse().find((h) => h.to === "in_review")?.actor;
+        if (submittedBy && user.id === submittedBy) fail("maker-checker: the submitter cannot approve their own submission");
         r.approvals = [...(r.approvals || []), { actor: user.id, roles: user.roles }];
-        if (r.regulatory_tag && !r.approvals.some((a) => a.roles.includes("compliance"))) { log(user.id, "rule.peer_approved", "rule", `${m[1]}:v${m[2]}`); return { ...r, pending: "compliance approval required" }; }
+        if (r.regulatory_tag && !r.approvals.some((a) => a.roles.includes("compliance"))) {
+          log(user.id, "rule.peer_approved", "rule", `${m[1]}:v${m[2]}`);
+          notifyPeers(r.author, "rule.peer_approved", `Compliance review needed: ${r.name || m[1]}`, `${user.id} peer-approved; Compliance still required.`, m[1]);
+          if (r.author && r.author !== user.id) pushNtf(r.author, "rule.peer_approved", `Peer approved ${r.name || m[1]} — waiting on Compliance`, "", m[1]);
+          return { ...r, pending: "compliance approval required" };
+        }
       }
       if (b.to === "canary") r.canary_pct = b.canary_pct || 5;
       if (b.to === "active") vs.forEach((x) => { if (x !== r && ["active", "canary", "shadow"].includes(x.status)) x.status = "retired"; });
-      r.history = [...(r.history || []), { ts: now(), actor: user.id, from: r.status, to: b.to, comment: b.comment }];
+      const from = r.status;
+      r.history = [...(r.history || []), { ts: now(), actor: user.id, from, to: b.to, comment: b.comment }];
       r.status = b.to;
       const i = s.rules.rules.findIndex((x) => x.rule_id === m[1]);
       const shown = vs.find((x) => x.status === "active") || vs[vs.length - 1];
       s.rules.rules[i] = { ...shown, exception_count: s.rules.rules[i].exception_count, versions: vs.map((x) => [x.version, x.status]) };
       log(user.id, `rule.${b.to}`, "rule", `${m[1]}:v${m[2]}`, { comment: b.comment });
       if (["active", "canary", "shadow", "retired"].includes(b.to)) publishAll(user.id, `rule ${m[1]} v${m[2]} ${b.to}`);
+      if (b.to === "in_review") notifyPeers(r.author, "rule.in_review", `Review requested: ${r.name || m[1]}`, `${user.id} submitted for peer review.`, m[1]);
+      if (b.to === "approved" && r.author && r.author !== user.id) pushNtf(r.author, "rule.approved", `Approved: ${r.name || m[1]}`, `${user.id} approved ${m[1]} v${m[2]}.`, m[1]);
+      if (b.to === "draft" && from === "in_review" && r.author && r.author !== user.id) pushNtf(r.author, "rule.sent_back", `Sent back: ${r.name || m[1]}`, `${user.id} returned the rule to draft.`, m[1]);
       return r;
     }],
     // ---------------- policy, analytics, audit

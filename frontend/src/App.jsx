@@ -28,9 +28,10 @@ const PAGES = [
   { id: "personas", label: "Personas", el: Personas },
 ];
 
-const fromHash = () => {
-  const h = (window.location.hash || "").replace("#", "");
-  return PAGES.some((p) => p.id === h) ? h : "overview";
+const pageIdFromHash = () => {
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  const id = raw.split("?")[0];
+  return PAGES.some((p) => p.id === id) ? id : "overview";
 };
 
 class ErrorBoundary extends React.Component {
@@ -49,19 +50,21 @@ class ErrorBoundary extends React.Component {
 }
 
 export default function App() {
-  const [page, setPage] = useState(fromHash());
+  const [page, setPage] = useState(pageIdFromHash());
   const [persona, setP] = useState(getPersona());
   const [nonce, setNonce] = useState(0);
   const [vendor, setVendor] = useState(getVendorScope());
   const vendors = useApi("/api/vendors", [nonce]);
   const screens = useApi("/api/personas/me/screens", [nonce, persona.id]);
   const { data: summary } = useApi(scoped("/api/exceptions/summary"), [nonce, vendor], { poll: 15000 });
+  const { data: ntf } = useApi("/api/notifications", [nonce, persona.id], { poll: 20000 });
   useEffect(() => { // a stored scope for a vendor that no longer exists falls back to all vendors
     if (vendor && vendors.data && !vendors.data.vendors.some((v) => v.vendor_id === vendor)) { setVendorScope(null); setVendor(null); }
   }, [vendors.data]);
   const pickVendor = (id) => { setVendorScope(id); setVendor(id || null); };
-  useEffect(() => { const h = () => setPage(fromHash()); window.addEventListener("hashchange", h); return () => window.removeEventListener("hashchange", h); }, []);
+  useEffect(() => { const h = () => setPage(pageIdFromHash()); window.addEventListener("hashchange", h); return () => window.removeEventListener("hashchange", h); }, []);
   const openCount = summary ? Object.values(summary.tiers).reduce((a, t) => a + (t.open || 0) + (t.pending_checker || 0) + (t.escalated || 0), 0) : null;
+  const ntfCount = ntf?.unread ?? (ntf?.notifications || []).filter((x) => !x.read_at).length;
   const allowed = screens.data?.screens;
   const navPages = PAGES.filter((p) => {
     if (allowed) return allowed.includes(p.id);
@@ -76,7 +79,7 @@ export default function App() {
     }
   }, [allowed, page]);
   const Page = (PAGES.find((p) => p.id === page) || PAGES[0]).el;
-  const go = (id) => { window.location.hash = id; setPage(id); };
+  const go = (id, qs = "") => { window.location.hash = qs ? `${id}?${qs}` : id; setPage(id); };
   return (
     <ToastHost>
       <div className="shell">
@@ -91,8 +94,14 @@ export default function App() {
           </label>
           <nav className="nav" aria-label="Sections">
             {navPages.map((p) => (
-              <a key={p.id} href={`#${p.id}`} className={page === p.id ? "on" : ""} onClick={(e) => { e.preventDefault(); go(p.id); }}>
-                {p.label}{p.id === "exceptions" && openCount !== null && <span className="count">{openCount}</span>}
+              <a key={p.id} href={`#${p.id}`} className={page === p.id ? "on" : ""} onClick={(e) => {
+                e.preventDefault();
+                if (p.id === "rules" && ntfCount > 0) go("rules", "queue=awaiting_review");
+                else go(p.id);
+              }}>
+                {p.label}
+                {p.id === "exceptions" && openCount !== null && openCount > 0 && <span className="count">{openCount}</span>}
+                {p.id === "rules" && ntfCount > 0 && <span className="count">{ntfCount}</span>}
               </a>
             ))}
           </nav>

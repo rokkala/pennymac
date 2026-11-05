@@ -120,8 +120,8 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "backend/lbp/api/main.py": {
-    "mtime": 1793809273.8480737,
-    "ast_hash": "899672d5b608a78d1bdd1ac50ee1034d",
+    "mtime": 1793838369.38229,
+    "ast_hash": "546442cd4fdb06ce8f45d801439e09f9",
     "semantic_hash": ""
   },
   "backend/lbp/cli.py": {
@@ -275,8 +275,8 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "backend/lbp/rules/authoring.py": {
-    "mtime": 1793809395.8045273,
-    "ast_hash": "35e0ab7a18196bf893138e05ea334182",
+    "mtime": 1793835290.2723503,
+    "ast_hash": "1df1263adda6ee4a6b10d5b24195154f",
     "semantic_hash": ""
   },
   "backend/lbp/rules/default_rules.py": {
@@ -295,9 +295,9 @@
     "semantic_hash": ""
   },
   "backend/lbp/rules/registry.py": {
-    "mtime": 1793678670.0,
-    "ast_hash": "1e5eb4fa9164d12e08dd9532d5366479",
-    "semantic_hash": "1e5eb4fa9164d12e08dd9532d5366479"
+    "mtime": 1793838287.8076534,
+    "ast_hash": "054daaf9be5798c3242aa28176b266e5",
+    "semantic_hash": ""
   },
   "backend/lbp/rules/schema_checks.py": {
     "mtime": 1793626083.0,
@@ -360,9 +360,9 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "backend/lbp/store/db.py": {
-    "mtime": 1793678628.0,
-    "ast_hash": "733e5c032f809e7f3dd3715d12739ce9",
-    "semantic_hash": "733e5c032f809e7f3dd3715d12739ce9"
+    "mtime": 1793837579.9113493,
+    "ast_hash": "5234102d309beb5b63d876f441da7871",
+    "semantic_hash": ""
   },
   "backend/lbp/vendors.py": {
     "mtime": 1793678670.0,
@@ -510,8 +510,8 @@
     "semantic_hash": ""
   },
   "frontend/src/App.jsx": {
-    "mtime": 1793802187.9246309,
-    "ast_hash": "26ca58d3144121befcc405534f262e11",
+    "mtime": 1793837698.675311,
+    "ast_hash": "93a0d820aa80ef3ac507cf4ced68383c",
     "semantic_hash": ""
   },
   "frontend/src/api.js": {
@@ -535,8 +535,8 @@
     "semantic_hash": ""
   },
   "frontend/src/mock/mockApi.js": {
-    "mtime": 1793802280.8717742,
-    "ast_hash": "b81572349f951aba7d33a2118c299067",
+    "mtime": 1793838372.0520043,
+    "ast_hash": "a6020fe4ef093fbc55612397ef191530",
     "semantic_hash": ""
   },
   "frontend/src/mock/snapshot.json": {
@@ -590,8 +590,8 @@
     "semantic_hash": ""
   },
   "frontend/src/pages/Rules.jsx": {
-    "mtime": 1793809390.0279362,
-    "ast_hash": "7de63329b8aca91fd42394b9b8d9ea5f",
+    "mtime": 1793838379.7040281,
+    "ast_hash": "1c2de96306ef6a8c34643e6e093add38",
     "semantic_hash": ""
   },
   "frontend/src/pages/Sources.jsx": {
@@ -613,16 +613,6 @@
     "mtime": 1793759051.1793609,
     "ast_hash": "0a7b1c5cd9f817f196f460c155426a24",
     "semantic_hash": ""
-  },
-  ".github/workflows/ci.yml": {
-    "mtime": 1793680786.0,
-    "ast_hash": "e1fd4e1806b0ab6c1cf1af886d10a1bd",
-    "semantic_hash": "e1fd4e1806b0ab6c1cf1af886d10a1bd"
-  },
-  ".github/workflows/deploy.yml": {
-    "mtime": 1793679805.0,
-    "ast_hash": "3485cca73ac7fc536e5df9aa92602081",
-    "semantic_hash": "3485cca73ac7fc536e5df9aa92602081"
   },
   "README.md": {
     "mtime": 1793687713.7218564,
@@ -674,46 +664,6 @@
     "ast_hash": "a48d36ce56ce45c4085bb45088c10a41",
     "semantic_hash": "a48d36ce56ce45c4085bb45088c10a41"
   },
-  "backend/.lbp_data/config/feeds/src_c6f5ad0c0023/current.json": {
-    "mtime": 1793683058.14974,
-    "ast_hash": "03c47ef2c9da27a233221e2f9f73be0a",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_c6f5ad0c0023/v1.json": {
-    "mtime": 1793683058.1494448,
-    "ast_hash": "03c47ef2c9da27a233221e2f9f73be0a",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_d62f4df77c3a/current.json": {
-    "mtime": 1793683058.812584,
-    "ast_hash": "6658573c701929d78b9af37d631bd5a4",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_d62f4df77c3a/v1.json": {
-    "mtime": 1793683058.8121843,
-    "ast_hash": "6658573c701929d78b9af37d631bd5a4",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_d7b540e5d5df/current.json": {
-    "mtime": 1793683056.425745,
-    "ast_hash": "ff8d1629b557ea5fadbc3b29b6453894",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_d7b540e5d5df/v1.json": {
-    "mtime": 1793683056.4255023,
-    "ast_hash": "ff8d1629b557ea5fadbc3b29b6453894",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_da5b29c68e0a/current.json": {
-    "mtime": 1793683057.249095,
-    "ast_hash": "d03e82c7a7e1db57be05c8d138593fac",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/config/feeds/src_da5b29c68e0a/v1.json": {
-    "mtime": 1793683057.2488477,
-    "ast_hash": "d03e82c7a7e1db57be05c8d138593fac",
-    "semantic_hash": ""
-  },
   "backend/lbp/demo_setup.py": {
     "mtime": 1793687539.6334364,
     "ast_hash": "de3489c27a0c0c8d7d7f4827e7a3621c",
@@ -732,11 +682,6 @@
   "demo_kit/start_demo.sh": {
     "mtime": 1793687644.7925594,
     "ast_hash": "f6fc99915b6a8dce50f93cf5728c154a",
-    "semantic_hash": ""
-  },
-  "backend/.lbp_data/samples/sub_servicing_sample.txt": {
-    "mtime": 1793683056.0178723,
-    "ast_hash": "f64680e166eb280be3d6926d38f790e0",
     "semantic_hash": ""
   },
   "demo_kit/DEMO_GUIDE.md": {
@@ -850,8 +795,8 @@
     "semantic_hash": ""
   },
   "frontend/src/pages/Maintenance.jsx": {
-    "mtime": 1793760479.855951,
-    "ast_hash": "4350131bafc087dd06d89479c7565441",
+    "mtime": 1793836544.6226978,
+    "ast_hash": "e83198d4e7f43fe29142078aaf43abb9",
     "semantic_hash": ""
   },
   "docs/superpowers/plans/2026-11-03-maintenance-glue-artifacts.md": {
@@ -975,28 +920,78 @@
     "semantic_hash": ""
   },
   "backend/lbp/rules/shapes.py": {
-    "mtime": 1793809234.9099736,
-    "ast_hash": "98860b1d53c50211a1c1060f7d88b63b",
+    "mtime": 1793835723.6966603,
+    "ast_hash": "4bdb332ae782f306c9c8c0f01c5edbaa",
     "semantic_hash": ""
   },
   "backend/tests/test_rule_compose.py": {
-    "mtime": 1793809300.9708219,
-    "ast_hash": "7e3d0adb5ac18ba81df191ad24225996",
+    "mtime": 1793835297.9928513,
+    "ast_hash": "239a00bd7c5305ac50275cb0748ca848",
     "semantic_hash": ""
   },
   "backend/tests/test_shapes.py": {
-    "mtime": 1793809170.4890053,
-    "ast_hash": "345cd6054a80a94658b2fa42a7a8903b",
+    "mtime": 1793835776.8983293,
+    "ast_hash": "1bdc525da800dcfbfa2eccb9ed38b759",
     "semantic_hash": ""
   },
   "docs/superpowers/plans/2026-11-04-guided-rule-authoring.md": {
-    "mtime": 1793809407.671147,
-    "ast_hash": "6620f8fa85c210086978626c7929ce88",
+    "mtime": 1793809417.8551898,
+    "ast_hash": "03ab6f19e5751fb59b9a513e07c80812",
     "semantic_hash": ""
   },
   "docs/superpowers/specs/2026-11-04-guided-rule-authoring-design.md": {
     "mtime": 1793809107.9615736,
     "ast_hash": "fbe2f4dce03024ce2a9c8d988b58987b",
+    "semantic_hash": ""
+  },
+  "backend/lbp/rules/template_store.py": {
+    "mtime": 1793836442.5416064,
+    "ast_hash": "c44d474e086f75d544013f756e990911",
+    "semantic_hash": ""
+  },
+  "backend/migrations/versions/0005_rule_templates.py": {
+    "mtime": 1793836431.2189057,
+    "ast_hash": "8f5d8681c54cbe8816a0acb084873451",
+    "semantic_hash": ""
+  },
+  "backend/tests/test_rule_templates.py": {
+    "mtime": 1793836438.609614,
+    "ast_hash": "3e585850947b159b939e67de8de1f702",
+    "semantic_hash": ""
+  },
+  "frontend/src/ruleTree.jsx": {
+    "mtime": 1793836476.312703,
+    "ast_hash": "59cfd5c723f91750b95d964a432d7f6a",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/specs/2026-11-05-rule-template-maintenance-design.md": {
+    "mtime": 1793836389.3647249,
+    "ast_hash": "8abd99fe0a7a91cee06849e9e9f89ae3",
+    "semantic_hash": ""
+  },
+  "backend/lbp/notifications.py": {
+    "mtime": 1793837599.9290447,
+    "ast_hash": "6429237ea5dc258001c16c55d7ec6e86",
+    "semantic_hash": ""
+  },
+  "backend/migrations/versions/0006_notifications.py": {
+    "mtime": 1793837583.0351362,
+    "ast_hash": "f4ee8d85d90449cdf9605f8ce19b094e",
+    "semantic_hash": ""
+  },
+  "backend/tests/test_notifications.py": {
+    "mtime": 1793838383.6535354,
+    "ast_hash": "148ffe0f184dfd78dc1a65ea14d61b99",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/plans/2026-11-05-rule-review-notifications.md": {
+    "mtime": 1793837563.5572894,
+    "ast_hash": "96baa58d50a40cae53e21d98a156373e",
+    "semantic_hash": ""
+  },
+  "docs/superpowers/specs/2026-11-05-rule-review-notifications-design.md": {
+    "mtime": 1793837559.757749,
+    "ast_hash": "153dae74e8ade8894fdb1c872c6b2025",
     "semantic_hash": ""
   }
 }

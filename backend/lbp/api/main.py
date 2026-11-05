@@ -47,7 +47,8 @@ from ..rules.jsonlogic import apply as jl_apply
 from ..rules.jsonlogic import validate as jl_validate
 from ..rules.registry import RuleError, RuleRegistry, run_tests
 from ..rules.shapes import ShapeError, catalog as shape_catalog
-from ..rules.shapes import compile_tree, decompile, fields_payload, templates as rule_templates
+from ..rules.shapes import compile_tree, decompile, fields_payload, pattern_presets
+from ..rules import template_store as rule_tpl
 from ..schema.sse_target import as_dicts
 from ..security import Principal, current_principal
 from ..store import db
@@ -89,12 +90,18 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/rules"): ("sme", "compliance"),
     ("PUT", "/api/rules/{rule_id}/{version}"): ("sme", "compliance"),
     ("POST", "/api/rules/{rule_id}/{version}/transition"): ("sme", "compliance"),
+    ("DELETE", "/api/rules/{rule_id}"): ("sme", "compliance"),
     ("POST", "/api/rules/author"): ("sme", "compliance", "analyst"),
     ("POST", "/api/rules/compose"): ("sme", "compliance", "analyst"),
     ("POST", "/api/rules/test"): ("sme", "compliance", "analyst"),
     ("GET", "/api/rules/fields"): ("sme", "compliance", "analyst", "ops", "reviewer"),
     ("GET", "/api/rules/shapes"): ("sme", "compliance", "analyst", "ops", "reviewer"),
     ("GET", "/api/rules/templates"): ("sme", "compliance", "analyst", "ops", "reviewer"),
+    ("POST", "/api/maintenance/rule-templates"): ("sme", "admin"),
+    ("PUT", "/api/maintenance/rule-templates/{template_id}"): ("sme", "admin"),
+    ("POST", "/api/maintenance/rule-templates/{template_id}/hide"): ("sme", "admin"),
+    ("POST", "/api/maintenance/rule-templates/{template_id}/unhide"): ("sme", "admin"),
+    ("DELETE", "/api/maintenance/rule-templates/{template_id}"): ("sme", "admin"),
     ("PUT", "/api/policy"): ("compliance",),
     ("POST", "/api/analytics/ask"): ("analyst", "sme", "ops", "reviewer", "checker", "compliance"),
     ("POST", "/api/demo/seed"): ("admin",),
@@ -130,6 +137,8 @@ READ_RESTRICTED: dict[str, tuple[str, ...]] = {
     "/api/audit/verify": ("compliance",),
     "/api/maintenance/artifacts": ("sme", "admin"),
     "/api/maintenance/artifacts/{artifact_id}": ("sme", "admin"),
+    "/api/maintenance/rule-templates": ("sme", "admin"),
+    "/api/maintenance/rule-templates/{template_id}": ("sme", "admin"),
     "/api/personas/screens": ("admin",),
     "/api/personas/users": ("admin",),
     # /api/personas/me/screens is any authenticated user (not listed → open to all roles)
@@ -166,6 +175,9 @@ async def lifespan(_app):
     n = RuleRegistry().seed_defaults()
     if n:
         log.info("seeded %d default rules", n)
+    nt = rule_tpl.seed_builtins()
+    if nt:
+        log.info("seeded %d rule templates", nt)
     stop = None
     if s.scheduler_enabled and s.env == "local":
         stop = _start_local_scheduler()
@@ -199,7 +211,7 @@ app = FastAPI(title="PennyMac Loan Boarding Platform", version="1.0.0", lifespan
               description="Mapping, validation, exception management and analytics for SSE loan boarding.")
 _origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
 if _origins:
-    app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET", "POST", "PUT"],
+    app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET", "POST", "PUT", "DELETE"],
                        allow_headers=["authorization", "content-type", "x-user", "x-roles", "x-request-id"])
 
 access_log = logging.getLogger("lbp.access")
@@ -1252,10 +1264,41 @@ def bulk_resolve(body: Bulk, user: User = Depends(current_user)):
     return exceptions_mgr.bulk_resolve(user.name, user.roles, body.rule_id, body.original_value, body.value, body.use_proposal, body.batch_id)
 
 
+# ------------------------------------------------------------------ notifications (in-app review inbox)
+@app.get("/api/notifications")
+def list_notifications(unread: bool = False, user: User = Depends(current_user)):
+    from .. import notifications as ntf
+
+    items = ntf.list_for(user.name, unread_only=unread)
+    return {"notifications": items, "unread": ntf.unread_count(user.name)}
+
+
+@app.post("/api/notifications/{notif_id}/read")
+def read_notification(notif_id: str, user: User = Depends(current_user)):
+    from .. import notifications as ntf
+
+    row = ntf.mark_read(notif_id, user.name)
+    if not row:
+        raise HTTPException(404, "notification not found")
+    return row
+
+
+@app.post("/api/notifications/read-all")
+def read_all_notifications(user: User = Depends(current_user)):
+    from .. import notifications as ntf
+
+    return {"ok": True, "updated": ntf.mark_all_read(user.name)}
+
+
 # ------------------------------------------------------------------ rules (Pillar 3.A)
 @app.get("/api/rules")
-def list_rules(status: str | None = None):
+def list_rules(status: str | None = None, queue: str | None = None, user: User = Depends(current_user)):
+    """queue=awaiting_review → in_review where caller is not the author; queue=my_drafts → drafts by caller."""
     rules = registry.list(status)
+    if queue == "awaiting_review":
+        rules = [r for r in rules if r.get("status") == "in_review" and r.get("author") != user.name]
+    elif queue == "my_drafts":
+        rules = [r for r in rules if r.get("status") == "draft" and r.get("author") == user.name]
     latest: dict[str, dict] = {}
     for r in rules:
         cur = latest.get(r["rule_id"])
@@ -1276,12 +1319,12 @@ def list_rule_fields():
 
 @app.get("/api/rules/shapes")
 def list_rule_shapes():
-    return {"shapes": shape_catalog()}
+    return {"shapes": shape_catalog(), "pattern_presets": pattern_presets()}
 
 
 @app.get("/api/rules/templates")
 def list_rule_templates():
-    return {"templates": rule_templates()}
+    return {"templates": rule_tpl.list_templates(include_hidden=False)}
 
 
 class ComposeReq(BaseModel):
@@ -1386,6 +1429,14 @@ def transition_rule(rule_id: str, version: int, body: Transition, user: User = D
         return registry.transition(rule_id, version, body.to, user.name, user.roles, body.comment, body.canary_pct)
     except RuleError as e:
         _err(e)
+
+
+@app.delete("/api/rules/{rule_id}")
+def delete_rule(rule_id: str, reason: str | None = None, user: User = Depends(current_user)):
+    try:
+        return registry.delete_rule(rule_id, user.name, reason)
+    except RuleError as e:
+        _err(e, 404 if "not found" in str(e).lower() else 400)
 
 
 class AuthorReq(BaseModel):
@@ -1590,7 +1641,7 @@ def demo_setup(body: DemoSetupIn, user: User = Depends(current_user)):
                                   "hint": "pass force=true after confirm"}) from e
 
 
-# ------------------------------------------------------------------ maintenance (Glue artifacts, read-only)
+# ------------------------------------------------------------------ maintenance (Glue artifacts + rule templates)
 @app.get("/api/maintenance/artifacts")
 def maintenance_artifacts():
     from ..maintenance import list_artifacts
@@ -1606,6 +1657,60 @@ def maintenance_artifact(artifact_id: str):
         return get_artifact(artifact_id)
     except MaintenanceError as e:
         raise HTTPException(404, str(e)) from None
+
+
+@app.get("/api/maintenance/rule-templates")
+def maintenance_rule_templates():
+    return {"templates": rule_tpl.list_templates(include_hidden=True)}
+
+
+class RuleTemplateBody(BaseModel):
+    id: str | None = None
+    name: str
+    description: str = ""
+    tree: Any
+
+
+@app.post("/api/maintenance/rule-templates")
+def maintenance_create_rule_template(body: RuleTemplateBody, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.create_template(body.model_dump(exclude_none=True), user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.put("/api/maintenance/rule-templates/{template_id}")
+def maintenance_update_rule_template(template_id: str, body: dict, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.update_template(template_id, body, user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(400 if "not found" not in str(e).lower() else 404, str(e)) from e
+
+
+@app.post("/api/maintenance/rule-templates/{template_id}/hide")
+def maintenance_hide_rule_template(template_id: str, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.set_hidden(template_id, True, user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/maintenance/rule-templates/{template_id}/unhide")
+def maintenance_unhide_rule_template(template_id: str, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.set_hidden(template_id, False, user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.delete("/api/maintenance/rule-templates/{template_id}")
+def maintenance_delete_rule_template(template_id: str, user: User = Depends(current_user)):
+    try:
+        rule_tpl.delete_template(template_id, user.name)
+        return {"ok": True, "id": template_id}
+    except rule_tpl.TemplateError as e:
+        code = 400 if "built-in" in str(e).lower() else 404
+        raise HTTPException(code, str(e)) from e
 
 
 # ------------------------------------------------------------------ personas (user admin + restrict-only screen nav matrix)
