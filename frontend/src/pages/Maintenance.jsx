@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Loading, Modal, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Loading, Modal, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { blankLeaf, ensureTree, LeafEditor } from "../ruleTree.jsx";
 
 const GROUP_LABEL = {
@@ -181,7 +181,7 @@ function TemplatesPane() {
         <button type="button" className="btn primary" onClick={() => setEditor({ mode: "new" })}>New template</button>
       </div>
       <Panel title="Rule templates" pad={false}>
-        {!rows.length ? <div className="empty" style={{ padding: 16 }}>No templates yet.</div> : (
+        {!rows.length ? <EmptyState title="No templates yet" body="Create a starter for Rules → Author." action={<button type="button" className="btn primary" onClick={() => setEditor({ mode: "new" })}>New template</button>} /> : (
           <div className="stack" style={{ gap: 0 }}>
             {rows.map((t) => (
               <div key={t.id} className="row" style={{
@@ -227,22 +227,21 @@ export default function Maintenance({ persona, go }) {
   const [tab, setTab] = useState("jobs"); // jobs | templates
   if (!canCap(persona, "readMaintenance")) {
     return (
-      <div className="empty stack" style={{ gap: 12, alignItems: "flex-start" }}>
-        <span>Platform source is for Dan · SME or Platform Admin.</span>
-        <button type="button" className="btn primary" onClick={() => go?.("guide")}>Open the product guide</button>
-      </div>
+      <EmptyState
+        title="Maintenance is restricted"
+        body="Platform source is for Dan · SME or Platform Admin."
+        action={<button type="button" className="btn primary" onClick={() => go?.("guide")}>Open the product guide</button>}
+      />
     );
   }
   return (
     <>
-      <div className="page-head">
-        <div>
-          <span className="eyebrow">Platform · data plane</span>
-          <h1>Maintenance</h1>
-          <p className="sub">Glue jobs and rule starter templates. Templates appear in Rules → Author.</p>
-        </div>
-        <button type="button" className="btn" onClick={() => go?.("guide")}>Product guide</button>
-      </div>
+      <PageHeader
+        eyebrow="Govern"
+        title="Maintenance"
+        sub="Glue jobs and rule starter templates. Templates appear in Rules → Author."
+        primary={<button type="button" className="btn" onClick={() => go?.("guide")}>Product guide</button>}
+      />
       <div className="row" style={{ gap: 6, marginBottom: 16 }}>
         {[["jobs", "Jobs & code"], ["templates", "Rule templates"]].map(([id, label]) => (
           <button key={id} type="button" className={`btn ${tab === id ? "primary" : ""}`} onClick={() => setTab(id)}>{label}</button>

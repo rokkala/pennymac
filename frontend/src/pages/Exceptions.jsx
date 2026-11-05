@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, setIntent, scoped } from "../api.js";
 import { can, canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Conf, Tier, TIER_NAMES, Tabs, Loading, ago, human, fmt, Modal, useDialog } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Conf, Tier, TIER_NAMES, Tabs, Loading, ago, human, fmt, Modal, useDialog, PageHeader, EmptyState } from "../ui.jsx";
 
 const TIER_RULE = {
   T1: "Low-risk formatting or code fix at ≥ 0.95 confidence. Applied automatically, audited, 5% sampled for QA, reversible within the rollback window.",
@@ -265,9 +265,13 @@ export default function Exceptions({ persona, go, vendor }) {
   const changed = () => { setLastIdx(Math.max(0, idx)); setNonce((n) => n + 1); };
   return (
     <>
-      <div className="page-head"><div><span className="eyebrow">Pillar 3.B · AI proposes, human disposes</span><h1>Exception Manager</h1>
-        <p className="sub">Every failed rule is classified, matched against past fixes, given a proposed correction and routed by confidence × risk. Risk tier is the hard gate: confidence alone never auto-applies a regulated field.</p></div>
-        <input id="ex-search" className="input" placeholder="Search loan number" value={q} onChange={(e) => setQ(e.target.value)} /></div>
+      <PageHeader
+        eyebrow="Run"
+        title="Exception Manager"
+        sub="Failed rules are classified, matched to past fixes, and routed by confidence × risk. Risk tier is the hard gate — confidence alone never auto-applies a regulated field."
+        guideHref="#guide?path=execution&step=exceptions"
+        primary={<input id="ex-search" className="input" placeholder="Search loan number" value={q} onChange={(e) => setQ(e.target.value)} aria-label="Search loan number" />}
+      />
       <RootCauses go={go} onFilter={(r) => { setRule(r); setTab("open"); setSel(null); }} />
       {rule && <div className="row"><span className="pill accent">Filtered to rule {rule}</span><button className="btn sm" onClick={() => setRule(null)}>Clear filter</button></div>}
       {t && <Tabs value={tab} onChange={(v) => { setTab(v); setSel(null); }} tabs={[
@@ -276,7 +280,9 @@ export default function Exceptions({ persona, go, vendor }) {
         { id: "checker", label: "Awaiting checker", count: Object.values(t).reduce((a, x) => a + (x.pending_checker || 0), 0) },
         { id: "T5", label: "T5 Compliance", count: t.T5.escalated }, { id: "resolved", label: "Resolved", count: Object.values(t).reduce((a, x) => a + (x.resolved || 0), 0) }]} />}
       <Panel pad={false} title={`${fmt(list.data?.total ?? 0)} exceptions`} sub={`${tab === "open" ? "Blocking items from the newest batches first. " : ""}Open one to review; use ← → to move through the queue.`}>
-          {!list.data ? <Loading error={list.error} /> : !items.length ? <div className="empty">Nothing in this queue.</div> : (
+          {!list.data ? <Loading error={list.error} /> : !items.length ? (
+            <EmptyState title="Nothing in this queue" body="Try another tab, or clear filters if you set a rule filter." action={rule ? <button type="button" className="btn primary" onClick={() => setRule(null)}>Clear rule filter</button> : null} />
+          ) : (
             <div className="tbl-wrap" style={{ maxHeight: 720 }}><table className="tbl">
               <thead><tr><th>Tier</th><th>Loan</th>{!vendor && <th>Vendor</th>}<th>Rule</th><th>Field</th><th>Value</th><th>Proposal</th><th>Status</th><th>Age</th></tr></thead>
               <tbody>{items.map((e) => (

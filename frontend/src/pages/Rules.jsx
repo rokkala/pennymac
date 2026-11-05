@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, getPersona } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Loading, ago, fmt, human, Modal, ReasonModal, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Loading, ago, fmt, human, Modal, ReasonModal, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { blankLeaf, ensureTree, LeafEditor } from "../ruleTree.jsx";
 
 function sameUser(a, b) {
@@ -597,19 +597,13 @@ export default function Rules({ persona }) {
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <span className="eyebrow">Pillar 3.A · rules</span>
-          <h1>Rule Engine</h1>
-          <p className="sub">New rule → submit → peer approves → live. Click a row to open. Same person cannot author and approve.</p>
-          {!canEdit && (
-            <p className="faint" style={{ fontSize: ".84rem", marginTop: 6 }}>
-              Switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> to add or move rules.
-            </p>
-          )}
-        </div>
-        {canAuthor && <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button>}
-      </div>
+      <PageHeader
+        eyebrow="Setup"
+        title="Rule Engine"
+        sub={<>New rule → submit → peer approves → live. Same person cannot author and approve.{!canEdit && <> Switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> to add or move rules.</>}</>}
+        guideHref="#guide?path=setup&step=rules"
+        primary={canAuthor ? <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button> : null}
+      />
 
       {unread.length > 0 && (
         <div className="callout" style={{ marginBottom: 12, fontSize: ".88rem" }}>
@@ -657,10 +651,11 @@ export default function Rules({ persona }) {
         sub="Open a row for the next step. Delete removes the rule entirely."
       >
         {!data.rules.length ? (
-          <div className="empty stack" style={{ gap: 12, padding: 24, alignItems: "flex-start" }}>
-            <span>No rules yet.</span>
-            {canAuthor && <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button>}
-          </div>
+          <EmptyState
+            title="No rules yet"
+            body="Author a draft, submit it for peer review, then promote to live."
+            action={canAuthor ? <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button> : null}
+          />
         ) : (
           <div className="tbl-wrap">
             <table className="tbl">

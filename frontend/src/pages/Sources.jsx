@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api, takeIntent } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog, ActionBar, PageHeader } from "../ui.jsx";
 import DeliveryProfile from "./DeliveryProfile.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { VendorList, VendorWorkspace } from "./Vendors.jsx";
@@ -409,36 +409,39 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
   const dqFails = (dq.data?.rules || []).filter((r) => r.failed > 0).length;
   return (
     <>
-      <div className="page-head">
-        <div><div className="crumbs"><a onClick={onVendors}>All vendors</a><span className="faint">›</span>
-            <a onClick={() => (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack())}>{mp.source.vendor_name || "Vendor"}</a><span className="faint">›</span>
-            <span>{mp.source.name}</span><span className="faint">›</span><span>Mapping v{mp.version}</span></div>
-          <h1 style={{ marginTop: 6 }}>{mp.source.name}{mp.source.vendor_name && mp.source.vendor_name !== mp.source.name && <span className="faint" style={{ fontWeight: 400 }}> · {mp.source.vendor_name}</span>}</h1>
-          <p className="sub">Mapping v{mp.version} · <Status s={mp.status} /> · prepared by {mp.created_by}{mp.approved_by ? ` · approved by ${mp.approved_by}` : ""}</p></div>
-        <div className="stack" style={{ gap: 8, alignItems: "flex-end" }}>
-        <div className="row">
-          <button className="btn" onClick={() => setModal("preview")}>Validation preview</button>
-          {mp.version > 1 && <button className="btn" onClick={() => setModal("diff")}>Changes vs v{mp.version - 1}</button>}
-          {mp.status === "approved" && canEdit && <button className="btn primary" onClick={() => ask({ kind: "confirm", title: `Edit ${mp.source.name} as a new version`, confirmLabel: `Create draft v${mp.version + 1}`,
-            body: <span>A draft copy of the live mapping v{mp.version} is created for editing. The live version keeps running until the draft is approved.</span>,
-            onConfirm: async () => { const r = await act(() => api(`/api/sources/${mp.source_id}/mappings/new-version`, { method: "POST" }), (x) => `Draft v${x.version} created from the live mapping`); if (r) onOpen(r.mapping_id); return r; } })}>Edit as new version…</button>}
-          {draft && canEdit && <button className="btn" disabled={!pending} onClick={() => ask({ kind: "confirm", title: "Accept high-confidence suggestions", confirmLabel: "Accept all ≥ 0.80",
-            body: <span>Accepts every suggested mapping with confidence 0.80 or higher ({fields.filter((f) => ["suggested", "needs_review"].includes(f.status) && f.confidence >= 0.8).length} fields). Lower-confidence fields stay for review. You can still change any field before submitting.</span>,
-            onConfirm: () => act(() => api(`/api/mappings/${mappingId}/accept-all?min_confidence=0.8`, { method: "POST" }), (r) => `Accepted ${r.accepted} high-confidence mappings`).then((r) => { if (r) m.reload(); return r; }) })}>Accept all ≥ 0.80…</button>}
-          {draft && canEdit && <button className="btn primary" onClick={() => ask({ kind: "reason", title: "Submit for SME approval", confirmLabel: "Submit", required: false, label: "Note for the approver",
-            help: pending ? `${pending} field(s) are still awaiting review; the server will refuse the submission until each is accepted, changed or rejected.` : "An SME other than you reviews and approves. On approval the configuration is published to the Glue data plane.",
-            placeholder: "e.g. New value translations for LoanType; please check FHA codes",
-            onSubmit: () => act(() => api(`/api/mappings/${mappingId}/submit`, { method: "POST" }), "Sent to SME for approval").then((r) => { if (r) m.reload(); return r; }) })}>Submit for approval…</button>}
-          {mp.status === "in_review" && canApprove && <>
-            <button className="btn" onClick={() => ask({ kind: "reason", title: "Send back to the analyst", confirmLabel: "Send back", minLength: 5,
+      <PageHeader
+        eyebrow={<span className="crumbs"><a onClick={onVendors}>All vendors</a><span className="faint">›</span>
+          <a onClick={() => (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack())}>{mp.source.vendor_name || "Vendor"}</a><span className="faint">›</span>
+          <span>{mp.source.name}</span><span className="faint">›</span><span>Mapping v{mp.version}</span></span>}
+        title={<>{mp.source.name}{mp.source.vendor_name && mp.source.vendor_name !== mp.source.name && <span className="faint" style={{ fontWeight: 400 }}> · {mp.source.vendor_name}</span>}</>}
+        sub={<>Mapping v{mp.version} · <Status s={mp.status} /> · prepared by {mp.created_by}{mp.approved_by ? ` · approved by ${mp.approved_by}` : ""}</>}
+        guideHref="#guide?path=setup&step=mapping"
+        primary={
+          mp.status === "in_review" && canApprove ? <button type="button" className="btn primary" onClick={() => setModal("approve")}>Approve…</button>
+            : draft && canEdit ? <button type="button" className="btn primary" onClick={() => ask({ kind: "reason", title: "Submit for SME approval", confirmLabel: "Submit", required: false, label: "Note for the approver",
+              help: pending ? `${pending} field(s) are still awaiting review; the server will refuse the submission until each is accepted, changed or rejected.` : "An SME other than you reviews and approves. On approval the configuration is published to the Glue data plane.",
+              placeholder: "e.g. New value translations for LoanType; please check FHA codes",
+              onSubmit: () => act(() => api(`/api/mappings/${mappingId}/submit`, { method: "POST" }), "Sent to SME for approval").then((r) => { if (r) m.reload(); return r; }) })}>Submit for approval…</button>
+            : mp.status === "approved" && canEdit ? <button type="button" className="btn primary" onClick={() => ask({ kind: "confirm", title: `Edit ${mp.source.name} as a new version`, confirmLabel: `Create draft v${mp.version + 1}`,
+              body: <span>A draft copy of the live mapping v{mp.version} is created for editing. The live version keeps running until the draft is approved.</span>,
+              onConfirm: async () => { const r = await act(() => api(`/api/sources/${mp.source_id}/mappings/new-version`, { method: "POST" }), (x) => `Draft v${x.version} created from the live mapping`); if (r) onOpen(r.mapping_id); return r; } })}>Edit as new version…</button>
+            : null
+        }
+        secondary={(
+          <ActionBar>
+            <button type="button" className="btn" onClick={() => setModal("preview")}>Validation preview</button>
+            {mp.version > 1 && <button type="button" className="btn" onClick={() => setModal("diff")}>Changes vs v{mp.version - 1}</button>}
+            {draft && canEdit && <button type="button" className="btn" disabled={!pending} onClick={() => ask({ kind: "confirm", title: "Accept high-confidence suggestions", confirmLabel: "Accept all ≥ 0.80",
+              body: <span>Accepts every suggested mapping with confidence 0.80 or higher ({fields.filter((f) => ["suggested", "needs_review"].includes(f.status) && f.confidence >= 0.8).length} fields). Lower-confidence fields stay for review. You can still change any field before submitting.</span>,
+              onConfirm: () => act(() => api(`/api/mappings/${mappingId}/accept-all?min_confidence=0.8`, { method: "POST" }), (r) => `Accepted ${r.accepted} high-confidence mappings`).then((r) => { if (r) m.reload(); return r; }) })}>Accept all ≥ 0.80…</button>}
+            {mp.status === "in_review" && canApprove && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: "Send back to the analyst", confirmLabel: "Send back", minLength: 5,
               help: "The mapping returns to draft with your comment. Say what needs to change.", presets: ["Please revisit the low-confidence fields", "Value translations incomplete"],
-              onSubmit: (comment) => act(() => api(`/api/mappings/${mappingId}/approve`, { method: "POST", body: { approve: false, comment } }), "Sent back to analyst").then((r) => { if (r) m.reload(); return r; }) })}>Send back…</button>
-            <button className="btn primary" onClick={() => setModal("approve")}>Approve…</button></>}
-          {mp.status === "in_review" && !canApprove && <span className="faint" style={{ fontSize: ".82rem" }}>SME can approve</span>}
-        </div>
-        {mp.source_id && mp.source.status === "live" && <FeedConfigChip sourceId={mp.source_id} persona={persona} />}
-        </div>
-      </div>
+              onSubmit: (comment) => act(() => api(`/api/mappings/${mappingId}/approve`, { method: "POST", body: { approve: false, comment } }), "Sent back to analyst").then((r) => { if (r) m.reload(); return r; }) })}>Send back…</button>}
+            {mp.status === "in_review" && !canApprove && <span className="faint" style={{ fontSize: ".82rem" }}>SME can approve</span>}
+            {mp.source_id && mp.source.status === "live" && <FeedConfigChip sourceId={mp.source_id} persona={persona} />}
+          </ActionBar>
+        )}
+      />
       <Kpis items={[
         { label: "Auto-mapped", value: `${mp.stats?.auto_mapped_pct}%`, detail: "confidence ≥ 0.80 (PoC target 70%)" },
         { label: "Avg confidence", value: (mp.stats?.avg_confidence ?? 0).toFixed(2) },

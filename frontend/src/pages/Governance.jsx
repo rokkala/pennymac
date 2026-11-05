@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { api, DEMO } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Loading, Tier, ago, human, Modal, Field, useDialog } from "../ui.jsx";
+import { useApi, useAction, Panel, Loading, Tier, ago, human, Modal, Field, useDialog, PageHeader } from "../ui.jsx";
 
 const EDITABLE = [
   { key: "t1_min_confidence", label: "T1 auto-apply: minimum confidence", type: "number", step: 0.01, min: 0.9, max: 1, hint: "Never below 0.90 (enforced on the server)." },
@@ -132,9 +132,12 @@ export default function Governance({ persona }) {
   const t1 = pol.data.effective;
   return (
     <>
-      <div className="page-head"><div><span className="eyebrow">Controls</span><h1>Policy & Audit</h1>
-        <p className="sub">Routing thresholds live in the policy store. Changing them needs a Compliance approver who is not the requester; every change and every human or AI action is written to the audit trail (and CloudTrail in AWS).</p></div>
-        {showDemo && <div className="row"><button className="btn" onClick={() => setDemoModal(true)}>Load demo scenario…</button></div>}</div>
+      <PageHeader
+        eyebrow="Govern"
+        title="Policy & Audit"
+        sub="Routing thresholds live in the policy store. Changes need a Compliance approver who is not the requester; every action is written to the audit trail."
+        primary={showDemo ? <button type="button" className="btn" onClick={() => setDemoModal(true)}>Load demo scenario…</button> : null}
+      />
       <Panel title="Confidence × risk routing" sub="The hard gate. Risk tier wins over confidence." pad={false}
         actions={<>{t1 && <span className={`pill ${t1.t1_effective ? "pass" : "fail"}`}>{t1.t1_effective ? "T1 auto-apply on" : t1.t1_auto_suspended ? "T1 auto-suspended" : "T1 off"}</span>}
           {canPolicy && p.t1_enabled !== false && <button className="btn sm danger" onClick={() => ask({ kind: "reason", title: "Turn off AI auto-apply (T1)", danger: true, confirmLabel: "Turn off T1",

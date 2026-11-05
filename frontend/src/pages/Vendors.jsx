@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { api, scoped } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field, PageHeader, ActionBar } from "../ui.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { BatchModal } from "./Imports.jsx";
 
@@ -70,11 +70,13 @@ export function VendorList({ persona, onOpen, onCreated }) {
   const list = v.data.vendors;
   return (
     <>
-      <div className="page-head">
-        <div><span className="eyebrow">Workflow 1 · vendor onboarding</span><h1>Vendors & Mapping</h1>
-          <p className="sub">Each vendor owns one or more feeds: a boarding tape, change files, snapshots. Every feed has its own mapping versions, delivery profile and schedule. A new vendor or feed is configuration, not a code change.</p></div>
-        {canCap(persona, "editVendors") && <button className="btn primary" onClick={() => setCreate(true)}>Onboard vendor</button>}
-      </div>
+      <PageHeader
+        eyebrow="Setup"
+        title="Vendors & Mapping"
+        sub="Each vendor owns one or more feeds. Every feed has mapping versions, a delivery profile, and a schedule — configuration, not a code change."
+        guideHref="#guide?path=setup&step=vendor"
+        primary={canCap(persona, "editVendors") ? <button type="button" className="btn primary" onClick={() => setCreate(true)}>Onboard vendor</button> : null}
+      />
       <Kpis items={[
         { label: "Vendors", value: list.length, detail: `${list.filter((x) => x.status === "active").length} active · ${list.filter((x) => x.status === "onboarding").length} onboarding` },
         { label: "Feeds", value: list.reduce((a, x) => a + x.feeds, 0), detail: `${list.reduce((a, x) => a + x.live_feeds, 0)} live` },
@@ -206,16 +208,20 @@ export function VendorWorkspace({ vendorId, persona, go, onBack, onOpenMapping, 
   const reload = () => { v.reload(); reloadVendors && reloadVendors(); };
   return (
     <>
-      <div className="page-head">
-        <div><div className="crumbs">{onBack && <><a onClick={onBack}>All vendors</a><span className="faint">›</span></>}<span>{x.name}</span></div>
-          <h1 style={{ marginTop: 6 }}>{x.name}</h1>
-          <p className="sub">{VENDOR_TYPES[x.vendor_type] || human(x.vendor_type)} · <Status s={x.status} />{x.external_ref ? ` · ${x.external_ref}` : ""}{x.legal_name ? ` · ${x.legal_name}` : ""}
-            {x.contact?.email && <> · contact <a href={`mailto:${x.contact.email}`}>{x.contact.name || x.contact.email}</a></>}</p></div>
-        <div className="row">
-          <button className="btn" onClick={() => { pickVendor(vendorId); }} title="Scope every page to this vendor">Focus on this vendor</button>
-          {canCap(persona, "vendorLifecycle") && <button className="btn" onClick={() => setModal("status")}>Change status…</button>}
-          {canCap(persona, "editVendors") && <button className="btn primary" onClick={() => setModal("feed")}>Add feed</button>}</div>
-      </div>
+      <PageHeader
+        eyebrow={<span className="crumbs">{onBack && <><a onClick={onBack}>All vendors</a><span className="faint">›</span></>}<span>{x.name}</span></span>}
+        title={x.name}
+        sub={<>{VENDOR_TYPES[x.vendor_type] || human(x.vendor_type)} · <Status s={x.status} />{x.external_ref ? ` · ${x.external_ref}` : ""}{x.legal_name ? ` · ${x.legal_name}` : ""}
+          {x.contact?.email && <> · contact <a href={`mailto:${x.contact.email}`}>{x.contact.name || x.contact.email}</a></>}</>}
+        guideHref="#guide?path=setup&step=feed"
+        primary={canCap(persona, "editVendors") ? <button type="button" className="btn primary" onClick={() => setModal("feed")}>Add feed</button> : null}
+        secondary={(
+          <ActionBar>
+            <button type="button" className="btn" onClick={() => { pickVendor(vendorId); }} title="Scope every page to this vendor">Focus on this vendor</button>
+            {canCap(persona, "vendorLifecycle") && <button type="button" className="btn" onClick={() => setModal("status")}>Change status…</button>}
+          </ActionBar>
+        )}
+      />
       {x.status === "suspended" && <div className="callout t5" style={{ marginBottom: 12 }}><b>Suspended.</b> Files from this vendor are recorded but not processed.</div>}
       <Kpis items={[
         { label: "Feeds", value: x.feeds.length, detail: `${x.live_feeds || 0} live` },

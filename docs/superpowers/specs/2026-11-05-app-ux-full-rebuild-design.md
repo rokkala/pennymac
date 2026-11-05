@@ -1,7 +1,7 @@
 # App UX full rebuild (IA + visual system + every page)
 
 **Date:** 2026-11-05  
-**Status:** approved — Phase A plan in `docs/superpowers/plans/2026-11-05-app-ux-phase-a.md`  
+**Status:** implemented on `feature/app-ux-phase-a` — Phases A–D; plans in `docs/superpowers/plans/2026-11-05-app-ux-phase-a.md` and `docs/superpowers/plans/2026-11-05-app-ux-phases-b-d.md`  
 **Classification:** architectural  
 **Audience choice:** **C** — demo walkthrough **and** day-to-day operators  
 **Approach choice:** **3** — full visual + information-architecture rebuild (every page)

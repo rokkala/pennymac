@@ -1,6 +1,6 @@
 import React, { useState } from "react";
 import { api, scoped } from "../api.js";
-import { useApi, useAction, Panel, Tabs, Loading, fmt, Kpis, Conf, Status } from "../ui.jsx";
+import { useApi, useAction, Panel, Tabs, Loading, fmt, Kpis, Conf, Status, PageHeader } from "../ui.jsx";
 import { HBars, VBars, heatColor } from "../charts.jsx";
 
 function Ask() {
@@ -141,8 +141,12 @@ export default function Analytics() {
   const [tab, setTab] = useState("exceptions");
   return (
     <>
-      <div className="page-head"><div><span className="eyebrow">Pillar 2 · Workflow 3</span><h1>Analytics</h1>
-        <p className="sub">Batch KPIs, exception trends, data-quality scoring and AI performance. In AWS these are Redshift Serverless views served through embedded QuickSight dashboards.</p></div></div>
+      <PageHeader
+        eyebrow="Run"
+        title="Analytics"
+        sub="Batch KPIs, exception trends, data-quality scoring, and AI performance. In AWS these are Redshift views served through QuickSight."
+        guideHref="#guide?path=execution&step=board"
+      />
       <Ask />
       <Tabs value={tab} onChange={setTab} tabs={[{ id: "exceptions", label: "Exception analytics" }, { id: "dq", label: "DQ scorecard" }, { id: "sources", label: "Vendor & feed performance" }, { id: "vendors", label: "Vendor deliveries" }, { id: "ai", label: "AI mapping insights" }]} />
       {tab === "exceptions" && <ExceptionsDash />}{tab === "dq" && <DQ />}{tab === "sources" && <SourcesDash />}{tab === "vendors" && <VendorsDash />}{tab === "ai" && <AIDash />}

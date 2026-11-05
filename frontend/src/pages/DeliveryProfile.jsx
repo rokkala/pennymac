@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { api } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Loading, human, Modal } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Loading, human, Modal, ActionBar, EmptyState } from "../ui.jsx";
 
 const LT = {
   full: "Full boarding tape: every file is a complete set of new loans.",
@@ -174,13 +174,18 @@ export default function DeliveryProfile({ sourceId, persona, go }) {
   return (
     <div className="grid" style={{ gridTemplateColumns: "minmax(0, 1fr) minmax(0, 380px)", alignItems: "start" }}>
       <Panel title="How this vendor delivers" sub="Applies to every new file from this feed. Changes need a second approver (maker-checker)."
-        actions={<>{pending ? <span className="pill warn">change proposed by {d.data.proposed_by}</span> : <span className="pill pass">{d.data.configured ? "approved" : "default (full tapes)"}</span>}
-          {canCap(persona, "editDelivery") && <button className="btn sm" onClick={() => setModal("edit")}>{pending ? "Edit proposal…" : "Edit…"}</button>}</>}>
+        actions={<ActionBar
+          primary={pending && (canCap(persona, "approveDelivery") || canCap(persona, "editDelivery"))
+            ? <button type="button" className="btn sm primary" onClick={() => setModal("review")}>Review proposal…</button>
+            : canCap(persona, "editDelivery") ? <button type="button" className="btn sm primary" onClick={() => setModal("edit")}>Edit…</button> : null}
+        >
+          {pending ? <span className="pill warn">change proposed by {d.data.proposed_by}</span> : <span className="pill pass">{d.data.configured ? "approved" : "default (full tapes)"}</span>}
+          {pending && canCap(persona, "editDelivery") && <button type="button" className="btn sm" onClick={() => setModal("edit")}>Edit proposal…</button>}
+        </ActionBar>}>
         <div className="stack">
           <span className="muted" style={{ fontSize: ".86rem" }}>{LT[d.data.delivery.load_type]}</span>
           <Summary p={d.data.delivery} />
-          {pending && <div className="callout t4 row" style={{ fontSize: ".86rem" }}><span><b>{d.data.proposed_by}</b> proposed a change ({changedKeys(d.data.delivery, pending).length} setting(s)).</span><span className="spacer" />
-            {(canCap(persona, "approveDelivery") || canCap(persona, "editDelivery")) && <button className="btn sm primary" onClick={() => setModal("review")}>Review proposal…</button>}</div>}
+          {pending && <div className="callout t4" style={{ fontSize: ".86rem" }}><b>{d.data.proposed_by}</b> proposed a change ({changedKeys(d.data.delivery, pending).length} setting(s)). Use Review proposal to approve or reject.</div>}
           {d.data.last_sequence && <span className="faint" style={{ fontSize: ".8rem" }}>last applied file #{d.data.last_sequence}</span>}
         </div>
       </Panel>
@@ -198,7 +203,7 @@ export default function DeliveryProfile({ sourceId, persona, go }) {
           </div>
         </Panel>
         <Panel title="Delivery schedules" actions={<button className="btn sm" onClick={() => go("deliveries")}>Open Vendor Deliveries</button>}>
-          {!sch.data ? <Loading /> : sch.data.schedules.length === 0 ? <div className="empty">No schedule: files are processed when they arrive, but nobody is alerted if one doesn't.</div> : (
+          {!sch.data ? <Loading /> : sch.data.schedules.length === 0 ? <EmptyState title="No schedule" body="Files still process on arrival, but nobody is alerted if one doesn’t show up." action={<button type="button" className="btn sm primary" onClick={() => go("deliveries")}>Open Vendor Deliveries</button>} /> : (
             <div className="stack" style={{ gap: 6 }}>{sch.data.schedules.map((x) => (
               <div key={x.schedule_id} className="row" style={{ fontSize: ".86rem" }}><b>{x.name}</b><Status s={x.status} /><span className="faint">{x.describe} · {(x.config || x.proposed || {}).timezone}</span>
                 {x.next_due_local && <span className="chip">next {x.next_due_local}</span>}</div>))}</div>)}

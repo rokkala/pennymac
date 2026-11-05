@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api, setIntent, scoped } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, Modal, ReasonModal, useDialog, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, Modal, ReasonModal, useDialog, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { Segments, Sparkline } from "../charts.jsx";
 
 function UploadModal({ sources, onClose, onDone }) {
@@ -351,9 +351,13 @@ export default function Imports({ persona, go, vendor }) {
   const peak = Math.max(0, ...batches.map((x) => x.throughput_lps || 0));
   return (
     <>
-      <div className="page-head"><div><span className="eyebrow">Workflow 2 · daily loan processing</span><h1>Import Monitor</h1>
-        <p className="sub">Every file runs as an AWS Glue job on its feed's published (approved, signed) configuration: mapped, validated and loaded in throttled micro-batches. Progress is checkpointed so a paused or failed run resumes where it stopped.</p></div>
-        {canCap(persona, "upload") && <button className="btn primary" onClick={() => setUpload(true)}>Upload file</button>}</div>
+      <PageHeader
+        eyebrow="Run"
+        title="Import Monitor"
+        sub="Every file runs on its feed’s published configuration: mapped, validated, and loaded in micro-batches. Progress is checkpointed so a pause or failure resumes where it stopped."
+        guideHref="#guide?path=execution&step=arrive"
+        primary={canCap(persona, "upload") ? <button type="button" className="btn primary" onClick={() => setUpload(true)}>Upload file</button> : null}
+      />
       <Kpis items={[
         { label: "Batches running", value: b.data.running },
         { label: "Current throughput", value: `${fmt(b.data.current_throughput_lps)}/s`, detail: `target ${b.data.target_lps}/s for 1M/24h` },
@@ -361,6 +365,15 @@ export default function Imports({ persona, go, vendor }) {
         { label: "Completed batches", value: done.length, detail: `${fmt(done.reduce((a, x) => a + x.processed, 0))} loans` },
       ]} />
       <Panel title="Batches" sub="Select a file to see its progress, checks and actions" pad={false}>
+          {!batches.length ? (
+            <EmptyState
+              title="No batches yet"
+              body="Upload a file or wait for a vendor delivery to arrive."
+              action={canCap(persona, "upload")
+                ? <button type="button" className="btn primary" onClick={() => setUpload(true)}>Upload file</button>
+                : <a className="btn primary" href="#guide?path=execution&step=arrive">How arrival works</a>}
+            />
+          ) : (
           <div className="tbl-wrap"><table className="tbl">
             <thead><tr><th>File</th><th>{vendor ? "Feed" : "Vendor · feed"}</th><th>Status</th><th style={{ minWidth: 140 }}>Outcome</th><th className="r">Rows</th><th className="r">Loans/s</th><th>Micro-batch time</th><th>Started</th></tr></thead>
             <tbody>{batches.map((x) => (
@@ -372,7 +385,7 @@ export default function Imports({ persona, go, vendor }) {
                 <td><Sparkline values={(x.last_micro_batches || []).map((m) => m.seconds)} /></td>
                 <td className="faint">{ago(x.started_at)}</td>
               </tr>))}</tbody>
-          </table></div>
+          </table></div>)}
       </Panel>
       {sel && <BatchModal id={sel} persona={persona} go={go} onClose={() => setSel(null)}
         nav={{ label: idx >= 0 ? `${idx + 1} of ${batches.length}` : "", onPrev: idx > 0 ? () => setSel(batches[idx - 1].batch_id) : null, onNext: idx >= 0 && idx < batches.length - 1 ? () => setSel(batches[idx + 1].batch_id) : null }} />}

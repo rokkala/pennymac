@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Loading, Modal, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Loading, Modal, Field, PageHeader } from "../ui.jsx";
 
 const ROLE_ORDER = ["admin", "sme", "analyst", "ops", "reviewer", "checker", "compliance"];
 
@@ -76,21 +76,21 @@ export default function Personas({ persona, go }) {
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <span className="eyebrow">Platform · identity</span>
-          <h1>Personas</h1>
-          <p className="sub">Create Cognito users (one role each) and hide screens a role does not need. API permissions stay fixed in code.</p>
-        </div>
-        <div className="row">
-          <button type="button" className={`btn ${tab === "users" ? "primary" : ""}`} onClick={() => setTab("users")}>Users</button>
-          <button type="button" className={`btn ${tab === "screens" ? "primary" : ""}`} onClick={() => setTab("screens")}>Screen access</button>
-        </div>
-      </div>
+      <PageHeader
+        eyebrow="Govern"
+        title="Personas"
+        sub="Create Cognito users (one role each) and hide screens a role does not need. API permissions stay fixed in code."
+        primary={tab === "screens" ? <button type="button" className="btn primary" onClick={saveMatrix}>Save access</button> : <button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>Add user</button>}
+        secondary={(
+          <>
+            <button type="button" className={`btn sm ${tab === "users" ? "primary" : ""}`} onClick={() => setTab("users")}>Users</button>
+            <button type="button" className={`btn sm ${tab === "screens" ? "primary" : ""}`} onClick={() => setTab("screens")}>Screen access</button>
+          </>
+        )}
+      />
 
       {tab === "users" && (
-        <Panel title="Users" sub="One Cognito group per person. Temp password forces change on first sign-in."
-          actions={<button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>Add user</button>}>
+        <Panel title="Users" sub="One Cognito group per person. Temp password forces change on first sign-in.">
           <div className="tbl-wrap" style={{ overflowX: "auto" }}>
             <table className="tbl">
               <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Enabled</th><th /></tr></thead>
@@ -122,8 +122,7 @@ export default function Personas({ persona, go }) {
       )}
 
       {tab === "screens" && (
-        <Panel title="Screen access by role" sub="Uncheck to hide a screen in the nav. You cannot grant a screen the role does not already have by default."
-          actions={<button type="button" className="btn primary" onClick={saveMatrix}>Save access</button>}>
+        <Panel title="Screen access by role" sub="Uncheck to hide a screen in the nav. You cannot grant a screen the role does not already have by default.">
           <div className="tbl-wrap" style={{ overflowX: "auto" }}>
             <table className="tbl">
               <thead>
