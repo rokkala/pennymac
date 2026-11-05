@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { DEMO, PERSONAS, SIGNED_IN, setPersona, getPersona, getVendorScope, setVendorScope, scoped } from "./api.js";
-import { ToastHost, useApi } from "./ui.jsx";
+import { ToastHost, useApi, EmptyState } from "./ui.jsx";
 import Overview from "./pages/Overview.jsx";
 import Imports from "./pages/Imports.jsx";
 import Deliveries from "./pages/Deliveries.jsx";
@@ -13,6 +13,8 @@ import Maintenance from "./pages/Maintenance.jsx";
 import Personas from "./pages/Personas.jsx";
 import HowItWorks from "./pages/HowItWorks.jsx";
 import { canCap } from "./roles.js";
+import { parseHash, buildHash } from "./hash.js";
+import { NAV_GROUPS, visibleNav } from "./navModel.js";
 
 const PAGES = [
   { id: "overview", label: "Overview", el: Overview },
@@ -28,10 +30,11 @@ const PAGES = [
   { id: "personas", label: "Personas", el: Personas },
 ];
 
+const pageById = Object.fromEntries(PAGES.map((p) => [p.id, p]));
+
 const pageIdFromHash = () => {
-  const raw = (window.location.hash || "").replace(/^#/, "");
-  const id = raw.split("?")[0];
-  return PAGES.some((p) => p.id === id) ? id : "overview";
+  const { id } = parseHash(window.location.hash || "");
+  return pageById[id] ? id : "overview";
 };
 
 class ErrorBoundary extends React.Component {
@@ -40,11 +43,11 @@ class ErrorBoundary extends React.Component {
   render() {
     if (!this.state.error) return this.props.children;
     return (
-      <div className="panel"><div className="panel-b stack">
-        <h2>This page hit an error</h2>
-        <p className="muted">Nothing was changed. Reload the page; if it keeps happening, send the time and page to the platform team.</p>
-        <button className="btn" style={{ alignSelf: "flex-start" }} onClick={() => this.setState({ error: null })}>Try again</button>
-      </div></div>
+      <EmptyState
+        title="This page hit an error"
+        body="Nothing was changed. Reload the page; if it keeps happening, send the time and page to the platform team."
+        action={<button type="button" className="btn" onClick={() => this.setState({ error: null })}>Try again</button>}
+      />
     );
   }
 }
@@ -58,7 +61,7 @@ export default function App() {
   const screens = useApi("/api/personas/me/screens", [nonce, persona.id]);
   const { data: summary } = useApi(scoped("/api/exceptions/summary"), [nonce, vendor], { poll: 15000 });
   const { data: ntf } = useApi("/api/notifications", [nonce, persona.id], { poll: 20000 });
-  useEffect(() => { // a stored scope for a vendor that no longer exists falls back to all vendors
+  useEffect(() => {
     if (vendor && vendors.data && !vendors.data.vendors.some((v) => v.vendor_id === vendor)) { setVendorScope(null); setVendor(null); }
   }, [vendors.data]);
   const pickVendor = (id) => { setVendorScope(id); setVendor(id || null); };
@@ -72,14 +75,15 @@ export default function App() {
     if (p.id === "personas") return canCap(persona, "managePersonas");
     return true;
   });
+  const groups = visibleNav(NAV_GROUPS, navPages.map((p) => p.id));
   useEffect(() => {
     if (allowed && !allowed.includes(page)) {
       window.location.hash = "overview";
       setPage("overview");
     }
   }, [allowed, page]);
-  const Page = (PAGES.find((p) => p.id === page) || PAGES[0]).el;
-  const go = (id, qs = "") => { window.location.hash = qs ? `${id}?${qs}` : id; setPage(id); };
+  const Page = (pageById[page] || PAGES[0]).el;
+  const go = (id, qs = "") => { window.location.hash = buildHash(id, qs); setPage(id); };
   return (
     <ToastHost>
       <div className="shell">
@@ -93,16 +97,25 @@ export default function App() {
             </select>
           </label>
           <nav className="nav" aria-label="Sections">
-            {navPages.map((p) => (
-              <a key={p.id} href={`#${p.id}`} className={page === p.id ? "on" : ""} onClick={(e) => {
-                e.preventDefault();
-                if (p.id === "rules" && ntfCount > 0) go("rules", "queue=awaiting_review");
-                else go(p.id);
-              }}>
-                {p.label}
-                {p.id === "exceptions" && openCount !== null && openCount > 0 && <span className="count">{openCount}</span>}
-                {p.id === "rules" && ntfCount > 0 && <span className="count">{ntfCount}</span>}
-              </a>
+            {groups.map((g) => (
+              <div key={g.id} className="nav-group">
+                <span className="eyebrow">{g.label}</span>
+                {g.pages.map((id) => {
+                  const p = pageById[id];
+                  if (!p) return null;
+                  return (
+                    <a key={id} href={`#${id}`} className={page === id ? "on" : ""} onClick={(e) => {
+                      e.preventDefault();
+                      if (id === "rules" && ntfCount > 0) go("rules", "queue=awaiting_review");
+                      else go(id);
+                    }}>
+                      {p.label}
+                      {id === "exceptions" && openCount !== null && openCount > 0 && <span className="count">{openCount}</span>}
+                      {id === "rules" && ntfCount > 0 && <span className="count">{ntfCount}</span>}
+                    </a>
+                  );
+                })}
+              </div>
             ))}
           </nav>
           <div className="rail-foot">

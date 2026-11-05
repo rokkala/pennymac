@@ -229,6 +229,58 @@ export const Tabs = ({ tabs, value, onChange }) => (
 
 export const Loading = ({ error }) => <div className="empty">{error ? `Could not load: ${error}` : "Loading…"}</div>;
 
+/** Page chrome: eyebrow + title + sub + primary/secondary actions + optional guide link. */
+export function PageHeader({ eyebrow, title, sub, primary, secondary, guideHref }) {
+  return (
+    <div className="page-head">
+      <div>
+        {eyebrow && <span className="eyebrow">{eyebrow}</span>}
+        <h1>{title}</h1>
+        {sub && <p className="sub">{sub}</p>}
+        {guideHref && <a className="guide-link" href={guideHref}>Why this step</a>}
+      </div>
+      {(primary || secondary) && (
+        <div className="row page-head-actions">
+          {secondary}
+          {primary}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One primary action, then quieter secondary actions. */
+export function ActionBar({ primary, children }) {
+  return (
+    <div className="action-bar row">
+      {primary}
+      {children}
+    </div>
+  );
+}
+
+export function EmptyState({ title, body, action }) {
+  return (
+    <div className="empty-state">
+      <h2>{title}</h2>
+      {body && <p className="muted">{body}</p>}
+      {action}
+    </div>
+  );
+}
+
+export function QueueCard({ title, detail, cta, onClick }) {
+  return (
+    <button type="button" className="queue-card" onClick={onClick}>
+      <span className="stack" style={{ gap: 4, textAlign: "left" }}>
+        <span className="queue-card-title">{title}</span>
+        <span className="muted" style={{ fontSize: ".85rem" }}>{detail}</span>
+      </span>
+      <span className="queue-card-cta">{cta}</span>
+    </button>
+  );
+}
+
 export const Transform = ({ steps }) => (
   <span className="row" style={{ gap: 4 }}>
     {(steps || []).filter((s) => s.op !== "trim").map((s, i) => (

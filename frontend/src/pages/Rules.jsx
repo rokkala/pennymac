@@ -381,7 +381,7 @@ function RuleModal({ ruleId, persona, onChanged, onClose, onDeleted, nav, editIn
       if (src?.status === "draft") openEditor(src);
       else if (src && src.status !== "retired") newVersionFrom(src, { openEdit: false });
     }
-  }, [editIntent, data, ruleId, canEdit]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [editIntent, data, ruleId, canEdit]);
 
   if (!data || data.rule_id !== ruleId) return <Modal title="Loading…" size="lg" onClose={onClose} nav={nav}><Loading /></Modal>;
   const vs = data.versions;

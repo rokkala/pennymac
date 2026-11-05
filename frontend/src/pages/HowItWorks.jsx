@@ -1,5 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { can, canCap } from "../roles.js";
+import { PageHeader } from "../ui.jsx";
+import { parseHash } from "../hash.js";
 
 /** Product guide: Setup vs Execution, filtered by what this persona can do. */
 
@@ -218,14 +220,42 @@ function StepCard({ step, n, persona, go, showTech, active, onSelect }) {
   );
 }
 
+function applyGuideHash(setMode, setSel) {
+  const { params } = parseHash(window.location.hash || "");
+  const path = params.get("path");
+  const step = params.get("step");
+  if (path === "setup" || path === "execution") setMode(path);
+  if (step && SETUP.some((s) => s.id === step)) {
+    setMode("setup");
+    setSel(step);
+  } else if (step && EXECUTION.some((s) => s.id === step)) {
+    setMode("execution");
+    setSel(step);
+  }
+}
+
 export default function HowItWorks({ go, persona }) {
   const [mode, setMode] = useState(() => defaultMode(persona));
   const steps = mode === "setup" ? SETUP : EXECUTION;
   const firstYours = useMemo(() => steps.find((s) => isYourStep(s, persona))?.id || steps[0].id, [steps, persona]);
   const [sel, setSel] = useState(firstYours);
   const showTech = canCap(persona, "readMaintenance");
-  useEffect(() => { setSel(firstYours); }, [firstYours]);
-  useEffect(() => { setMode(defaultMode(persona)); }, [persona?.id]);
+  useEffect(() => {
+    applyGuideHash(setMode, setSel);
+    const h = () => applyGuideHash(setMode, setSel);
+    window.addEventListener("hashchange", h);
+    return () => window.removeEventListener("hashchange", h);
+  }, []);
+  useEffect(() => {
+    const { params } = parseHash(window.location.hash || "");
+    if (params.get("step")) return; // Ruling: deep-link step wins over persona default
+    setMode(defaultMode(persona));
+  }, [persona?.id]);
+  useEffect(() => {
+    const { params } = parseHash(window.location.hash || "");
+    if (params.get("step")) return;
+    setSel(firstYours);
+  }, [firstYours]);
 
   const yoursCount = steps.filter((s) => isYourStep(s, persona)).length;
   const blurb = mode === "setup"
@@ -234,18 +264,18 @@ export default function HowItWorks({ go, persona }) {
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <span className="eyebrow">Product guide</span>
-          <h1>How loan boarding works</h1>
-          <p className="sub">
+      <PageHeader
+        eyebrow="Product guide"
+        title="How loan boarding works"
+        sub={(
+          <>
             Signed in as <b>{persona.label}</b>. {blurb}{" "}
             {yoursCount > 0
               ? `${yoursCount} step${yoursCount === 1 ? "" : "s"} on this path are yours to act on.`
               : "You’re mostly an observer on this path — follow Who to see who acts."}
-          </p>
-        </div>
-      </div>
+          </>
+        )}
+      />
 
       <div className="guide-intro callout">
         <p style={{ margin: 0 }}>

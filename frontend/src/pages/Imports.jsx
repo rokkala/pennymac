@@ -124,7 +124,7 @@ function Preflight({ data, onChanged, persona, go }) {
   );
 }
 
-function ReplayModal({ data, persona, onClose, onChanged }) {
+function ReplayModal({ data, persona: _persona, onClose, onChanged }) {
   const [res, setRes] = useState(null);
   const [err, setErr] = useState(null);
   const [busy, setBusy] = useState(false);

@@ -1,33 +1,60 @@
 import React from "react";
 import { DEMO, getPersona, scoped } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, Panel, Kpis, fmt, fmtCompact, fmtMoney, Loading, Tier, TIER_NAMES } from "../ui.jsx";
+import { useApi, Panel, Kpis, fmt, fmtCompact, fmtMoney, Loading, Tier, TIER_NAMES, PageHeader, QueueCard, EmptyState } from "../ui.jsx";
 import { Lines, HBars, VBars } from "../charts.jsx";
+import { buildWorkCards } from "../workToday.js";
 
 export default function Overview({ go, persona }) {
   const ex = useApi(scoped("/api/analytics/executive"));
   const ea = useApi(scoped("/api/analytics/exceptions"));
   const cfg = useApi("/api/config");
+  const { data: summary } = useApi(scoped("/api/exceptions/summary"), [], { poll: 15000 });
+  const { data: ntf } = useApi("/api/notifications", [persona?.id], { poll: 20000 });
   if (!ex.data || !ea.data) return <Loading error={ex.error || ea.error} />;
   const e = ex.data, a = ea.data;
   const capX = e.projected_capacity_24h / e.target_24h;
   const who = persona || getPersona();
   const showDemo = !DEMO && cfg.data?.demo && cfg.data?.demo_setup?.available && canCap(who, "demoSetup");
+  const openExceptions = summary
+    ? Object.values(summary.tiers).reduce((acc, t) => acc + (t.open || 0) + (t.pending_checker || 0) + (t.escalated || 0), 0)
+    : (e.open_blocking_exceptions || 0);
+  const ntfUnread = ntf?.unread ?? (ntf?.notifications || []).filter((x) => !x.read_at).length;
+  const cards = buildWorkCards({
+    canWorkExceptions: canCap(who, "workExceptions"),
+    openExceptions,
+    canReviewRules: canCap(who, "authorRules") || canCap(who, "editRules"),
+    ntfUnread,
+    canDemoSetup: showDemo,
+    showMappingLink: canCap(who, "editMapping") || canCap(who, "approveMapping") || canCap(who, "editVendors") || canCap(who, "publishConfig"),
+    showPolicyLink: canCap(who, "editPolicy") || canCap(who, "readAudit"),
+  });
+
+  let primary = <button type="button" className="btn primary" onClick={() => go("guide")}>Walk the product</button>;
+  if (canCap(who, "workExceptions")) {
+    primary = <button type="button" className="btn primary" onClick={() => go("exceptions")}>Work exceptions</button>;
+  } else if (canCap(who, "upload")) {
+    primary = <button type="button" className="btn primary" onClick={() => go("imports")}>Upload a file</button>;
+  }
+  const secondary = (
+    <>
+      <button type="button" className="btn" onClick={() => go("guide")}>How it works</button>
+      {showDemo && <button type="button" className="btn" onClick={() => go("governance")}>Demo setup…</button>}
+      {canCap(who, "upload") && canCap(who, "workExceptions") && (
+        <button type="button" className="btn" onClick={() => go("imports")}>Upload a file</button>
+      )}
+    </>
+  );
+
   return (
     <>
-      <div className="page-head">
-        <div>
-          <span className="eyebrow">Executive summary</span>
-          <h1>Loan boarding at a glance</h1>
-          <p className="sub">Loans mapped from every vendor feed, validated against the SSE rule set and boarded in micro-batches. Anything that fails is routed by confidence and risk tier.</p>
-        </div>
-        <div className="row">
-          <button className="btn" onClick={() => go("guide")}>How it works</button>
-          {showDemo && <button className="btn" onClick={() => go("governance")}>Demo setup…</button>}
-          {canCap(who, "upload") && <button className="btn" onClick={() => go("imports")}>Upload a file</button>}
-          {canCap(who, "workExceptions") && <button className="btn primary" onClick={() => go("exceptions")}>Work exceptions</button>}
-        </div>
-      </div>
+      <PageHeader
+        eyebrow="Home"
+        title="Loan boarding"
+        sub="Loans mapped from every vendor feed, validated against the SSE rule set, and boarded in micro-batches. Failures route by confidence and risk tier."
+        primary={primary}
+        secondary={secondary}
+      />
       <Kpis items={[
         { label: "Loans boarded", value: fmt(e.loans_boarded_total), detail: `${fmtMoney(e.upb_boarded)} UPB` },
         { label: "Straight-through", value: `${fmt(e.straight_through_rate, 1)}%`, detail: `of ${fmt(e.loans_processed)} processed` },
@@ -35,6 +62,33 @@ export default function Overview({ go, persona }) {
         { label: "Compliance blocks", value: fmt(e.compliance_blocks), detail: "OFAC / fraud · T5" },
         { label: "Projected capacity", value: `${fmtCompact(e.projected_capacity_24h)}/24h`, detail: `${fmt(capX, 0)}× the 1M target at peak` },
       ]} />
+
+      <section className="stack" style={{ gap: 12 }}>
+        <div>
+          <span className="eyebrow">Your work today</span>
+          <h2 style={{ fontSize: "1.08rem", marginTop: 4 }}>Queues for {who.label}</h2>
+        </div>
+        {cards.length === 0 ? (
+          <EmptyState
+            title="You’re caught up"
+            body="No open queues for your role right now."
+            action={<button type="button" className="btn primary" onClick={() => go("guide")}>Walk the product</button>}
+          />
+        ) : (
+          <div className="queue-grid">
+            {cards.map((c) => (
+              <QueueCard
+                key={c.id}
+                title={c.title}
+                detail={c.detail}
+                cta={c.cta}
+                onClick={() => go(c.page, c.qs || "")}
+              />
+            ))}
+          </div>
+        )}
+      </section>
+
       <div className="grid g-side">
         {a.trend.length >= 3 ? (
           <Panel title="Exceptions over time" sub="Created vs resolved per day, last 30 days">
@@ -53,7 +107,7 @@ export default function Overview({ go, persona }) {
             ]} />
           </Panel>
         )}
-        <Panel title="Where exceptions land" sub="Confidence × risk routing" actions={<button className="btn sm" onClick={() => go("exceptions")}>Open queues</button>}>
+        <Panel title="Where exceptions land" sub="Confidence × risk routing" actions={<button type="button" className="btn sm" onClick={() => go("exceptions")}>Open queues</button>}>
           <VBars items={a.by_tier.map((t) => ({ label: t.tier, title: `${t.tier} · ${TIER_NAMES[t.tier]}`, value: t.count, color: `var(--t${t.tier[1]})` }))} />
           <div className="row" style={{ marginTop: 8, gap: 12, fontSize: ".78rem" }}>
             {a.by_tier.map((t) => <span key={t.tier} className="row" style={{ gap: 4 }}><Tier t={t.tier} />{t.label}</span>)}
