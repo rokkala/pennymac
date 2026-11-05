@@ -36,9 +36,10 @@ export default function Overview({ go, persona }) {
   } else if (canCap(who, "upload")) {
     primary = <button type="button" className="btn primary" onClick={() => go("imports")}>Upload a file</button>;
   }
+  const primaryIsGuide = !canCap(who, "workExceptions") && !canCap(who, "upload");
   const secondary = (
     <>
-      <button type="button" className="btn" onClick={() => go("guide")}>How it works</button>
+      {!primaryIsGuide && <button type="button" className="btn" onClick={() => go("guide")}>How it works</button>}
       {showDemo && <button type="button" className="btn" onClick={() => go("governance")}>Demo setup…</button>}
       {canCap(who, "upload") && canCap(who, "workExceptions") && (
         <button type="button" className="btn" onClick={() => go("imports")}>Upload a file</button>

@@ -248,14 +248,16 @@ export default function HowItWorks({ go, persona }) {
   }, []);
   useEffect(() => {
     const { params } = parseHash(window.location.hash || "");
-    if (params.get("step")) return; // Ruling: deep-link step wins over persona default
+    // Ruling: path or step deep-link wins over persona default mode
+    if (params.get("step") || params.get("path")) return;
     setMode(defaultMode(persona));
   }, [persona?.id]);
   useEffect(() => {
     const { params } = parseHash(window.location.hash || "");
-    if (params.get("step")) return;
-    setSel(firstYours);
-  }, [firstYours]);
+    const step = params.get("step");
+    // Honor deep-linked step only while it belongs to the active path list
+    setSel(step && steps.some((s) => s.id === step) ? step : firstYours);
+  }, [firstYours, steps]);
 
   const yoursCount = steps.filter((s) => isYourStep(s, persona)).length;
   const blurb = mode === "setup"

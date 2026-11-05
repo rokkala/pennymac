@@ -260,7 +260,10 @@ ol.steps li::marker { color: var(--ink-3); font: .78rem var(--f-mono); }
   .shell { grid-template-columns: minmax(0, 1fr); }
   .rail { position: static; height: auto; padding: 10px max(16px, env(safe-area-inset-left, 0px)); flex-direction: column; }
   .brand { padding: 2px 0 8px; }
-  .nav { flex-direction: row; overflow-x: auto; }
+  .nav { flex-direction: row; overflow-x: auto; align-items: center; }
+  .nav-group { flex-direction: row; align-items: center; }
+  .nav-group + .nav-group { margin-top: 0; margin-left: 8px; }
+  .nav-group > .eyebrow { white-space: nowrap; padding: 0 4px 0 0; }
   .nav a { white-space: nowrap; }
   .nav a.on { box-shadow: inset 0 -3px 0 var(--accent); }
   .rail-foot { flex-direction: row; align-items: center; padding: 8px 0 0; margin: 0; }
