@@ -43,7 +43,9 @@
   --rail-active: #1c3139; --pass: #5cc68a; --pass-soft: #163527; --warn: #e0a640; --warn-soft: #3a2c10; --fail: #f07a70; --fail-soft: #3d1a17;
   --t1: #5cc68a; --t2: #4fb8b8; --t3: #cdb94a; --t4: #e39a4a; --t5: #f07a70;
   --chart-1: #16a3a6; --chart-2: #c4841c; --chart-3: #6a80d4; --chart-grid: #22333c;
-  --shadow: 0 1px 2px rgba(0, 0, 0, .3); color-scheme: dark;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .3);
+  --elevated: 0 2px 6px rgba(0, 0, 0, .35), 0 10px 24px rgba(0, 0, 0, .25);
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
