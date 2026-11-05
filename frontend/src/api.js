@@ -6,7 +6,6 @@ export const PERSONAS = [
   { id: "dan.sme", label: "Dan · SME", roles: ["sme", "analyst"] },
   { id: "maria.ops", label: "Maria · Boarding Ops", roles: ["ops"] },
   { id: "lee.reviewer", label: "Lee · Exception Reviewer", roles: ["reviewer"] },
-  { id: "sam.checker", label: "Sam · Checker", roles: ["checker", "reviewer"] },
   { id: "ana.compliance", label: "Ana · Compliance", roles: ["compliance", "checker"] },
   { id: "admin", label: "Platform Admin", roles: ["admin", "analyst", "sme", "ops", "reviewer", "checker", "compliance"] },
 ];

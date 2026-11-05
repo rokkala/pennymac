@@ -219,7 +219,7 @@ def _build_scenario(tmp: Path, rows: int) -> None:
             elif ex["tier"] == "T4" and r < 0.12 and ex["proposal"]:
                 m.resolve(ex["exception_id"], "lee.reviewer", ["reviewer"], use_proposal=True)
                 if r < 0.07:
-                    m.checker_decision(ex["exception_id"], "sam.checker", ["checker"], True, "Verified against note")
+                    m.checker_decision(ex["exception_id"], "ana.compliance", ["checker", "compliance"], True, "Verified against note")
         except ExceptionActionError:
             pass
 
@@ -453,7 +453,7 @@ def _build_scenario(tmp: Path, rows: int) -> None:
             try:
                 m.resolve(chg[0]["exception_id"], "lee.reviewer", ["reviewer"], use_proposal=True,
                           comment="Rate modification letter on file")
-                m.checker_decision(chg[0]["exception_id"], "sam.checker", ["checker"], True,
+                m.checker_decision(chg[0]["exception_id"], "ana.compliance", ["checker", "compliance"], True,
                                    "Verified against modification agreement")
             except ExceptionActionError:
                 pass

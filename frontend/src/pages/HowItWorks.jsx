@@ -142,7 +142,7 @@ const EXECUTION = [
     where: "Exception Manager",
     page: "exceptions",
     youIf: "workExceptions",
-    ask: "Reviewer → Checker → Compliance by tier",
+    ask: "Reviewer → Compliance (checker) by tier",
     rolesCare: ["reviewer", "checker", "compliance", "admin"],
   },
   {

@@ -188,7 +188,7 @@ Overview Band B prefers existing endpoints:
 Per phase:
 
 - `npm run lint` on touched files.
-- Manual persona matrix: Ops, Analyst, SME, Reviewer, Checker, Compliance, Admin — each sees correct nav groups and Overview cards.
+- Manual persona matrix: Ops, Analyst, SME, Reviewer, Compliance (also checker), Admin — each sees correct nav groups and Overview cards.
 - `npm run build` and `npm run build:demo`; open demo once for shell + Overview + one Setup + one Run page.
 - No Playwright suite required unless already present (YAGNI).
 
