@@ -51,3 +51,7 @@ graphify-out/*/
 !graphify-out/manifest.json
 !graphify-out/cost.json
 .github/workflows/
+
+# Superpowers brainstorm companion
+.superpowers/
+docs/superpowers/palette-picker.html
