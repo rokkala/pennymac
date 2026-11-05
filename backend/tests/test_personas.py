@@ -56,6 +56,25 @@ def test_cannot_disable_last_admin(env):
         set_user("admin.only@example.com", enabled=False, actor="admin.only@example.com")
 
 
+def test_demo_cast_seed_and_switcher_api(client):
+    from lbp.personas import DEMO_CAST, cast_for_switcher, ensure_demo_cast, list_users
+
+    ensure_demo_cast(actor="test")
+    users = list_users()
+    emails = {u["email"] for u in users}
+    assert {r["email"] for r in DEMO_CAST} <= emails
+    cast = cast_for_switcher()
+    assert [p["id"] for p in cast[: len(DEMO_CAST)]] == [r["id"] for r in DEMO_CAST]
+    assert all(len(p["roles"]) == 1 for p in cast)
+
+    h_ops = {"X-User": "maria.ops", "X-Roles": "ops"}
+    r = client.get("/api/personas/cast", headers=h_ops)
+    assert r.status_code == 200
+    ids = [p["id"] for p in r.json()["cast"]]
+    assert "lee.reviewer" in ids and "ana.compliance" in ids
+    assert client.get("/api/personas/users", headers=h_ops).status_code == 403
+
+
 def test_api_personas_admin_and_me_screens(client):
     h_admin = {"X-User": "admin", "X-Roles": "admin"}
     h_ops = {"X-User": "maria", "X-Roles": "ops"}

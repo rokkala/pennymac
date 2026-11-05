@@ -51,6 +51,17 @@ _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MATRIX_KEY = "screen_matrix"
 _USERS_KEY = "persona_users"
 
+# Demo / local training cast — one Cognito role each; also listed on Personas → Users.
+# Dual-control: Lee (reviewer) makes; Ana (compliance) checks via CAPS.checkerApprove.
+DEMO_CAST: tuple[dict[str, str], ...] = (
+    {"id": "priya.analyst", "email": "priya.analyst@demo.lbp.local", "label": "Priya · Data Analyst", "role": "analyst"},
+    {"id": "dan.sme", "email": "dan.sme@demo.lbp.local", "label": "Dan · SME", "role": "sme"},
+    {"id": "maria.ops", "email": "maria.ops@demo.lbp.local", "label": "Maria · Boarding Ops", "role": "ops"},
+    {"id": "lee.reviewer", "email": "lee.reviewer@demo.lbp.local", "label": "Lee · Exception Reviewer", "role": "reviewer"},
+    {"id": "ana.compliance", "email": "ana.compliance@demo.lbp.local", "label": "Ana · Compliance", "role": "compliance"},
+    {"id": "admin", "email": "admin@demo.lbp.local", "label": "Platform Admin", "role": "admin"},
+)
+
 
 class PersonaError(ValueError):
     pass
@@ -177,6 +188,66 @@ def list_users() -> list[dict]:
     if _use_cognito():
         return _cognito_list()
     return sorted(_load_local(), key=lambda u: u.get("email") or "")
+
+
+def ensure_demo_cast(*, actor: str = "system") -> list[dict]:
+    """Upsert DEMO_CAST into the local user directory (no-op under Cognito)."""
+    if _use_cognito():
+        return []
+    users = _load_local()
+    by_user = {u.get("username"): u for u in users}
+    by_email = {u.get("email"): u for u in users}
+    changed = False
+    for row in DEMO_CAST:
+        uid, email, label, role = row["id"], row["email"], row["label"], row["role"]
+        existing = by_user.get(uid) or by_email.get(email)
+        if existing:
+            if existing.get("label") != label or existing.get("role") != role or not existing.get("enabled", True):
+                existing["label"] = label
+                existing["role"] = role
+                existing["enabled"] = True
+                existing.setdefault("status", "CONFIRMED")
+                changed = True
+            continue
+        users.append({
+            "username": uid,
+            "email": email,
+            "label": label,
+            "role": role,
+            "enabled": True,
+            "status": "CONFIRMED",
+            "demo_cast": True,
+        })
+        changed = True
+    if changed:
+        _save_local(users, actor, "personas.cast.ensure", {"count": len(DEMO_CAST)})
+    return list_users()
+
+
+def cast_for_switcher() -> list[dict]:
+    """People available in the Signed-in-as switcher (local demo cast + enabled directory)."""
+    ensure_demo_cast()
+    if _use_cognito():
+        # JWT mode: no header switcher; empty cast. Cognito users are managed in Personas.
+        return []
+    out = []
+    for u in list_users():
+        if not u.get("enabled", True):
+            continue
+        role = u.get("role")
+        if role not in ROLES:
+            continue
+        label = u.get("label") or u.get("email") or u.get("username")
+        out.append({
+            "id": u.get("username") or u.get("email"),
+            "label": label,
+            "email": u.get("email"),
+            "roles": [role],
+        })
+    # Stable demo order first, then any extra admin-created users
+    order = {row["id"]: i for i, row in enumerate(DEMO_CAST)}
+    out.sort(key=lambda p: (order.get(p["id"], 1000), p["label"]))
+    return out
 
 
 def get_user(username: str) -> dict:

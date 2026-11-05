@@ -9,11 +9,11 @@ from sqlalchemy import insert, select, update
 
 from .store import db
 
-# Mirrors frontend PERSONAS used for X-User demo auth.
+# Fallback when the Personas directory is empty (mirrors DEMO_CAST one-role users).
 PEER_DIRECTORY = [
-    {"id": "dan.sme", "roles": ["sme", "analyst"]},
-    {"id": "ana.compliance", "roles": ["compliance", "checker"]},
-    {"id": "admin", "roles": ["admin", "analyst", "sme", "ops", "reviewer", "checker", "compliance"]},
+    {"id": "dan.sme", "roles": ["sme"]},
+    {"id": "ana.compliance", "roles": ["compliance"]},
+    {"id": "admin", "roles": ["admin"]},
 ]
 
 

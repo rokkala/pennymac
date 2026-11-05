@@ -14,6 +14,7 @@ assert.equal(can(lee, "reviewer"), true);
 assert.equal(can(lee, "ops"), false);
 assert.ok(CAPS.replay.includes("ops"));
 assert.equal(canCap(lee, "readMaintenance"), false);
-assert.equal(canCap({ id: "dan.sme", roles: ["sme", "analyst"] }, "readMaintenance"), true);
+assert.equal(canCap({ id: "dan.sme", roles: ["sme"] }, "readMaintenance"), true);
+assert.equal(canCap({ id: "ana.compliance", roles: ["compliance"] }, "checkerApprove"), true);
 assert.equal(canCap(admin, "readMaintenance"), true);
 console.log("check-can ok");

@@ -79,7 +79,7 @@ export default function Personas({ persona, go }) {
       <PageHeader
         eyebrow="Govern"
         title="Personas"
-        sub="Create Cognito users (one role each) and hide screens a role does not need. API permissions stay fixed in code."
+        sub="User and role directory for Cognito (one role each). Local demo seeds six people into this list; the Signed-in-as switcher reads the same cast. API permissions stay fixed in code."
         primary={tab === "screens" ? <button type="button" className="btn primary" onClick={saveMatrix}>Save access</button> : <button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>Add user</button>}
         secondary={(
           <>
@@ -90,13 +90,14 @@ export default function Personas({ persona, go }) {
       />
 
       {tab === "users" && (
-        <Panel title="Users" sub="One Cognito group per person. Temp password forces change on first sign-in.">
+        <Panel title="Users" sub="One Cognito group per person. Display name feeds the Signed-in-as switcher in local/demo mode.">
           <div className="tbl-wrap" style={{ overflowX: "auto" }}>
             <table className="tbl">
-              <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Enabled</th><th /></tr></thead>
+              <thead><tr><th>Display name</th><th>Email</th><th>Role</th><th>Status</th><th>Enabled</th><th /></tr></thead>
               <tbody>
                 {(usersApi.data.users || []).map((u) => (
                   <tr key={u.username || u.email}>
+                    <td>{u.label || "—"}</td>
                     <td>{u.email}</td>
                     <td>
                       <select aria-label={`Role for ${u.email}`} value={u.role || ""}
@@ -114,7 +115,7 @@ export default function Personas({ persona, go }) {
                     </td>
                   </tr>
                 ))}
-                {!usersApi.data.users?.length && <tr><td colSpan={5} className="muted">No users yet.</td></tr>}
+                {!usersApi.data.users?.length && <tr><td colSpan={6} className="muted">No users yet.</td></tr>}
               </tbody>
             </table>
           </div>

@@ -42,9 +42,9 @@ export function createMockApi() {
   const has = (user, ...roles) => user.roles.some((r) => roles.includes(r) || r === "admin");
   const notifications = []; // in-app review inbox (demo)
   const PEERS = [
-    { id: "dan.sme", roles: ["sme", "analyst"] },
-    { id: "ana.compliance", roles: ["compliance", "checker"] },
-    { id: "admin", roles: ["admin", "sme", "compliance"] },
+    { id: "dan.sme", roles: ["sme"] },
+    { id: "ana.compliance", roles: ["compliance"] },
+    { id: "admin", roles: ["admin"] },
   ];
   const pushNtf = (userId, kind, title, body, entity_id) => {
     notifications.unshift({ id: uid("ntf"), user_id: userId, kind, title, body: body || "", entity_type: "rule", entity_id, read_at: null, created_at: now() });
@@ -186,7 +186,22 @@ export function createMockApi() {
   };
   const personaDefaults = Object.fromEntries(PERSONA_ROLES.map((r) => [r, PERSONA_SCREENS.map((x) => x.id).filter((id) => personaAccess[id].includes(r))]));
   const personaMatrix = clone(personaDefaults);
-  const personaUsers = [];
+  const DEMO_CAST = [
+    { id: "priya.analyst", email: "priya.analyst@demo.lbp.local", label: "Priya · Data Analyst", role: "analyst" },
+    { id: "dan.sme", email: "dan.sme@demo.lbp.local", label: "Dan · SME", role: "sme" },
+    { id: "maria.ops", email: "maria.ops@demo.lbp.local", label: "Maria · Boarding Ops", role: "ops" },
+    { id: "lee.reviewer", email: "lee.reviewer@demo.lbp.local", label: "Lee · Exception Reviewer", role: "reviewer" },
+    { id: "ana.compliance", email: "ana.compliance@demo.lbp.local", label: "Ana · Compliance", role: "compliance" },
+    { id: "admin", email: "admin@demo.lbp.local", label: "Platform Admin", role: "admin" },
+  ];
+  const personaUsers = DEMO_CAST.map((r) => ({
+    username: r.id, email: r.email, label: r.label, role: r.role, enabled: true, status: "CONFIRMED", demo_cast: true,
+  }));
+  const castPayload = () => ({
+    cast: personaUsers.filter((u) => u.enabled).map((u) => ({
+      id: u.username || u.email, label: u.label || u.email, email: u.email, roles: [u.role],
+    })),
+  });
   const screensPayload = () => ({ screens: PERSONA_SCREENS, roles: PERSONA_ROLES, defaults: personaDefaults, matrix: personaMatrix });
   const visibleScreens = (user) => {
     if (has(user, "admin")) return PERSONA_SCREENS.map((x) => x.id);
@@ -736,6 +751,7 @@ export function createMockApi() {
       return { artifacts: listMaintenanceArtifacts() };
     }],
     ["GET", /^\/api\/personas\/me\/screens$/, (m, b, user) => ({ screens: visibleScreens(user) })],
+    ["GET", /^\/api\/personas\/cast$/, () => castPayload()],
     ["GET", /^\/api\/personas\/screens$/, (m, b, user) => {
       if (!has(user, "admin")) fail("requires one of: admin");
       return screensPayload();

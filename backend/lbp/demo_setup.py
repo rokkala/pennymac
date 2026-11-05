@@ -121,6 +121,9 @@ def run_demo_setup(
         wipe_data_dir(settings.data_dir)
         settings = get_settings()
     RuleRegistry().seed_defaults()
+    from .personas import ensure_demo_cast
+
+    ensure_demo_cast(actor="demo_setup")
 
     work = settings.data_dir / "demo_work"
     work.mkdir(parents=True, exist_ok=True)

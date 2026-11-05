@@ -178,6 +178,13 @@ async def lifespan(_app):
     nt = rule_tpl.seed_builtins()
     if nt:
         log.info("seeded %d rule templates", nt)
+    if s.env == "local":
+        try:
+            from ..personas import ensure_demo_cast
+
+            ensure_demo_cast(actor="system")
+        except Exception:  # noqa: BLE001 - local cast seed is best-effort
+            log.exception("demo cast seed failed")
     stop = None
     if s.scheduler_enabled and s.env == "local":
         stop = _start_local_scheduler()
@@ -1719,6 +1726,14 @@ def personas_my_screens(user: User = Depends(current_user)):
     from ..personas import visible_screens
 
     return {"screens": visible_screens(user.roles)}
+
+
+@app.get("/api/personas/cast")
+def personas_cast():
+    """Signed-in-as switcher people (local demo cast + enabled directory). Open to any auth user."""
+    from ..personas import cast_for_switcher
+
+    return {"cast": cast_for_switcher()}
 
 
 @app.get("/api/personas/screens")

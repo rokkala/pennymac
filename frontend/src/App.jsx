@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { DEMO, PERSONAS, SIGNED_IN, setPersona, getPersona, getVendorScope, setVendorScope, scoped } from "./api.js";
+import { DEMO, FALLBACK_CAST, SIGNED_IN, setPersona, getPersona, getVendorScope, setVendorScope, scoped } from "./api.js";
 import { ToastHost, useApi, EmptyState } from "./ui.jsx";
 import Overview from "./pages/Overview.jsx";
 import Imports from "./pages/Imports.jsx";
@@ -60,12 +60,24 @@ export default function App() {
   const [vendor, setVendor] = useState(getVendorScope());
   const [theme, setThemeState] = useState(getTheme);
   const vendors = useApi("/api/vendors", [nonce]);
+  const castApi = useApi(SIGNED_IN ? null : "/api/personas/cast", [nonce]);
+  const cast = (castApi.data?.cast?.length ? castApi.data.cast : FALLBACK_CAST);
   const screens = useApi("/api/personas/me/screens", [nonce, persona.id]);
   const { data: summary } = useApi(scoped("/api/exceptions/summary"), [nonce, vendor], { poll: 15000 });
   const { data: ntf } = useApi("/api/notifications", [nonce, persona.id], { poll: 20000 });
   useEffect(() => {
     if (vendor && vendors.data && !vendors.data.vendors.some((v) => v.vendor_id === vendor)) { setVendorScope(null); setVendor(null); }
   }, [vendors.data]);
+  useEffect(() => {
+    if (SIGNED_IN || !castApi.data?.cast?.length) return;
+    const match = castApi.data.cast.find((x) => x.id === persona.id);
+    if (match && (match.label !== persona.label || JSON.stringify(match.roles) !== JSON.stringify(persona.roles))) {
+      setPersona(match); setP(match);
+    } else if (!match) {
+      const next = castApi.data.cast[0];
+      setPersona(next); setP(next); setNonce((n) => n + 1);
+    }
+  }, [castApi.data]);
   const pickVendor = (id) => { setVendorScope(id); setVendor(id || null); };
   useEffect(() => { const h = () => setPage(pageIdFromHash()); window.addEventListener("hashchange", h); return () => window.removeEventListener("hashchange", h); }, []);
   const openCount = summary ? Object.values(summary.tiers).reduce((a, t) => a + (t.open || 0) + (t.pending_checker || 0) + (t.escalated || 0), 0) : null;
@@ -133,8 +145,8 @@ export default function App() {
                 <span>{SIGNED_IN.roles.join(", ") || "no roles"}</span>
                 <button className="btn sm" onClick={async () => (await import("./auth.js")).logout()}>Sign out</button></span>
             ) : (
-              <select id="persona" aria-label="Signed in as" value={persona.id} onChange={(e) => { const p = PERSONAS.find((x) => x.id === e.target.value); setPersona(p); setP(p); setNonce((n) => n + 1); }}>
-                {PERSONAS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+              <select id="persona" aria-label="Signed in as" value={persona.id} onChange={(e) => { const p = cast.find((x) => x.id === e.target.value); if (!p) return; setPersona(p); setP(p); setNonce((n) => n + 1); }}>
+                {cast.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
               </select>)}
             {DEMO && <span className="demo-tag">DEMO · synthetic loans, in-browser API</span>}
           </div>
