@@ -8,8 +8,34 @@ export function buildWorkCards({
   canDemoSetup,
   showMappingLink,
   showPolicyLink,
+  lateDeliveries = 0,
+  runningBatches = 0,
+  stuckBatches = 0,
 }) {
   const cards = [];
+  if (lateDeliveries > 0 || stuckBatches > 0) {
+    cards.push({
+      id: "loads",
+      title: "Loads need attention",
+      detail: [
+        lateDeliveries > 0 ? `${lateDeliveries} late/missed` : null,
+        stuckBatches > 0 ? `${stuckBatches} stuck` : null,
+      ].filter(Boolean).join(" · "),
+      cta: "See desk",
+      page: "overview",
+      qs: "focus=attention",
+    });
+  }
+  if (runningBatches > 0) {
+    cards.push({
+      id: "running",
+      title: "Batches running",
+      detail: `${runningBatches} in flight`,
+      cta: "Watch progress",
+      page: "overview",
+      qs: "focus=attention",
+    });
+  }
   if (canWorkExceptions && openExceptions > 0) {
     cards.push({
       id: "exceptions",

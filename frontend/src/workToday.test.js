@@ -27,7 +27,7 @@ describe("buildWorkCards", () => {
     });
     assert.equal(cards.find((c) => c.id === "rule_reviews"), undefined);
   });
-  it("orders exceptions then reviews then demo then mapping then policy", () => {
+  it("orders loads then running then exceptions then reviews then demo then mapping then policy", () => {
     const cards = buildWorkCards({
       canWorkExceptions: true,
       openExceptions: 3,
@@ -36,11 +36,13 @@ describe("buildWorkCards", () => {
       canDemoSetup: true,
       showMappingLink: true,
       showPolicyLink: true,
+      lateDeliveries: 2,
+      runningBatches: 1,
+      stuckBatches: 1,
     });
-    assert.deepEqual(cards.map((c) => c.id), ["exceptions", "rule_reviews", "demo_setup", "mapping", "policy"]);
-    assert.equal(cards[0].detail, "3 needing attention");
-    assert.equal(cards[1].qs, "queue=awaiting_review");
-    assert.equal(cards[1].page, "rules");
-    assert.equal(cards[0].cta, "Work queue");
+    assert.deepEqual(cards.map((c) => c.id), ["loads", "running", "exceptions", "rule_reviews", "demo_setup", "mapping", "policy"]);
+    assert.equal(cards[0].detail, "2 late/missed · 1 stuck");
+    assert.equal(cards[2].cta, "Work queue");
+    assert.equal(cards[3].qs, "queue=awaiting_review");
   });
 });
