@@ -15,6 +15,7 @@ import HowItWorks from "./pages/HowItWorks.jsx";
 import { canCap } from "./roles.js";
 import { parseHash, buildHash } from "./hash.js";
 import { NAV_GROUPS, visibleNav } from "./navModel.js";
+import { getTheme, setTheme } from "./theme.js";
 
 const PAGES = [
   { id: "overview", label: "Overview", el: Overview },
@@ -57,6 +58,7 @@ export default function App() {
   const [persona, setP] = useState(getPersona());
   const [nonce, setNonce] = useState(0);
   const [vendor, setVendor] = useState(getVendorScope());
+  const [theme, setThemeState] = useState(getTheme);
   const vendors = useApi("/api/vendors", [nonce]);
   const screens = useApi("/api/personas/me/screens", [nonce, persona.id]);
   const { data: summary } = useApi(scoped("/api/exceptions/summary"), [nonce, vendor], { poll: 15000 });
@@ -119,6 +121,12 @@ export default function App() {
             ))}
           </nav>
           <div className="rail-foot">
+            <div className="theme-toggle" role="group" aria-label="Color theme">
+              <button type="button" className={theme === "light" ? "on" : ""} aria-pressed={theme === "light"}
+                onClick={() => setThemeState(setTheme("light"))}>Light</button>
+              <button type="button" className={theme === "dark" ? "on" : ""} aria-pressed={theme === "dark"}
+                onClick={() => setThemeState(setTheme("dark"))}>Dark</button>
+            </div>
             <span className="eyebrow" style={{ color: "var(--rail-ink)" }}>Signed in as</span>
             {SIGNED_IN ? (
               <span className="stack" style={{ gap: 4 }}><b style={{ color: "#fff", overflowWrap: "anywhere" }}>{SIGNED_IN.label}</b>

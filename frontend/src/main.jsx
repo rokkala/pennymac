@@ -2,8 +2,10 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App.jsx";
 import { DEMO, setSignedIn } from "./api.js";
+import { initTheme } from "./theme.js";
 import "./styles.css";
 
+initTheme();
 const root = createRoot(document.getElementById("root"));
 
 async function boot() {

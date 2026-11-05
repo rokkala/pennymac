@@ -1,5 +1,6 @@
 /* Layout: fixed left rail of workflow areas + scrolling work surface; on phones the rail becomes a top strip. */
-:root {
+:root,
+:root[data-theme="light"] {
   /* B · Trust navy + blue */
   --bg: #f8fafc;
   --surface: #ffffff;
@@ -81,6 +82,10 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .nav .count { font: 500 .72rem var(--f-mono); background: rgba(255,255,255,.1); padding: 1px 7px; border-radius: 10px; }
 .rail-foot { margin-top: auto; display: flex; flex-direction: column; gap: 8px; padding: 10px; font-size: .75rem; }
 .rail-foot select { background: var(--rail-active); border: 1px solid #2a4060; color: #fff; border-radius: var(--r); padding: 6px 8px; width: 100%; }
+.theme-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.theme-toggle button { border: 1px solid #2a4060; background: transparent; color: var(--rail-ink); border-radius: var(--r); padding: 5px 8px; cursor: pointer; font: 600 .72rem var(--f-body); }
+.theme-toggle button:hover { background: var(--rail-active); color: #fff; }
+.theme-toggle button.on { background: var(--rail-active); color: #fff; box-shadow: inset 0 0 0 1px var(--accent); }
 .demo-tag { font: 600 .68rem var(--f-mono); color: #ffd58a; letter-spacing: .04em; }
 
 .main { min-width: 0; padding-block: 22px 60px; padding-left: max(24px, env(safe-area-inset-left, 0px)); padding-right: max(24px, env(safe-area-inset-right, 0px)); display: flex; flex-direction: column; gap: 18px; }
