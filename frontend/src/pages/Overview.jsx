@@ -1,11 +1,71 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { DEMO, api, getPersona, scoped } from "../api.js";
-import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Kpis, fmt, fmtCompact, fmtMoney, Loading, Tier, TIER_NAMES, PageHeader, QueueCard, EmptyState, Status, Modal, ago, useDialog } from "../ui.jsx";
+import { can, canCap, isMonitoringExceptionDesk } from "../roles.js";
+import { SCREEN } from "../screenCopy.js";
+import { useApi, useAction, Panel, Kpis, fmt, fmtCompact, fmtMoney, Loading, Tier, TIER_NAMES, PageHeader, QueueCard, EmptyState, Status, Modal, Tabs, ago, useDialog } from "../ui.jsx";
 import { Lines, HBars, VBars } from "../charts.jsx";
-import { buildWorkCards } from "../workToday.js";
-import { buildAttentionRows, buildLoadHealth } from "../loadDesk.js";
+import { buildWorkCards, queueHandoff } from "../workToday.js";
+import { buildAttentionRows, buildLoadHealth, scheduleDays } from "../loadDesk.js";
 import { BatchModal } from "./Imports.jsx";
+
+function ScheduleModal({ onClose, onOpen, go }) {
+  const board = useApi(scoped("/api/deliveries?days_back=14&days_ahead=1"), [], { poll: 15000 });
+  const [day, setDay] = useState(null);
+  const days = useMemo(() => scheduleDays(board.data?.deliveries || []), [board.data]);
+  const selected = day && days.dates.some((d) => d.id === day) ? day : days.today;
+  const meta = days.dates.find((d) => d.id === selected);
+  const rows = days.byDate[selected] || [];
+  return (
+    <Modal
+      title={meta?.heading || "Schedule"}
+      sub={meta ? `${meta.count} scheduled${meta.missed ? ` · ${meta.missed} missed` : ""}` : ""}
+      size="lg"
+      onClose={onClose}
+      footer={(
+        <>
+          <button type="button" className="btn" onClick={onClose}>Close</button>
+          <button type="button" className="btn" onClick={() => { onClose(); go("deliveries"); }}>Open delivery schedule</button>
+        </>
+      )}
+    >
+      {!board.data ? <Loading error={board.error} /> : (
+        <>
+          <div>
+            <span className="eyebrow">Date</span>
+            <Tabs
+              value={selected}
+              onChange={setDay}
+              tabs={days.dates.map((d) => ({ id: d.id, label: d.label, count: d.missed || undefined }))}
+            />
+          </div>
+          {rows.length === 0 ? (
+            <EmptyState title="Nothing scheduled" body="No windows on this date." />
+          ) : (
+            <div className="tbl-wrap">
+              <table className="tbl">
+                <thead>
+                  <tr><th>Date</th><th>Feed</th><th>Status</th></tr>
+                </thead>
+                <tbody>
+                  {rows.map((row) => (
+                    <tr key={row.delivery.delivery_id} className="click" onClick={() => onOpen(row.delivery)}>
+                      <td><b className="num">{row.when}</b></td>
+                      <td>
+                        {row.delivery.vendor_name || row.delivery.source_name || row.delivery.schedule_name}
+                        <div className="faint" style={{ fontSize: ".76rem" }}>{row.delivery.schedule_name}</div>
+                      </td>
+                      <td><Status s={row.delivery.status} /></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </Modal>
+  );
+}
 
 function DeliveryWatch({ delivery, persona, onClose, onOpenBatch, go, onChanged }) {
   const act = useAction();
@@ -40,7 +100,7 @@ function DeliveryWatch({ delivery, persona, onClose, onOpenBatch, go, onChanged 
         footer={(
           <>
             <button type="button" className="btn" onClick={onClose}>Close</button>
-            <button type="button" className="btn" onClick={() => go("deliveries")}>Open Vendor Deliveries</button>
+            <button type="button" className="btn" onClick={() => go("deliveries")}>Open delivery schedule</button>
             {batchId && <button type="button" className="btn primary" onClick={() => onOpenBatch(batchId)}>Watch batch</button>}
           </>
         )}
@@ -77,6 +137,7 @@ export default function Overview({ go, persona }) {
   const { data: ntf } = useApi("/api/notifications", [who?.id], { poll: 20000 });
   const [batchId, setBatchId] = useState(null);
   const [watch, setWatch] = useState(null);
+  const [scheduleOpen, setScheduleOpen] = useState(false);
 
   const batches = batchesApi.data?.batches || [];
   const deliveries = delivApi.data?.deliveries || [];
@@ -98,9 +159,19 @@ export default function Overview({ go, persona }) {
 
   const showDemo = !DEMO && cfg.data?.demo && cfg.data?.demo_setup?.available && canCap(who, "demoSetup");
   const ntfUnread = ntf?.unread ?? (ntf?.notifications || []).filter((x) => !x.read_at).length;
+  const tiers = summary?.tiers;
+  const pending = tiers ? Object.values(tiers).reduce((a, t) => a + (t.pending_checker || 0), 0) : 0;
+  const holds = tiers?.T5?.escalated || 0;
+  const exceptionQueue = isMonitoringExceptionDesk(who) ? "loans"
+    : canCap(who, "checkerApprove") ? "accept"
+      : canCap(who, "complianceAct") ? "holds"
+        : canCap(who, "workExceptions") ? "loans" : null;
+  const exceptionCount = exceptionQueue === "accept" ? pending : exceptionQueue === "holds" ? holds : openExceptions;
   const cards = buildWorkCards({
-    canWorkExceptions: canCap(who, "workExceptions"),
+    canWorkExceptions: false,
     openExceptions,
+    exceptionQueue,
+    exceptionCount,
     canReviewRules: canCap(who, "authorRules") || canCap(who, "editRules"),
     ntfUnread,
     canDemoSetup: showDemo,
@@ -111,11 +182,21 @@ export default function Overview({ go, persona }) {
     stuckBatches: health.stuck,
   });
 
-  let primary = <button type="button" className="btn primary" onClick={() => go("deliveries")}>Vendor deliveries</button>;
-  if (canCap(who, "upload")) {
+  const handoff = queueHandoff({
+    tiers,
+    canWorkExceptions: isMonitoringExceptionDesk(who) || can(who, "admin"),
+    canCheck: canCap(who, "checkerApprove") || can(who, "admin"),
+    canComp: canCap(who, "complianceAct") || can(who, "admin"),
+  });
+  let primary = <button type="button" className="btn primary" onClick={() => go("deliveries")}>Delivery schedule</button>;
+  if (exceptionQueue === "accept" && pending > 0) {
+    primary = <button type="button" className="btn primary" onClick={() => go("exceptions")}>Accept or return</button>;
+  } else if (exceptionQueue === "holds" && holds > 0) {
+    primary = <button type="button" className="btn primary" onClick={() => go("exceptions")}>Review holds</button>;
+  } else if (canCap(who, "upload")) {
     primary = <button type="button" className="btn primary" onClick={() => go("imports")}>Upload a file</button>;
-  } else if (canCap(who, "workExceptions") && openExceptions > 0) {
-    primary = <button type="button" className="btn primary" onClick={() => go("exceptions")}>Work exceptions</button>;
+  } else if (exceptionCount > 0) {
+    primary = <button type="button" className="btn primary" onClick={() => go("exceptions")}>Loans to fix</button>;
   }
 
   const openRow = (row) => {
@@ -142,12 +223,14 @@ export default function Overview({ go, persona }) {
       <PageHeader
         eyebrow="Home"
         title="Boarding desk"
-        sub="Scheduled loads and in-flight batches for this vendor scope. Open a row to watch progress or act on a late window."
+        sub={SCREEN.overview.sub}
         primary={primary}
         secondary={(
           <>
-            <button type="button" className="btn" onClick={() => go("imports")}>Import Monitor</button>
-            <button type="button" className="btn" onClick={() => go("deliveries")}>Deliveries</button>
+            {can(who, "monitoring") && <button type="button" className="btn" onClick={() => setScheduleOpen(true)}>Today's schedule</button>}
+            {can(who, "monitoring") && <button type="button" className="btn" onClick={() => go("monitor")}>See all on Monitor</button>}
+            <button type="button" className="btn" onClick={() => go("imports")}>File loads</button>
+            <button type="button" className="btn" onClick={() => go("deliveries")}>Delivery schedule</button>
             <button type="button" className="btn" onClick={() => go("guide")}>How it works</button>
           </>
         )}
@@ -161,14 +244,14 @@ export default function Overview({ go, persona }) {
               { label: "Late", value: health.late, detail: "delivery windows" },
               { label: "Missed", value: health.missed, detail: "past miss threshold" },
               { label: "Stuck", value: health.stuck, detail: "blocked · waiting · paused" },
-              { label: "Exceptions", value: fmt(health.openExceptions), detail: "open / checker / escalated" },
+              { label: "Loans held", value: fmt(health.openExceptions), detail: "open, waiting, or on hold" },
             ]} />
           </div>
 
           <div id="desk-attention">
             <Panel
               title="Needs attention"
-              sub="Late and missed schedules, then stuck and running batches — click a row to monitor"
+              sub="Late and missed schedules, then files in the pipeline — click a row to watch each step"
               pad={false}
               actions={attention.length > 0 ? <span className="faint" style={{ fontSize: ".8rem" }}>{attention.length} item{attention.length === 1 ? "" : "s"}</span> : null}
             >
@@ -179,7 +262,7 @@ export default function Overview({ go, persona }) {
                   action={(
                     <span className="row" style={{ gap: 8 }}>
                       {canCap(who, "upload") && <button type="button" className="btn primary" onClick={() => go("imports")}>Upload a file</button>}
-                      <button type="button" className="btn" onClick={() => go("deliveries")}>Vendor deliveries</button>
+                      <button type="button" className="btn" onClick={() => go("deliveries")}>Delivery schedule</button>
                     </span>
                   )}
                 />
@@ -215,11 +298,11 @@ export default function Overview({ go, persona }) {
           <span className="eyebrow">Your work today</span>
           <h2 style={{ fontSize: "1.08rem", marginTop: 4 }}>Queues for {who.label}</h2>
         </div>
-        {cards.length === 0 ? (
+        {summary == null && cards.length === 0 ? null : cards.length === 0 ? (
           <EmptyState
-            title="You’re caught up"
-            body="No open queues for your role right now."
-            action={<button type="button" className="btn" onClick={() => go("guide")}>Walk the product</button>}
+            title={handoff ? "Nothing waiting on you" : "You’re caught up"}
+            body={handoff || "No open queues for your role right now."}
+            action={<button type="button" className="btn" onClick={() => go("guide")}>How it works</button>}
           />
         ) : (
           <div className="queue-grid">
@@ -304,6 +387,13 @@ export default function Overview({ go, persona }) {
               onNext: idx >= 0 && idx < uniq.length - 1 ? () => setBatchId(uniq[idx + 1]) : null,
             };
           })()}
+        />
+      )}
+      {scheduleOpen && (
+        <ScheduleModal
+          onClose={() => setScheduleOpen(false)}
+          onOpen={(d) => setWatch(d)}
+          go={go}
         />
       )}
       {watch && (
