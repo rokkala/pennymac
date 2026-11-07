@@ -189,19 +189,21 @@ export function createMockApi() {
 
   const PERSONA_ROLES = ["onboarding", "onboarding_reviewer", "monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"];
   const PERSONA_SCREENS = [
-    { id: "overview", label: "Overview" }, { id: "guide", label: "How it works" }, { id: "imports", label: "Import Monitor" },
-    { id: "deliveries", label: "Vendor Deliveries" }, { id: "sources", label: "Vendors & Mapping" }, { id: "exceptions", label: "Exception Manager" },
-    { id: "rules", label: "Rule Engine" }, { id: "analytics", label: "Analytics" }, { id: "governance", label: "Policy & Audit" },
+    { id: "overview", label: "Overview" }, { id: "guide", label: "How it works" }, { id: "monitor", label: "Monitor" },
+    { id: "imports", label: "File loads" },
+    { id: "deliveries", label: "Delivery schedule" }, { id: "sources", label: "Vendors" }, { id: "exceptions", label: "Loans to fix" },
+    { id: "rules", label: "Rules" }, { id: "analytics", label: "Analytics" }, { id: "governance", label: "Policy" },
     { id: "maintenance", label: "Maintenance" }, { id: "personas", label: "Personas" },
   ];
   const personaAccess = {
-    overview: PERSONA_ROLES, guide: PERSONA_ROLES,
+    overview: ["monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"], guide: PERSONA_ROLES,
+    monitor: ["monitoring", "monitoring_reviewer", "admin"],
     imports: ["monitoring", "monitoring_reviewer", "admin"],
     deliveries: ["monitoring", "monitoring_reviewer", "onboarding", "onboarding_reviewer", "admin"],
     sources: ["onboarding", "onboarding_reviewer", "admin"],
     exceptions: ["monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"],
     rules: ["onboarding", "onboarding_reviewer", "compliance", "compliance_reviewer", "admin"],
-    analytics: PERSONA_ROLES,
+    analytics: ["monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"],
     governance: ["compliance", "compliance_reviewer", "onboarding_reviewer", "admin"],
     maintenance: ["onboarding_reviewer", "admin"], personas: ["admin"],
   };
@@ -575,15 +577,47 @@ export function createMockApi() {
     }],
     // ---------------- exceptions
     ["GET", /^\/api\/exceptions\/summary$/, (m, b, u, q) => (q.get("vendor_id") ? s.by_vendor[q.get("vendor_id")]?.exceptions_summary : null) || s.exceptions_summary],
+    ["GET", /^\/api\/exceptions\/loads$/, (m, b, u, q) => {
+      const open = ["open", "pending_review", "pending_checker", "escalated"];
+      const byBatch = s.analytics["import-status"].batches.reduce((a, x) => { a[x.batch_id] = x; return a; }, {});
+      const status = q.get("status");
+      const matched = s.exceptions.filter((e) => {
+        if (status === "open" ? !open.includes(e.status) : status && e.status !== status) return false;
+        if (q.get("vendor_id") && e.vendor_id !== q.get("vendor_id")) return false;
+        return true;
+      });
+      const map = new Map();
+      matched.forEach((e) => {
+        const bch = byBatch[e.batch_id] || {};
+        const loaded = bch.started_at || bch.created_at || e.created_at;
+        const cur = map.get(e.batch_id) || {
+          batch_id: e.batch_id, source_id: e.source_id, filename: bch.filename || e.filename || e.batch_id,
+          loaded_at: loaded, loaded_on: (loaded || "").slice(0, 10), vendor_id: e.vendor_id, vendor_name: e.vendor_name,
+          feed_name: e.feed_name, open_count: 0,
+        };
+        cur.open_count += 1;
+        map.set(e.batch_id, cur);
+      });
+      return { loads: [...map.values()].sort((a, b) => String(b.loaded_at).localeCompare(String(a.loaded_at))) };
+    }],
     ["GET", /^\/api\/exceptions(\?.*)?$/, (m, b, u, q) => {
       const open = ["open", "pending_review", "pending_checker", "escalated"];
+      const byBatch = s.analytics["import-status"].batches.reduce((a, x) => { a[x.batch_id] = x; return a; }, {});
       let items = s.exceptions.filter((e) => {
         if (q.get("status") === "open" ? !open.includes(e.status) : q.get("status") && e.status !== q.get("status")) return false;
         if (q.get("tier") && e.tier !== q.get("tier")) return false;
         if (q.get("rule_id") && e.rule_id !== q.get("rule_id")) return false;
+        if (q.get("batch_id") && e.batch_id !== q.get("batch_id")) return false;
         if (q.get("vendor_id") && e.vendor_id !== q.get("vendor_id")) return false;
         if (q.get("q") && !String(e.loan_number).includes(q.get("q"))) return false;
+        const bch = byBatch[e.batch_id] || {};
+        const loaded = bch.started_at || bch.created_at || e.created_at || "";
+        if (q.get("loaded_on") && String(loaded).slice(0, 10) !== q.get("loaded_on")) return false;
         return true;
+      }).map((e) => {
+        const bch = byBatch[e.batch_id] || {};
+        const loaded = bch.started_at || bch.created_at || e.created_at;
+        return { ...e, filename: bch.filename || e.filename, loaded_at: loaded };
       });
       return { total: items.length, items: items.slice(0, +(q.get("limit") || 100)) };
     }],

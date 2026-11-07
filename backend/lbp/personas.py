@@ -21,27 +21,32 @@ from .store import db
 SCREENS: dict[str, str] = {
     "overview": "Overview",
     "guide": "How it works",
-    "imports": "Import Monitor",
-    "deliveries": "Vendor Deliveries",
-    "sources": "Vendors & Mapping",
-    "exceptions": "Exception Manager",
-    "rules": "Rule Engine",
+    "monitor": "Monitor",
+    "imports": "File loads",
+    "deliveries": "Delivery schedule",
+    "sources": "Vendors",
+    "exceptions": "Loans to fix",
+    "rules": "Rules",
     "analytics": "Analytics",
-    "governance": "Policy & Audit",
+    "governance": "Policy",
     "maintenance": "Maintenance",
     "personas": "Personas",
 }
 
+# Onboarding sets up feeds. Run screens belong to Monitoring and Compliance.
+_RUN_ROLES = ("monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin")
+
 # Baseline visibility per screen (roles that may see it). Admin always sees all via bypass.
 DEFAULT_ACCESS: dict[str, tuple[str, ...]] = {
-    "overview": ROLES,
+    "overview": _RUN_ROLES,
     "guide": ROLES,
+    "monitor": ("monitoring", "monitoring_reviewer", "admin"),
     "imports": ("monitoring", "monitoring_reviewer", "admin"),
     "deliveries": ("monitoring", "monitoring_reviewer", "onboarding", "onboarding_reviewer", "admin"),
     "sources": ("onboarding", "onboarding_reviewer", "admin"),
     "exceptions": ("monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"),
     "rules": ("onboarding", "onboarding_reviewer", "compliance", "compliance_reviewer", "admin"),
-    "analytics": ROLES,
+    "analytics": _RUN_ROLES,
     "governance": ("compliance", "compliance_reviewer", "onboarding_reviewer", "admin"),
     "maintenance": ("onboarding_reviewer", "admin"),
     "personas": ("admin",),

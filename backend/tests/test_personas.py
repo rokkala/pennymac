@@ -22,6 +22,20 @@ def test_matrix_restrict_only_rejects_grant(env):
         set_screen_matrix({"monitoring": list(m["monitoring"]) + ["personas"]}, actor="admin1")
 
 
+def test_onboarding_team_does_not_see_run_screens(env):
+    from lbp.personas import visible_screens
+
+    run = {"overview", "monitor", "imports", "exceptions", "analytics"}
+    for role in ("onboarding", "onboarding_reviewer"):
+        assert run.isdisjoint(visible_screens([role])), role
+    assert "sources" in visible_screens(["onboarding"])
+    assert "rules" in visible_screens(["onboarding"])
+    assert "overview" in visible_screens(["monitoring"])
+    assert "monitor" in visible_screens(["monitoring"])
+    assert "monitor" not in visible_screens(["compliance"])
+    assert "analytics" in visible_screens(["compliance"])
+
+
 def test_matrix_can_hide_and_visible_for_roles(env):
     from lbp.personas import get_screen_matrix, set_screen_matrix, visible_screens
 

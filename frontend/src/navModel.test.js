@@ -1,13 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { NAV_GROUPS, visibleNav } from "./navModel.js";
+import { NAV_GROUPS, firstAllowedPage, visibleNav } from "./navModel.js";
 
 describe("NAV_GROUPS", () => {
   it("locks Guide → Setup → Run → Govern order and page ids", () => {
     assert.deepEqual(NAV_GROUPS.map((g) => g.id), ["guide", "setup", "run", "govern"]);
     assert.deepEqual(NAV_GROUPS.find((g) => g.id === "guide").pages, ["guide"]);
     assert.deepEqual(NAV_GROUPS.find((g) => g.id === "setup").pages, ["sources", "rules", "deliveries"]);
-    assert.deepEqual(NAV_GROUPS.find((g) => g.id === "run").pages, ["overview", "imports", "exceptions", "analytics"]);
+    assert.deepEqual(NAV_GROUPS.find((g) => g.id === "run").pages, ["overview", "monitor", "imports", "exceptions", "analytics"]);
     assert.deepEqual(NAV_GROUPS.find((g) => g.id === "govern").pages, ["governance", "maintenance", "personas"]);
   });
 });
@@ -22,5 +22,12 @@ describe("visibleNav", () => {
     const v = visibleNav(NAV_GROUPS, ["overview", "imports"]);
     assert.deepEqual(v.map((g) => g.id), ["run"]);
     assert.deepEqual(v[0].pages, ["overview", "imports"]);
+  });
+});
+
+describe("firstAllowedPage", () => {
+  it("skips Run when that team cannot see it", () => {
+    assert.equal(firstAllowedPage(["guide", "sources", "rules", "deliveries"]), "guide");
+    assert.equal(firstAllowedPage(["sources", "rules"]), "sources");
   });
 });
