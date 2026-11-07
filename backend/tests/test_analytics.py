@@ -82,6 +82,13 @@ def test_batches_since_after_until_returns_400(client):
     assert r.status_code == 400
 
 
+def test_batches_days_with_aware_until_does_not_500(client):
+    """days uses naive UTC now; until may arrive as Z — must not TypeError on compare."""
+    r = client.get("/api/batches?days=7&until=2026-11-07T00:00:00Z&limit=1")
+    assert r.status_code == 200
+    assert "batches" in r.json()
+
+
 def test_batches_http_filters_status_and_days(client, onboarded, sample_files):
     from lbp.pipeline.batch import create_batch, run_batch
 

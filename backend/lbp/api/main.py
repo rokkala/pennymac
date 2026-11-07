@@ -733,11 +733,14 @@ def presign(source_id: str, filename: str, user: User = Depends(current_user)):
 
 
 def _parse_batch_instant(raw: str, label: str):
-    from datetime import datetime
+    from datetime import UTC, datetime
 
     try:
         text = raw.strip().replace("Z", "+00:00")
-        return datetime.fromisoformat(text)
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt  # treat bare naive as already-UTC platform time
+        return dt.astimezone(UTC).replace(tzinfo=None)
     except ValueError as e:
         raise HTTPException(400, f"invalid {label}: {raw}") from e
 
@@ -773,6 +776,13 @@ def get_batch(batch_id: str):
     with db.get_engine().connect() as c:
         row = c.execute(select(db.batches.c.micro_batches).where(db.batches.c.batch_id == batch_id)).first()
     b["micro_batch_log"] = row[0] if row else []
+    # List endpoint skips SF traces for terminal batches; detail always loads the one execution.
+    if "pipeline" not in b:
+        from ..pipeline.trace import fetch_traces
+
+        trace = fetch_traces([batch_id]).get(batch_id)
+        if trace:
+            b["pipeline"] = trace
     return b
 
 

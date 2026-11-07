@@ -20,6 +20,8 @@ from ..store import db
 
 DAY = timedelta(days=1)
 ATTENTION_STATUSES = ("failed", "blocked", "waiting", "paused", "out_of_order")
+# Step Functions history is only polled for in-flight rows on the list endpoint (throttle).
+TRACE_STATUSES = ("queued", "running", "pausing", "paused", "blocked", "waiting", "out_of_order")
 
 
 def _iso(d):
@@ -104,7 +106,8 @@ def import_status(limit: int = 50, source_ids: list[str] | None = None, *,
         })
     from ..pipeline.trace import fetch_traces
 
-    for bid, trace in fetch_traces([i["batch_id"] for i in items]).items():
+    trace_ids = [i["batch_id"] for i in items if i["status"] in TRACE_STATUSES]
+    for bid, trace in fetch_traces(trace_ids).items():
         for item in items:
             if item["batch_id"] == bid:
                 item["pipeline"] = trace
