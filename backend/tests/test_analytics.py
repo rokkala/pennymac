@@ -71,3 +71,25 @@ def test_import_status_q_respects_vendor_scope(onboarded, sample_files):
                  allow_duplicate=True, reason="scope fixture")
     data = import_status(limit=50, source_ids=[b["source_id"]], q="scoped_pcg")
     assert data["batches"] == []
+
+
+def test_batches_bad_days_returns_400(client):
+    assert client.get("/api/batches?days=99").status_code == 400
+
+
+def test_batches_since_after_until_returns_400(client):
+    r = client.get("/api/batches?since=2026-11-07T00:00:00Z&until=2026-11-01T00:00:00Z")
+    assert r.status_code == 400
+
+
+def test_batches_http_filters_status_and_days(client, onboarded, sample_files):
+    from lbp.pipeline.batch import create_batch, run_batch
+
+    src = onboarded["correspondent"]
+    bid = create_batch(src["source_id"], sample_files["correspondent"], "http_filter.csv", "ops",
+                       allow_duplicate=True, reason="http filter")
+    run_batch(bid, workers=1)
+    data = client.get("/api/batches?status=completed&days=30&limit=50&q=http_filter").json()
+    assert "attention" in data
+    assert data["batches"]
+    assert all(b["status"] == "completed" for b in data["batches"])

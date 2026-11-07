@@ -732,9 +732,36 @@ def presign(source_id: str, filename: str, user: User = Depends(current_user)):
     return {"url": url, "bucket": s.raw_bucket, "key": key}
 
 
+def _parse_batch_instant(raw: str, label: str):
+    from datetime import datetime
+
+    try:
+        text = raw.strip().replace("Z", "+00:00")
+        return datetime.fromisoformat(text)
+    except ValueError as e:
+        raise HTTPException(400, f"invalid {label}: {raw}") from e
+
+
 @app.get("/api/batches")
-def list_batches(limit: int = 25, vendor_id: str | None = None):
-    return analytics.import_status(limit, _scope(vendor_id))
+def list_batches(limit: int = Query(50, ge=1, le=200), vendor_id: str | None = None,
+                 status: str | None = None, days: int | None = None,
+                 since: str | None = None, until: str | None = None, q: str | None = None):
+    from datetime import timedelta
+
+    statuses = [s.strip() for s in (status or "").split(",") if s.strip()] or None
+    since_dt = until_dt = None
+    if days is not None:
+        if days not in (1, 7, 30):
+            raise HTTPException(400, "days must be 1, 7, or 30")
+        since_dt = db.now() - timedelta(days=days)
+    if since:
+        since_dt = _parse_batch_instant(since, "since")
+    if until:
+        until_dt = _parse_batch_instant(until, "until")
+    if since_dt is not None and until_dt is not None and since_dt > until_dt:
+        raise HTTPException(400, "since must be before until")
+    return analytics.import_status(limit, _scope(vendor_id), statuses=statuses,
+                                   since=since_dt, until=until_dt, q=q or None)
 
 
 @app.get("/api/batches/{batch_id}")
@@ -1157,8 +1184,14 @@ def analytics_vendors(vendor_id: str | None = None):
 @app.get("/api/exceptions")
 def list_exceptions(status: str | None = "open", tier: str | None = None, queue: str | None = None, batch_id: str | None = None,
                     rule_id: str | None = None, source_id: str | None = None, q: str | None = None,
-                    limit: int = Query(100, le=1000), offset: int = 0, vendor_id: str | None = None):
-    return exceptions_mgr.list(status, tier, queue, batch_id, rule_id, source_id, q, limit, offset, _scope(vendor_id))
+                    loaded_on: str | None = None, limit: int = Query(100, le=1000), offset: int = 0, vendor_id: str | None = None):
+    return exceptions_mgr.list(status, tier, queue, batch_id, rule_id, source_id, q, limit, offset, _scope(vendor_id), loaded_on)
+
+
+@app.get("/api/exceptions/loads")
+def exceptions_loads(status: str | None = "open", vendor_id: str | None = None):
+    """File loads that have exceptions — for vendor / file / date filters."""
+    return exceptions_mgr.loads(status, _scope(vendor_id), vendor_id)
 
 
 @app.get("/api/exceptions/summary")
@@ -1540,8 +1573,8 @@ def update_policy(body: PolicyChange, user: User = Depends(current_user)):
 
 # ------------------------------------------------------------------ analytics (Pillar 2)
 @app.get("/api/analytics/import-status")
-def a_import(vendor_id: str | None = None):
-    return analytics.import_status(25, _scope(vendor_id))
+def a_import(limit: int = 25, vendor_id: str | None = None):
+    return analytics.import_status(min(max(limit, 1), 500), _scope(vendor_id))
 
 
 @app.get("/api/analytics/exceptions")
