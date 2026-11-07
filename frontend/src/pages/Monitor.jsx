@@ -4,7 +4,7 @@ import { canCap } from "../roles.js";
 import { useApi, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, PageHeader, EmptyState, Field } from "../ui.jsx";
 import { Segments } from "../charts.jsx";
 import { SCREEN } from "../screenCopy.js";
-import { buildBatchesPath, splitLiveAndHistory } from "../monitorQuery.js";
+import { buildBatchesPath, splitLiveAndHistory, deskOrder } from "../monitorQuery.js";
 import { BatchModal, UploadModal } from "./Imports.jsx";
 
 const STEP_PILL = { succeeded: "pass", failed: "fail", running: "accent" };
@@ -13,7 +13,18 @@ const DAY_OPTS = [
   { value: 1, label: "Today" },
   { value: 7, label: "Last 7 days" },
   { value: 30, label: "Last 30 days" },
+  { value: "custom", label: "Custom range" },
 ];
+
+function toDateInput(d) {
+  return d.toISOString().slice(0, 10);
+}
+function startOfDayUtc(ymd) {
+  return `${ymd}T00:00:00.000Z`;
+}
+function endOfDayUtc(ymd) {
+  return `${ymd}T23:59:59.999Z`;
+}
 
 function ProgressBar({ pct, status }) {
   const tone = status === "failed" ? "fail" : status === "completed" ? "pass" : "";
@@ -113,17 +124,28 @@ function BatchRows({ rows, vendor, sel, onSelect, showProgress }) {
 }
 
 export default function Monitor({ persona, go, vendor }) {
-  const [days, setDays] = useState(1);
+  const today = toDateInput(new Date());
+  const weekAgo = toDateInput(new Date(Date.now() - 6 * 86400000));
+  const [range, setRange] = useState(1); // 1 | 7 | 30 | "custom"
+  const [sinceDay, setSinceDay] = useState(weekAgo);
+  const [untilDay, setUntilDay] = useState(today);
   const [status, setStatus] = useState([]);
   const [q, setQ] = useState("");
   const [qDraft, setQDraft] = useState("");
   const [sel, setSel] = useState(null);
   const [upload, setUpload] = useState(false);
 
-  const path = useMemo(
-    () => scoped(buildBatchesPath({ days, status, q, limit: 50 })),
-    [days, status, q, vendor],
-  );
+  const path = useMemo(() => {
+    const custom = range === "custom";
+    return scoped(buildBatchesPath({
+      days: custom ? null : range,
+      since: custom ? startOfDayUtc(sinceDay) : null,
+      until: custom ? endOfDayUtc(untilDay) : null,
+      status,
+      q,
+      limit: 50,
+    }));
+  }, [range, sinceDay, untilDay, status, q, vendor]);
   const b = useApi(path, [path], { poll: 2000 });
   const s = useApi(scoped("/api/sources"));
 
@@ -131,9 +153,13 @@ export default function Monitor({ persona, go, vendor }) {
 
   const batches = b.data.batches || [];
   const { live, history } = splitLiveAndHistory(batches);
+  const ordered = deskOrder(batches);
   const done = batches.filter((x) => x.status === "completed");
-  const idx = batches.findIndex((x) => x.batch_id === sel);
+  const idx = ordered.findIndex((x) => x.batch_id === sel);
   const empty = !live.length && !history.length;
+  const rangeLabel = range === "custom"
+    ? `${sinceDay} → ${untilDay}`
+    : (DAY_OPTS.find((d) => d.value === range)?.label || "Range");
 
   const toggleStatus = (st) => {
     setStatus((prev) => (prev.includes(st) ? prev.filter((x) => x !== st) : [...prev, st]));
@@ -160,10 +186,30 @@ export default function Monitor({ persona, go, vendor }) {
       <Panel title="Filters" sub="History and live share the same range and search">
         <div className="toolbar" style={{ flexWrap: "wrap", gap: 12 }}>
           <Field id="mon-days" label="Range">
-            <select id="mon-days" className="input" value={days} onChange={(e) => setDays(Number(e.target.value))}>
+            <select
+              id="mon-days"
+              className="input"
+              value={range}
+              onChange={(e) => {
+                const v = e.target.value;
+                setRange(v === "custom" ? "custom" : Number(v));
+              }}
+            >
               {DAY_OPTS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </Field>
+          {range === "custom" && (
+            <>
+              <Field id="mon-since" label="From">
+                <input id="mon-since" type="date" className="input" value={sinceDay} max={untilDay}
+                  onChange={(e) => setSinceDay(e.target.value)} />
+              </Field>
+              <Field id="mon-until" label="To">
+                <input id="mon-until" type="date" className="input" value={untilDay} min={sinceDay}
+                  onChange={(e) => setUntilDay(e.target.value)} />
+              </Field>
+            </>
+          )}
           <Field id="mon-q" label="Search">
             <form className="row" style={{ gap: 6 }} onSubmit={(e) => { e.preventDefault(); setQ(qDraft); }}>
               <input id="mon-q" className="input" placeholder="Filename or batch id" value={qDraft}
@@ -200,7 +246,7 @@ export default function Monitor({ persona, go, vendor }) {
             </Panel>
           )}
           {history.length > 0 && (
-            <Panel title="History" sub={`${DAY_OPTS.find((d) => d.value === days)?.label || "Range"} · click a row to open the batch`} pad={false}>
+            <Panel title="History" sub={`${rangeLabel} · click a row to open the batch`} pad={false}>
               <BatchRows rows={history} vendor={vendor} sel={sel} onSelect={setSel} showProgress={false} />
             </Panel>
           )}
@@ -214,9 +260,9 @@ export default function Monitor({ persona, go, vendor }) {
           go={go}
           onClose={() => setSel(null)}
           nav={{
-            label: idx >= 0 ? `${idx + 1} of ${batches.length}` : "",
-            onPrev: idx > 0 ? () => setSel(batches[idx - 1].batch_id) : null,
-            onNext: idx >= 0 && idx < batches.length - 1 ? () => setSel(batches[idx + 1].batch_id) : null,
+            label: idx >= 0 ? `${idx + 1} of ${ordered.length}` : "",
+            onPrev: idx > 0 ? () => setSel(ordered[idx - 1].batch_id) : null,
+            onNext: idx >= 0 && idx < ordered.length - 1 ? () => setSel(ordered[idx + 1].batch_id) : null,
           }}
         />
       )}

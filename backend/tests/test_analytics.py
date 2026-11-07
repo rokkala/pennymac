@@ -60,6 +60,43 @@ def test_attention_not_capped_by_limit(onboarded, sample_files):
     assert len(data["batches"]) == 1
 
 
+def test_running_not_capped_by_limit(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch
+    from lbp.store import db
+
+    src = onboarded["correspondent"]
+    a = create_batch(src["source_id"], sample_files["correspondent"], "run_a.csv", "ops",
+                     allow_duplicate=True, reason="running fixture a")
+    b = create_batch(src["source_id"], sample_files["correspondent"], "run_b.csv", "ops",
+                     allow_duplicate=True, reason="running fixture b")
+    with db.get_engine().begin() as c:
+        c.execute(db.batches.update().where(db.batches.c.batch_id.in_((a, b)))
+                  .values(status="running", throughput_lps=10.0))
+
+    data = import_status(limit=1, since=db.now() - timedelta(days=30))
+    assert data["running"] >= 2
+    assert len(data["batches"]) == 1
+    assert data["current_throughput_lps"] >= 20.0
+
+
+def test_import_status_q_escapes_like_wildcards(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch
+
+    src = onboarded["correspondent"]
+    create_batch(src["source_id"], sample_files["correspondent"], "plain.csv", "ops",
+                 allow_duplicate=True, reason="wildcard plain")
+    create_batch(src["source_id"], sample_files["correspondent"], "has%percent.csv", "ops",
+                 allow_duplicate=True, reason="wildcard percent")
+    with_pct = import_status(limit=50, q="has%percent")
+    assert [b["filename"] for b in with_pct["batches"]] == ["has%percent.csv"]
+    # bare "%" must not act as "match everything" — only rows whose name contains %
+    bare = import_status(limit=50, q="%")
+    assert all("%" in b["filename"] for b in bare["batches"])
+    assert not any(b["filename"] == "plain.csv" for b in bare["batches"])
+
+
 def test_import_status_q_respects_vendor_scope(onboarded, sample_files):
     from lbp.analytics.service import import_status
     from lbp.pipeline.batch import create_batch

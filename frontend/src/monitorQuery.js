@@ -2,10 +2,17 @@
 
 export const LIVE_STATUSES = new Set(["queued", "running", "pausing", "paused"]);
 
-export function buildBatchesPath({ days = 1, status = [], q = "", limit = 50 } = {}) {
+export function buildBatchesPath({
+  days = 1, status = [], q = "", limit = 50, since = null, until = null,
+} = {}) {
   const params = new URLSearchParams();
   params.set("limit", String(limit));
-  if (days) params.set("days", String(days));
+  if (since || until) {
+    if (since) params.set("since", since);
+    if (until) params.set("until", until);
+  } else if (days) {
+    params.set("days", String(days));
+  }
   if (status?.length) params.set("status", status.join(","));
   if (q?.trim()) params.set("q", q.trim());
   return `/api/batches?${params.toString()}`;
@@ -19,4 +26,10 @@ export function splitLiveAndHistory(batches = []) {
     else history.push(b);
   }
   return { live, history };
+}
+
+/** Live rows first, then history — used for BatchModal prev/next. */
+export function deskOrder(batches = []) {
+  const { live, history } = splitLiveAndHistory(batches);
+  return [...live, ...history];
 }

@@ -20,8 +20,14 @@ from ..store import db
 
 DAY = timedelta(days=1)
 ATTENTION_STATUSES = ("failed", "blocked", "waiting", "paused", "out_of_order")
+RUNNING_STATUSES = ("running", "queued")
 # Step Functions history is only polled for in-flight rows on the list endpoint (throttle).
 TRACE_STATUSES = ("queued", "running", "pausing", "paused", "blocked", "waiting", "out_of_order")
+
+
+def _like_escape(raw: str) -> str:
+    """Treat user search as a literal substring — escape LIKE wildcards."""
+    return raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _iso(d):
@@ -63,8 +69,12 @@ def import_status(limit: int = 50, source_ids: list[str] | None = None, *,
         if until is not None:
             stmt = stmt.where(b.c.created_at <= until)
         if q:
-            needle = f"%{q.strip()}%"
-            stmt = stmt.where(or_(b.c.filename.ilike(needle), b.c.batch_id.ilike(needle)))
+            needle = f"%{_like_escape(q.strip())}%"
+            # escapechar so \% / \_ are literals (SQLite + Postgres)
+            stmt = stmt.where(or_(
+                b.c.filename.ilike(needle, escape="\\"),
+                b.c.batch_id.ilike(needle, escape="\\"),
+            ))
         return stmt
 
     with db.get_engine().connect() as c:
@@ -77,6 +87,12 @@ def import_status(limit: int = 50, source_ids: list[str] | None = None, *,
         attn_q = _scope_time_q(select(func.count()).select_from(b)).where(
             b.c.status.in_(attn_statuses or ["__none__"]))
         attention = int(c.execute(attn_q).scalar() or 0)
+        run_statuses = [s for s in (statuses or RUNNING_STATUSES) if s in RUNNING_STATUSES]
+        run_base = _scope_time_q(select(func.count(), func.coalesce(func.sum(b.c.throughput_lps), 0))
+                                 .select_from(b)).where(b.c.status.in_(run_statuses or ["__none__"]))
+        run_row = c.execute(run_base).one()
+        running_n = int(run_row[0] or 0)
+        throughput = float(run_row[1] or 0)
         names = _names(c)
         bids = [r.batch_id for r in rows]
         ex_total, ex_open = {}, {}
@@ -111,9 +127,8 @@ def import_status(limit: int = 50, source_ids: list[str] | None = None, *,
         for item in items:
             if item["batch_id"] == bid:
                 item["pipeline"] = trace
-    running = [i for i in items if i["status"] in ("running", "queued")]
-    return {"batches": items, "running": len(running), "attention": attention,
-            "current_throughput_lps": round(sum(i["throughput_lps"] or 0 for i in running), 1),
+    return {"batches": items, "running": running_n, "attention": attention,
+            "current_throughput_lps": round(throughput, 1),
             "target_lps": round(1_000_000 / 86400, 1)}
 
 
