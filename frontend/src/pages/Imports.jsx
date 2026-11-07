@@ -4,7 +4,23 @@ import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, Modal, ReasonModal, useDialog, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { Segments, Sparkline } from "../charts.jsx";
 
-function UploadModal({ sources, onClose, onDone }) {
+const STEP_PILL = { succeeded: "pass", failed: "fail", running: "accent" };
+
+function PipelineSteps({ steps }) {
+  if (!steps?.length) return null;
+  return (
+    <div className="timeline" aria-label="Pipeline steps">
+      {steps.map((s, i) => (
+        <div key={`${s.name}-${i}`}>
+          <span className={`pill ${STEP_PILL[s.state] || ""}`}>{s.label}</span>{" "}
+          <span className="faint">{s.state === "running" ? "in progress" : s.summary || s.state}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export function UploadModal({ sources, onClose, onDone }) {
   const vendorsIn = [...new Map(sources.filter((s) => s.active_mapping_id).map((s) => [s.vendor_id, s.vendor_name])).entries()];
   const [ven, setVen] = useState("");
   const [src, setSrc] = useState("");
@@ -258,7 +274,7 @@ function ChangeSummary({ data, persona, onChanged }) {
             {canCap(persona, "snapshotReviews") && <div className="row" style={{ marginTop: 6 }}><button className="btn sm" onClick={() => ask({ kind: "confirm", title: "Raise close reviews", confirmLabel: `Raise ${fmt(snap.missing)} close reviews`, danger: true,
               body: <span>Only do this when the vendor has confirmed the snapshot is complete. Each of the <b>{fmt(snap.missing)}</b> missing loans becomes a close review (CHG04): a person still confirms every payoff before SSE changes.</span>,
               onConfirm: () => act(() => api(`/api/batches/${data.batch_id}/snapshot-reviews`, { method: "POST" }), (r) => `${r.reviews_raised} close reviews raised`).then((r) => { onChanged(); return r; }) })}>Vendor confirmed: raise close reviews…</button></div>}</>
-            : snap.reviews_raised ? <>Each is a close review (CHG04) in the Exception Manager: confirm the payoff or keep the loan active.</> : null}
+            : snap.reviews_raised ? <>Each is a close review (CHG04) in Loans to fix: confirm the payoff or keep the loan active.</> : null}
         </div>)}
       {dialog}
     </div>
@@ -298,6 +314,7 @@ export function BatchModal({ id, onClose, persona, go, nav }) {
       {data.status === "paused" && canCap(persona, "resumeBatch") && <button className="btn sm primary" onClick={() => act(() => api(`/api/batches/${id}/resume`, { method: "POST" }), "Resumed from checkpoint")}>Resume</button>}</>}>
       <div className="grid" style={{ gridTemplateColumns: "minmax(0, 1.25fr) minmax(0, 1fr)", alignItems: "start", gap: 16 }}>
       <div className="stack">
+        <PipelineSteps steps={data.pipeline?.steps} />
         <dl className="kv">
           <dt>Status</dt><dd><Status s={data.status} /></dd>
           <dt>File type</dt><dd>{human(data.load_type || "full")}{data.sequence && <span className="chip" style={{ marginLeft: 6 }}>#{data.sequence}</span>}{data.delivery_id && <span className="faint" style={{ marginLeft: 6, fontSize: ".78rem" }}>scheduled delivery</span>}</dd>
@@ -345,7 +362,8 @@ export default function Imports({ persona, go, vendor }) {
   const [sel, setSel] = useState(null);
   const [upload, setUpload] = useState(false);
   if (!b.data || !s.data) return <Loading error={b.error || s.error} />;
-  const batches = b.data.batches;
+  const rank = (s) => (s === "queued" || s === "running" ? 0 : s === "paused" || s === "waiting" || s === "blocked" ? 1 : s === "failed" ? 2 : 3);
+  const batches = [...b.data.batches].sort((a, c) => rank(a.status) - rank(c.status));
   const idx = batches.findIndex((x) => x.batch_id === sel);
   const done = batches.filter((x) => x.status === "completed");
   const peak = Math.max(0, ...batches.map((x) => x.throughput_lps || 0));
@@ -353,8 +371,8 @@ export default function Imports({ persona, go, vendor }) {
     <>
       <PageHeader
         eyebrow="Run"
-        title="Import Monitor"
-        sub="Every file runs on its feed’s published configuration: mapped, validated, and loaded in micro-batches. Progress is checkpointed so a pause or failure resumes where it stopped."
+        title="File loads"
+        sub="See whether today's files boarded, and open the ones that stopped."
         guideHref="#guide?path=execution&step=arrive"
         primary={canCap(persona, "upload") ? <button type="button" className="btn primary" onClick={() => setUpload(true)}>Upload file</button> : null}
       />
@@ -378,9 +396,9 @@ export default function Imports({ persona, go, vendor }) {
             <thead><tr><th>File</th><th>{vendor ? "Feed" : "Vendor · feed"}</th><th>Status</th><th style={{ minWidth: 140 }}>Outcome</th><th className="r">Rows</th><th className="r">Loans/s</th><th>Micro-batch time</th><th>Started</th></tr></thead>
             <tbody>{batches.map((x) => (
               <tr key={x.batch_id} className={`click ${sel === x.batch_id ? "sel" : ""}`} onClick={() => setSel(x.batch_id)}>
-                <td className="mono">{x.filename}{x.load_type && x.load_type !== "full" && <div className="row" style={{ gap: 4, marginTop: 2 }}><span className="chip">{x.load_type === "snapshot" ? "snapshot" : "changes"}</span>{x.sequence && <span className="chip">#{x.sequence}</span>}</div>}</td><td>{vendor ? x.source_name : <>{x.vendor_name || x.source_name}{x.vendor_name && x.vendor_name !== x.source_name && <div className="faint" style={{ fontSize: ".76rem" }}>{x.source_name}</div>}</>}</td><td><span className="row" style={{ gap: 4, flexWrap: "nowrap" }}><Status s={x.status} />{x.preflight?.decision === "warn" && <span className="pill warn" title={x.preflight.summary}>drift</span>}{(x.replays || []).length > 0 && <span className="pill accent">replayed</span>}</span></td>
+                <td className="mono">{x.filename}{x.load_type && x.load_type !== "full" && <div className="row" style={{ gap: 4, marginTop: 2 }}><span className="chip">{x.load_type === "snapshot" ? "snapshot" : "changes"}</span>{x.sequence && <span className="chip">#{x.sequence}</span>}</div>}</td><td>{vendor ? x.source_name : <>{x.vendor_name || x.source_name}{x.vendor_name && x.vendor_name !== x.source_name && <div className="faint" style={{ fontSize: ".76rem" }}>{x.source_name}</div>}</>}</td><td><span className="row" style={{ gap: 4, flexWrap: "wrap" }}><Status s={x.status} />{x.preflight?.decision === "warn" && <span className="pill warn" title={x.preflight.summary}>drift</span>}{(x.replays || []).length > 0 && <span className="pill accent">replayed</span>}{(x.pipeline?.steps || []).map((s, i) => <span key={`${s.name}-${i}`} className={`pill ${STEP_PILL[s.state] || ""}`} title={s.summary || s.state}>{s.label}</span>)}</span></td>
                 <td><Segments total={x.total_rows || x.processed} parts={[{ label: "Pass", value: x.passed, color: "var(--pass)" }, { label: "Warn", value: x.warned, color: "var(--warn)" }, { label: "Fail", value: x.failed, color: "var(--fail)" }]} /></td>
-                <td className="r num">{fmt(x.processed)}{x.status === "running" ? ` / ${fmt(x.total_rows)}` : ""}</td>
+                <td className="r num">{fmt(x.processed)}{x.status === "running" || x.status === "queued" ? ` / ${fmt(x.total_rows)}` : ""}</td>
                 <td className="r num">{fmt(x.throughput_lps)}</td>
                 <td><Sparkline values={(x.last_micro_batches || []).map((m) => m.seconds)} /></td>
                 <td className="faint">{ago(x.started_at)}</td>

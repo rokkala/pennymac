@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { DEMO, FALLBACK_CAST, SIGNED_IN, setPersona, getPersona, getVendorScope, setVendorScope, scoped } from "./api.js";
 import { ToastHost, useApi, EmptyState } from "./ui.jsx";
 import Overview from "./pages/Overview.jsx";
+import Monitor from "./pages/Monitor.jsx";
 import Imports from "./pages/Imports.jsx";
 import Deliveries from "./pages/Deliveries.jsx";
 import Sources from "./pages/Sources.jsx";
@@ -12,23 +13,25 @@ import Governance from "./pages/Governance.jsx";
 import Maintenance from "./pages/Maintenance.jsx";
 import Personas from "./pages/Personas.jsx";
 import HowItWorks from "./pages/HowItWorks.jsx";
-import { canCap } from "./roles.js";
+import { canCap, seesRunDesk } from "./roles.js";
 import { parseHash, buildHash } from "./hash.js";
-import { NAV_GROUPS, visibleNav } from "./navModel.js";
+import { NAV_GROUPS, firstAllowedPage, visibleNav } from "./navModel.js";
+import { SCREEN } from "./screenCopy.js";
 import { getTheme, setTheme } from "./theme.js";
 
 const PAGES = [
-  { id: "overview", label: "Overview", el: Overview },
-  { id: "guide", label: "How it works", el: HowItWorks },
-  { id: "imports", label: "Import Monitor", el: Imports },
-  { id: "deliveries", label: "Vendor Deliveries", el: Deliveries },
-  { id: "sources", label: "Vendors & Mapping", el: Sources },
-  { id: "exceptions", label: "Exception Manager", el: Exceptions },
-  { id: "rules", label: "Rule Engine", el: Rules },
-  { id: "analytics", label: "Analytics", el: Analytics },
-  { id: "governance", label: "Policy & Audit", el: Governance },
-  { id: "maintenance", label: "Maintenance", el: Maintenance },
-  { id: "personas", label: "Personas", el: Personas },
+  { id: "overview", label: SCREEN.overview.label, el: Overview },
+  { id: "guide", label: SCREEN.guide.label, el: HowItWorks },
+  { id: "monitor", label: SCREEN.monitor.label, el: Monitor },
+  { id: "imports", label: SCREEN.imports.label, el: Imports },
+  { id: "deliveries", label: SCREEN.deliveries.label, el: Deliveries },
+  { id: "sources", label: SCREEN.sources.label, el: Sources },
+  { id: "exceptions", label: SCREEN.exceptions.label, el: Exceptions },
+  { id: "rules", label: SCREEN.rules.label, el: Rules },
+  { id: "analytics", label: SCREEN.analytics.label, el: Analytics },
+  { id: "governance", label: SCREEN.governance.label, el: Governance },
+  { id: "maintenance", label: SCREEN.maintenance.label, el: Maintenance },
+  { id: "personas", label: SCREEN.personas.label, el: Personas },
 ];
 
 const pageById = Object.fromEntries(PAGES.map((p) => [p.id, p]));
@@ -83,8 +86,10 @@ export default function App() {
   const openCount = summary ? Object.values(summary.tiers).reduce((a, t) => a + (t.open || 0) + (t.pending_checker || 0) + (t.escalated || 0), 0) : null;
   const ntfCount = ntf?.unread ?? (ntf?.notifications || []).filter((x) => !x.read_at).length;
   const allowed = screens.data?.screens;
+  const RUN_PAGES = new Set(["overview", "monitor", "imports", "exceptions", "analytics"]);
   const navPages = PAGES.filter((p) => {
     if (allowed) return allowed.includes(p.id);
+    if (RUN_PAGES.has(p.id) && !seesRunDesk(persona)) return false;
     if (p.id === "maintenance") return canCap(persona, "readMaintenance");
     if (p.id === "personas") return canCap(persona, "managePersonas");
     return true;
@@ -92,8 +97,9 @@ export default function App() {
   const groups = visibleNav(NAV_GROUPS, navPages.map((p) => p.id));
   useEffect(() => {
     if (allowed && !allowed.includes(page)) {
-      window.location.hash = "overview";
-      setPage("overview");
+      const next = firstAllowedPage(allowed);
+      window.location.hash = next;
+      setPage(next);
     }
   }, [allowed, page]);
   const Page = (pageById[page] || PAGES[0]).el;
