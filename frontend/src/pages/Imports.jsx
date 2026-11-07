@@ -3,6 +3,7 @@ import { api, setIntent, scoped } from "../api.js";
 import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, Modal, ReasonModal, useDialog, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { Segments, Sparkline } from "../charts.jsx";
+import { SCREEN } from "../screenCopy.js";
 
 const STEP_PILL = { succeeded: "pass", failed: "fail", running: "accent" };
 
@@ -372,7 +373,7 @@ export default function Imports({ persona, go, vendor }) {
       <PageHeader
         eyebrow="Run"
         title="File loads"
-        sub="See whether today's files boarded, and open the ones that stopped."
+        sub={SCREEN.imports.sub}
         guideHref="#guide?path=execution&step=arrive"
         primary={canCap(persona, "upload") ? <button type="button" className="btn primary" onClick={() => setUpload(true)}>Upload file</button> : null}
       />
