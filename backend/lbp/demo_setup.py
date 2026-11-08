@@ -170,6 +170,7 @@ def _build_scenario(tmp: Path, rows: int) -> None:
 
     from sqlalchemy import select as _sel
 
+    from .config import get_settings
     from . import samples, vendors as vs
     from .exceptions.manager import ExceptionActionError, ExceptionManager
     from .mapping import service as ms
@@ -340,7 +341,8 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         "holiday_rule": "next_business_day", "grace_minutes": 60, "miss_after_minutes": 360, "load_type": "snapshot",
         "pull": {
             "protocol": "sftp", "host": "sftp.westside-partner.example", "port": 22, "path": "/outbound/lbp",
-            "pattern": "correspondent_snapshot_*.csv", "secret_ref": "lbp/vendors/correspondent",
+            "pattern": "correspondent_snapshot_*.csv",
+            "secret_ref": f"{get_settings().vendor_secret_prefix}correspondent",
             "host_key_sha256": "SHA256:Zq3nY8d9r1QeVb7kq0m6l3c4w2xT5uJpA1sD9fG8hKk", "poll_minutes": 15,
         },
     })

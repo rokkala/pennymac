@@ -1,11 +1,12 @@
 env    = "poc"
 region = "us-west-2"
+image_tag = "app6"
 # Small PostgreSQL for a poc. The suite is verified on PostgreSQL; SQL Server Standard cannot run this small.
 db_engine                = "postgres"
 db_engine_version        = "16"
-db_instance_class        = "db.t4g.micro"
-db_allocated_storage     = 20
-db_max_allocated_storage = 20
+db_instance_class        = "db.t4g.medium"
+db_allocated_storage     = 200
+db_max_allocated_storage = 200
 ai_provider              = "bedrock"
 glue_feed_concurrency    = 8
 alert_email              = "loan-boarding-alerts@example.com"

@@ -37,6 +37,7 @@ override.tf
 !.env.example
 **/secrets/
 *.pem
+aws.config
 
 # Local data / caches
 sample_data/_generated/
@@ -55,3 +56,8 @@ graphify-out/*/
 # Superpowers brainstorm companion
 .superpowers/
 docs/superpowers/palette-picker.html
+
+# build/plan artifacts
+aws/terraform/*.bin
+backend/build/
+frontend/graphify-out/

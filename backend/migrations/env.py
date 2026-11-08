@@ -1,11 +1,10 @@
 """Alembic environment: schema is defined in lbp.store.db.metadata; URL from LBP settings."""
 from alembic import context
-from sqlalchemy import create_engine
 
 from lbp.config import get_settings
-from lbp.store.db import metadata
+from lbp.store import db
 
-target_metadata = metadata
+target_metadata = db.metadata
 
 
 def run():
@@ -15,7 +14,8 @@ def run():
         with context.begin_transaction():
             context.run_migrations()
         return
-    engine = create_engine(url)
+    # get_engine injects the Secrets Manager password; a bare URL has the user only
+    engine = db.get_engine(create=False)
     with engine.connect() as conn:
         context.configure(connection=conn, target_metadata=target_metadata, compare_type=True)
         with context.begin_transaction():

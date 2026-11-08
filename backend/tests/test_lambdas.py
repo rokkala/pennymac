@@ -142,8 +142,9 @@ def test_api_uploads_dispatch_to_step_functions_not_inline(onboarded, monkeypatc
         import lbp.api.main as _m
         from lbp.security import Principal
 
-        # AWS refuses dev identity headers; stand in for a verified Cognito token
-        monkeypatch.setattr(_m, "current_principal", lambda *a, **k: Principal(name="maria.ops", roles=("ops",)))
+        # AWS refuses dev identity headers; stand in for a verified Cognito token (expanded roles)
+        from lbp.security import expand_roles
+        monkeypatch.setattr(_m, "current_principal", lambda *a, **k: Principal(name="maria.ops", roles=expand_roles(["ops"])))
         cl = TestClient(app)  # no lifespan: Lambda runs the app the same way (Mangum lifespan="off")
         with open(src["path"], "rb") as f:
             r = cl.post("/api/upload", data={"source_id": src["source_id"]}, files={"file": ("c.csv", f)}, headers={"X-User": "o", "X-Roles": "ops"})

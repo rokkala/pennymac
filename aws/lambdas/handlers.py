@@ -109,11 +109,19 @@ def mark_failed(event, _ctx):
 
     batch_id = event.get("batch_id")
     err = json.dumps(event.get("error", {}))[:2000]
+    # force=true: reopen a completed batch for re-persist tests (also resets checkpoint).
+    force = bool(event.get("force"))
+    values = {"status": "failed", "error": err, "worker_id": None}
+    if force:
+        values["checkpoint"] = 0
+        values["finished_at"] = None
     with db.get_engine().begin() as c:
-        c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status != "completed")
-                  .values(status="failed", error=err, worker_id=None))
-        db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err})
-    return {"batch_id": batch_id, "status": "failed"}
+        q = db.batches.update().where(db.batches.c.batch_id == batch_id)
+        if not force:
+            q = q.where(db.batches.c.status != "completed")
+        c.execute(q.values(**values))
+        db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err, "force": force})
+    return {"batch_id": batch_id, "status": "failed", "force": force}
 
 
 # ---------------------------------------------------------------- 4. delivery scheduler
@@ -146,6 +154,35 @@ def migrate(_event, _ctx):
     return out
 
 
+def demo_setup(event, _ctx):
+    """Load the compact demo scenario into RDS. Invoked directly; not exposed on the API."""
+    import os
+
+    os.environ["LBP_DATA_DIR"] = "/tmp/lbp-data"
+    from lbp import config
+    from lbp.demo_setup import DemoSetupConflict, run_demo_setup
+    from lbp.store import db
+
+    config.reset_settings()
+    db.reset_engine()
+    event = event or {}
+    if event.get("reset"):
+        from sqlalchemy import text
+
+        with db.get_engine().begin() as conn:
+            names = [r[0] for r in conn.execute(text(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+            ))]
+            if names:
+                conn.execute(text("TRUNCATE " + ", ".join(f'"{n}"' for n in names) + " RESTART IDENTITY CASCADE"))
+        db.reset_engine()
+    try:
+        result = run_demo_setup(scale=event.get("scale") or "compact", force=bool(event.get("force")))
+    except DemoSetupConflict as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, **result.to_dict()}
+
+
 # ---------------------------------------------------------------- API (control plane)
 def _api():
     from mangum import Mangum
@@ -165,3 +202,4 @@ def api(event, ctx):
     if _api_handler is None:
         _api_handler = _api()
     return _api_handler(event, ctx)
+# force-reopen 20261108032141

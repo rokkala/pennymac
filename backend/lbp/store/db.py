@@ -45,7 +45,8 @@ def now() -> datetime:
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+    # Full uuid4 hex — [:12] birthday-collides under parallel 10M exception inserts.
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 # A vendor (seller, correspondent, sub-servicer, bulk seller, internal channel) owns one or more feeds.
@@ -110,7 +111,7 @@ batches = Table(
     Column("mapping_id", String(40)),
     Column("filename", String(300)),
     Column("file_path", String(500)),
-    Column("status", String(20), default="queued"),  # queued | running | paused | completed | failed
+    Column("status", String(20), default="queued"),  # queued | claimed | running | staged | paused | completed | failed | blocked
     Column("total_rows", Integer, default=0),
     Column("processed", Integer, default=0),
     Column("passed", Integer, default=0),

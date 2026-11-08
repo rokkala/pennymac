@@ -111,6 +111,59 @@ def _write(conn, rows: list[dict]) -> None:
     conn.execute(t.insert(), [{c: r.get(c) for c in cols} for r in rows])
 
 
+def _copy_cell(v):
+    # TEXT COPY can't adapt dict/list — JSON columns need a string.
+    if isinstance(v, (dict, list)):
+        import json
+        return json.dumps(v, default=str)
+    return v
+
+
+def _copy_rows(conn, table: str, cols: list[str], payload: list[dict]) -> bool:
+    """True if Postgres COPY succeeded. False = caller should executemany (SQLite / no driver)."""
+    if conn.engine.dialect.name != "postgresql":
+        return False
+    raw = conn.connection.driver_connection
+    with raw.cursor() as cur:
+        with cur.copy(f"COPY {table} ({', '.join(cols)}) FROM STDIN") as copy:
+            for r in payload:
+                copy.write_row([_copy_cell(r.get(c)) for c in cols])
+    return True
+
+
+def copy_insert_loans(conn, rows: list[dict]) -> None:
+    """Insert brand-new SSE loan rows. Uses Postgres COPY when available; else executemany."""
+    if not rows:
+        return
+    cols = [c.name for c in db.sse_loans.columns]
+    payload = [{c: r.get(c) for c in cols} for r in rows]
+    if not _copy_rows(conn, "sse_loans", cols, payload):
+        conn.execute(db.sse_loans.insert(), payload)
+
+
+def copy_insert_staging(conn, rows: list[dict]) -> None:
+    """Bulk-insert slim staging rows (no autoincrement id — DB fills it)."""
+    if not rows:
+        return
+    cols = ["batch_id", "row_number", "loan_number", "status", "record", "raw", "transform_errors",
+            "boarded", "action", "changes", "base_version"]
+    payload = [{c: r.get(c) for c in cols} for r in rows]
+    if not _copy_rows(conn, "loans_staging", cols, payload):
+        conn.execute(db.loans_staging.insert(), payload)
+
+
+_EXCEPTION_COLS = [c.name for c in db.exceptions.columns]
+
+
+def copy_insert_exceptions(conn, rows: list[dict]) -> None:
+    """Bulk-insert exception tickets. Uses Postgres COPY when available; else executemany."""
+    if not rows:
+        return
+    payload = [{c: r.get(c) for c in _EXCEPTION_COLS} for r in rows]
+    if not _copy_rows(conn, "exceptions", _EXCEPTION_COLS, payload):
+        conn.execute(db.exceptions.insert(), payload)
+
+
 def load_records(conn, records: list[tuple[dict, str]], batch_id: str, failures: list | None = None,
                  source_id: str | None = None) -> int:
     """Upsert [(sse_record, dq_status)] by loan_number. Returns rows written.

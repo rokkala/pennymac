@@ -47,7 +47,7 @@ output "db_secret_arn" {
 }
 
 output "glue_jobs" {
-  value = { feed = aws_glue_job.feed.name, feed_spark = aws_glue_job.feed_spark.name, vendor_pull = aws_glue_job.vendor_pull.name }
+  value = { feed = aws_glue_job.feed.name, feed_spark = aws_glue_job.feed_spark.name, feed_load = aws_glue_job.feed_load.name, vendor_pull = aws_glue_job.vendor_pull.name }
 }
 
 output "config_signing_secret_arn" {

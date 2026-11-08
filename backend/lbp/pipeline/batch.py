@@ -15,6 +15,7 @@ worker, orchestrated by Step Functions (see aws/).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -256,7 +257,7 @@ class BatchBusyError(RuntimeError):
     pass
 
 
-LEASE_FROM = ("queued", "claimed", "paused", "failed", "blocked")
+LEASE_FROM = ("queued", "claimed", "paused", "failed", "blocked", "staged")
 STALE_AFTER_MINUTES = 10
 
 
@@ -680,9 +681,12 @@ def _record_load_rejections(c, batch_id, source_id, rejected, staging_rows, ids,
 def _persist_chunk(batch_id, source_id, results, triage: Triage, pii_cols, counters, progress=None, change_acc: dict | None = None) -> dict:
     from .changes import apply_closes, apply_updates, conflict_failures
 
+    # ponytail: LBP_SLIM_STAGING drops PASS/WARN JSON from staging (loan still lands in sse_loans). Needed for 10M POC on small RDS; remove when storage is sized for full audit rows.
+    slim = os.environ.get("LBP_SLIM_STAGING", "").lower() in ("1", "true", "yes")
     dups = detect_duplicates(batch_id, results)
     staged, ex_rows_by_idx, st = _triage_results(results, triage)
     staging_rows = []
+    adds: list[tuple[dict, str]] = []
     for r, rec, status in staged:
         action = "unchanged" if status == "UNCHANGED" else r.get("action")
         changes = None
@@ -696,15 +700,18 @@ def _persist_chunk(batch_id, source_id, results, triage: Triage, pii_cols, count
                                  "status": status, "record": {}, "raw": None, "transform_errors": {}, "boarded": False,
                                  "action": "unchanged", "changes": None, "base_version": r.get("base_version")})
             continue
+        boarded = status in ("PASS", "WARN")
+        if boarded and action in (None, "add"):
+            adds.append((rec, status))
+        store_rec = {} if slim and boarded and action in (None, "add") else rec
         staging_rows.append({"batch_id": batch_id, "row_number": r["row"], "loan_number": _str(rec.get("loan_number")),
-                             "status": status, "record": rec, "raw": _mask_raw(r["raw"], pii_cols), "transform_errors": r["terrs"],
-                             "boarded": status in ("PASS", "WARN"), "action": action, "changes": changes,
+                             "status": status, "record": store_rec, "raw": None if slim else _mask_raw(r["raw"], pii_cols),
+                             "transform_errors": r["terrs"], "boarded": boarded, "action": action, "changes": changes,
                              "base_version": r.get("base_version")})
     with db.get_engine().begin() as c:
         ids = [row[0] for row in c.execute(db.loans_staging.insert().returning(db.loans_staging.c.id), staging_rows)] if staging_rows else []
         _insert_exceptions(c, _exception_rows(batch_id, source_id, ex_rows_by_idx, [s["loan_number"] for s in staging_rows], ids))
         rejected: list = []
-        adds = [(s["record"], s["status"]) for s in staging_rows if s["boarded"] and s["action"] in (None, "add")]
         loaded = load_records(c, adds, batch_id, rejected, source_id=source_id)
         if rejected:
             _record_load_rejections(c, batch_id, source_id, rejected, staging_rows, ids, triage)
@@ -876,7 +883,8 @@ def reconcile(conn, batch_id: str, source_rows: int) -> dict:
     out = {
         "source_rows": source_rows, "staged": staged, "boarded": boarded, "held_in_exceptions": held, "rejected": rejected,
         "unchanged": unchanged, "in_sse": in_sse, "duplicate_loan_numbers": dup, "exceptions_by_status": by_status,
-        "balanced": source_rows == staged == boarded + held + rejected + unchanged and in_sse <= adds_boarded,
+        # in_sse must match boarded adds for this batch — missing dirty loans.jsonl rows used to slip through with <=.
+        "balanced": source_rows == staged == boarded + held + rejected + unchanged and in_sse == adds_boarded,
     }
     changed_boarded = n(st.c.boarded.is_(True), st.c.action.in_(("update", "close")))
     if changed_boarded or unchanged:

@@ -36,14 +36,18 @@ resource "aws_security_group" "app" {
   name        = "${local.name}-app"
   description = "Glue jobs and VPC Lambdas"
   vpc_id      = module.vpc.vpc_id
+}
 
-  egress {
-    description = "HTTPS to AWS APIs (S3, DynamoDB, Bedrock, Secrets Manager) via endpoints/NAT"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
+# Standalone rules only. Inline rules on the group get revoked whenever the group is updated,
+# which previously dropped the database egress and left Lambdas unable to reach RDS.
+resource "aws_security_group_rule" "app_https_egress" {
+  description       = "HTTPS to AWS APIs (S3, DynamoDB, Bedrock, Secrets Manager) via endpoints/NAT"
+  type              = "egress"
+  from_port         = 443
+  to_port           = 443
+  protocol          = "tcp"
+  security_group_id = aws_security_group.app.id
+  cidr_blocks       = ["0.0.0.0/0"]
 }
 
 resource "aws_security_group_rule" "app_to_vendor_sftp" {
@@ -109,5 +113,14 @@ resource "aws_security_group" "db" {
     to_port         = local.db_port
     protocol        = "tcp"
     security_groups = [aws_security_group.app.id]
+  }
+
+  # aws_s3.table_import_from_s3 runs inside RDS and must reach S3 + KMS
+  egress {
+    description = "RDS aws_s3 import to S3/KMS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }

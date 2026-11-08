@@ -33,14 +33,27 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": { "JobName": "${spark_job}", "Arguments": { "--batch_id.$": "$.batch_id" } },
-      "ResultPath": "$.glue",
+      "ResultPath": "$.glue_spark",
       "ResultSelector": { "run_id.$": "$.Id", "state.$": "$.JobRunState", "seconds.$": "$.ExecutionTime" },
       "Retry": [
         { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 120, "MaxAttempts": 20, "BackoffRate": 1.2, "MaxDelaySeconds": 600 }
       ],
-      "Comment": "A failed Spark run resumes on the standard engine from the last checkpoint (rows already loaded are skipped)",
-      "Catch": [{ "ErrorEquals": ["States.TaskFailed"], "ResultPath": "$.spark_error", "Next": "GlueStandard" },
-                { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Comment": "Spark materializes clean+dirty parts to S3 only (DB-free). Load job COPYs next.",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
+      "Next": "GlueLoad"
+    },
+    "GlueLoad": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": { "JobName": "${load_job}", "Arguments": { "--batch_id.$": "$.batch_id" } },
+      "ResultPath": "$.glue_load",
+      "ResultSelector": { "run_id.$": "$.Id", "state.$": "$.JobRunState", "seconds.$": "$.ExecutionTime" },
+      "Retry": [
+        { "ErrorEquals": ["Glue.ConcurrentRunsExceededException", "Glue.ThrottlingException"], "IntervalSeconds": 60, "MaxAttempts": 30, "BackoffRate": 1.2, "MaxDelaySeconds": 300 },
+        { "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 60, "MaxAttempts": 1, "BackoffRate": 1 }
+      ],
+      "Comment": "Independently retryable COPY from bulk-load/{batch_id}/; does not rematerialize Spark",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed" }],
       "Next": "Finalize"
     },
     "Finalize": {

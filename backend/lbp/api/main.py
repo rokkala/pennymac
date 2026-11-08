@@ -1199,9 +1199,9 @@ def list_exceptions(status: str | None = "open", tier: str | None = None, queue:
 
 
 @app.get("/api/exceptions/loads")
-def exceptions_loads(status: str | None = "open", vendor_id: str | None = None):
+def exceptions_loads(status: str | None = "open", vendor_id: str | None = None, tier: str | None = None):
     """File loads that have exceptions — for vendor / file / date filters."""
-    return exceptions_mgr.loads(status, _scope(vendor_id), vendor_id)
+    return exceptions_mgr.loads(status, _scope(vendor_id), vendor_id, tier=tier)
 
 
 @app.get("/api/exceptions/summary")

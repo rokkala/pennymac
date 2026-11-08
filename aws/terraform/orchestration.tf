@@ -15,6 +15,7 @@ resource "aws_sfn_state_machine" "boarding" {
     failed_fn_arn   = aws_lambda_function.fn["mark-failed"].arn
     feed_job        = aws_glue_job.feed.name
     spark_job       = aws_glue_job.feed_spark.name
+    load_job        = aws_glue_job.feed_load.name
     sns_topic_arn   = aws_sns_topic.alerts.arn
   })
   logging_configuration {
@@ -91,6 +92,7 @@ locals {
   glue_scripts = {
     feed        = "feed_job.py"
     feed-spark  = "feed_spark_job.py"
+    feed-load   = "feed_load_job.py"
     vendor-pull = "vendor_pull_job.py"
   }
   processed = aws_s3_bucket.zone["processed"].bucket
@@ -173,6 +175,34 @@ resource "aws_glue_job" "feed_spark" {
   default_arguments = merge(local.glue_common_args, local.glue_env_args, {
     "--enable-auto-scaling" = "true"
     "--processed_bucket"    = local.processed
+    "--LBP_SPARK_DB_FREE"   = "1"
+    "--LBP_BULK_FILE_LOAD"  = "1"
+    "--LBP_S3_IMPORT"       = "1"
+  })
+  security_configuration = aws_glue_security_configuration.main.name
+}
+
+# Load engine: COPY clean+dirty S3 parts after Spark DB-free materialize (no Spark cluster).
+resource "aws_glue_job" "feed_load" {
+  name              = "${local.name}-feed-load"
+  description       = "COPY staged bulk-load parts into SSE after Spark materialize"
+  role_arn          = aws_iam_role.glue.arn
+  glue_version      = "5.0"
+  worker_type       = "G.1X"
+  number_of_workers = 2
+  timeout           = 480
+  max_retries       = 0
+  connections       = [aws_glue_connection.vpc.name]
+  execution_property { max_concurrent_runs = var.glue_feed_concurrency }
+  command {
+    name            = "glueetl"
+    script_location = "s3://${local.processed}/${aws_s3_object.glue_script["feed-load"].key}"
+    python_version  = "3"
+  }
+  default_arguments = merge(local.glue_common_args, local.glue_env_args, {
+    "--processed_bucket"   = local.processed
+    "--LBP_BULK_FILE_LOAD" = "1"
+    "--LBP_S3_IMPORT"      = "1"
   })
   security_configuration = aws_glue_security_configuration.main.name
 }

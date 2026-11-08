@@ -80,10 +80,56 @@ def test_standard_job_entrypoint(onboarded):
     assert json.loads(glue_jobs.summary(res))["batch_id"] == res["batch_id"]
 
 
+def test_persist_bulk_boards_clean_adds(onboarded):
+    """Spark full-tape path: clean adds go through COPY/bulk, not OLTP micro-batches."""
+    from lbp import glue_jobs
+    from lbp.ingestion.parser import ParseOptions, iter_rows
+    from lbp.pipeline.batch import process_chunk
+
+    src = onboarded["pcg_retail"]
+    bid = create_batch(src["source_id"], src["path"], src["path"].name, "s3")
+    cfg, b = glue_jobs.prepare_large(bid)
+    assert cfg is not None and b.batch_id == bid
+    key = f"{cfg.mapping_id}:{cfg.mapping_version}|{cfg.rules_key}"
+    _, it = iter_rows(src["path"], ParseOptions(**(cfg.parse_options or {})))
+    rows = list(it)
+    results = process_chunk(rows, cfg.fields, cfg.runtime_set, 0, key)
+    res = glue_jobs.persist_bulk(bid, cfg, results, chunk=50)
+    assert res["processed"] == len(rows)
+    done = _batch(bid)
+    assert done.status == "completed" and done.reconciliation["balanced"]
+    assert done.loaded == res["loaded"] and done.loaded > 0
+
+
+def test_persist_partition_then_finalize(onboarded, monkeypatch):
+    """Executor-style path: partitions write parts; driver finalizes (load + reconcile)."""
+    from lbp import glue_jobs
+    from lbp.ingestion.parser import ParseOptions, iter_rows
+    from lbp.pipeline.batch import process_chunk
+
+    monkeypatch.setenv("LBP_SPARK_DB_FREE", "1")
+    monkeypatch.setenv("LBP_BULK_FILE_LOAD", "1")
+    src = onboarded["pcg_retail"]
+    bid = create_batch(src["source_id"], src["path"], src["path"].name, "s3")
+    cfg, b = glue_jobs.prepare_large(bid)
+    key = f"{cfg.mapping_id}:{cfg.mapping_version}|{cfg.rules_key}"
+    _, it = iter_rows(src["path"], ParseOptions(**(cfg.parse_options or {})))
+    results = process_chunk(list(it), cfg.fields, cfg.runtime_set, 0, key)
+    ckpt = glue_jobs.begin_bulk(bid)
+    mid = max(1, len(results) // 2)
+    sid = src["source_id"]
+    glue_jobs.persist_partition(bid, cfg, results[:mid], checkpoint=ckpt, source_id=sid)
+    glue_jobs.persist_partition(bid, cfg, results[mid:], checkpoint=ckpt, source_id=sid)
+    res = glue_jobs.finalize_bulk(bid, cfg)
+    done = _batch(bid)
+    assert done.status == "completed" and done.reconciliation["balanced"]
+    assert res["loaded"] == done.loaded and done.loaded > 0
+
+
 @pytest.mark.skipif(not shutil.which("java"), reason="needs Java for a local Spark")
-def test_spark_job_on_local_spark(onboarded, tmp_path, env):
+def test_spark_job_map_partitions_writes_few_parquet(onboarded, tmp_path, env):
+    """No pandas: mapPartitions → coalesce Parquet; map-only exits staged."""
     pytest.importorskip("pyspark")
-    pytest.importorskip("pyarrow")
     src = onboarded["pcg_retail"]
     bid = create_batch(src["source_id"], src["path"], src["path"].name, "s3")
     fake = tmp_path / "fakeglue" / "awsglue"
@@ -107,19 +153,13 @@ def test_spark_job_on_local_spark(onboarded, tmp_path, env):
                     f"sys.argv = ['job', '--batch_id', '{bid}', '--processed_bucket', '{tmp_path / 'processed'}']\n"
                     f"runpy.run_path('{ROOT / 'aws' / 'glue' / 'feed_spark_job.py'}', run_name='__main__')\n")
     envv = {**os.environ, "PYTHONPATH": f"{tmp_path / 'fakeglue'}:{ROOT / 'backend'}", "PYSPARK_PYTHON": sys.executable}
-    # SparkContext() inside the script picks up the context created by boot.py
     envv["LBP_WORKERS"] = "1"
+    envv["LBP_SPARK_MAP_ONLY"] = "1"
+    envv["LBP_FORCE_REMAP"] = "1"
+    envv["LBP_PARQUET_FILES"] = "2"
     r = subprocess.run([sys.executable, str(boot)], env=envv, capture_output=True, text=True, timeout=600)
     assert r.returncode == 0, r.stderr[-3000:]
-    b = _batch(bid)
-    assert b.status == "completed" and b.reconciliation["balanced"] and b.processed == 300, (b.status, b.error, r.stdout[-500:])
-    assert list((tmp_path / "processed").rglob("*.parquet"))
-    # same outcome as the standard engine on the same file
-    from lbp import glue_jobs
-
-    p2 = tmp_path / "copy.csv"
-    p2.write_text(Path(src["path"]).read_text())
-    with db.get_engine().begin() as c:
-        c.execute(db.sse_loans.delete())
-    res = glue_jobs.process_batch(create_batch(src["source_id"], p2, "copy.csv", "s3", allow_duplicate=True, reason="engine parity"))
-    assert (res["passed"], res["warned"], res["failed"]) == (b.passed, b.warned, b.failed)
+    parts = list((tmp_path / "processed").rglob("*.parquet"))
+    assert parts and len(parts) <= 4, parts  # coalesce(2) + possible success file noise
+    assert _batch(bid).status == "staged"
+    assert "parquet_written" in r.stdout
