@@ -1,0 +1,9 @@
+file,upload_to,rows,what_it_shows,expected
+01_happy_path_pcg.csv,PennyMac Retail · Daily retail tape,24,"Clean new loans, no defects",Pre-flight passes; loans board
+02_exceptions_mixed_pcg.csv,PennyMac Retail · Daily retail tape,36,Every row has a data defect,T2 T4 and T5 exceptions open; clean rows still board
+03_schema_drift_pcg.csv,PennyMac Retail · Daily retail tape,20,NoteRate renamed; MaturityDate is MM/DD/YYYY,Blocked before any row loads
+04_t5_ofac_fraud_pcg.csv,PennyMac Retail · Daily retail tape,12,3 OFAC hits and 3 fraud flags,Those loans halt as T5; only Compliance can clear
+05_atlas_bulk.xlsx,Atlas · Bulk acquisition tape,20,"Excel tape, light defects",Parsed like CSV; a few exceptions
+06_cornerstone_boarding.txt,Cornerstone · Boarding tapes,20,"Pipe-delimited tape, light defects",Completed with a few exceptions
+07_summit_owner_occ.csv,Summit · Loan tape,18,Occupancy written as Owner-Occ,Boards; mapping v2 translates Owner-Occ to P S or I
+08_cornerstone_resend.txt,Cornerstone · Boarding tapes,15,Loans already boarded on the sample tape,Loans already in SSE held as DUP02 and not overwritten; rows never boarded raise their field rules
