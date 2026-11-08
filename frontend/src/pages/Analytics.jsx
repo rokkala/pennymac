@@ -1,155 +1,292 @@
-import React, { useState } from "react";
-import { api, scoped } from "../api.js";
-import { useApi, useAction, Panel, Tabs, Loading, fmt, Kpis, Conf, Status, PageHeader } from "../ui.jsx";
-import { HBars, VBars, heatColor } from "../charts.jsx";
+import React, { useMemo, useState } from "react";
+import { scoped } from "../api.js";
+import { useApi, Panel, Tabs, Loading, fmt, ago, Kpis, Status, PageHeader, EmptyState } from "../ui.jsx";
+import { HBars } from "../charts.jsx";
 
-function Ask() {
-  const [q, setQ] = useState("Which vendor has the worst success rate?");
-  const [ans, setAns] = useState(null);
-  const act = useAction();
-  const run = async (question = q) => setAns(await act(() => api("/api/analytics/ask", { method: "POST", body: { question } })));
-  const render = (a) => {
-    if (a === null || a === undefined) return null;
-    if (Array.isArray(a)) return (
-      <div className="tbl-wrap"><table className="tbl"><thead><tr>{Object.keys(a[0] || {}).map((k) => <th key={k}>{k.replace(/_/g, " ")}</th>)}</tr></thead>
-        <tbody>{a.map((r, i) => <tr key={i}>{Object.values(r).map((v, j) => <td key={j} className="num">{typeof v === "number" ? fmt(v, 1) : String(v)}</td>)}</tr>)}</tbody></table></div>);
-    if (typeof a === "object") return <dl className="kv">{Object.entries(a).map(([k, v]) => <React.Fragment key={k}><dt>{k.replace(/_/g, " ")}</dt><dd className="num">{typeof v === "number" ? fmt(v, 1) : String(v)}</dd></React.Fragment>)}</dl>;
-    return <span className="kpi"><span className="v">{typeof a === "number" ? fmt(a, 1) : a}</span></span>;
-  };
+function pct(v) {
+  return v === null || v === undefined ? "—" : `${fmt(v, 1)}%`;
+}
+
+function rollupVendors(byVendor, sources, loads) {
+  const byVid = new Map();
+  for (const s of sources || []) {
+    const id = s.vendor_id || s.source_id;
+    const cur = byVid.get(id) || {
+      vendor_id: id,
+      name: s.vendor_name || s.name,
+      processed: 0,
+      boarded: 0,
+      exceptions: 0,
+      auto_fixed: 0,
+      feeds: 0,
+      feed_rows: [],
+    };
+    cur.processed += s.loans_processed || 0;
+    cur.boarded += s.loans_boarded || 0;
+    cur.exceptions += s.exceptions || 0;
+    cur.auto_fixed += s.auto_fixed || 0;
+    cur.feeds += 1;
+    cur.feed_rows.push(s);
+    byVid.set(id, cur);
+  }
+  const loadsByVendor = new Map();
+  for (const b of loads || []) {
+    if (!b.vendor_id) continue;
+    const list = loadsByVendor.get(b.vendor_id) || [];
+    list.push(b);
+    loadsByVendor.set(b.vendor_id, list);
+  }
+  const base = (byVendor || []).length
+    ? byVendor
+    : [...byVid.values()].map((v) => ({ vendor_id: v.vendor_id, name: v.name, status: "active", open_exceptions: 0, on_time_pct: null, last_file: null, feeds: v.feeds }));
+  return base.map((v) => {
+    const perf = byVid.get(v.vendor_id) || { processed: 0, boarded: 0, exceptions: 0, auto_fixed: 0, feeds: v.feeds || 0, feed_rows: [] };
+    const success = perf.processed ? round(perf.boarded / perf.processed * 100, 1) : null;
+    const ex100 = perf.processed ? round(perf.exceptions / perf.processed * 100, 1) : null;
+    return {
+      ...v,
+      processed: perf.processed,
+      boarded: perf.boarded,
+      success_rate: success,
+      exceptions: perf.exceptions,
+      exceptions_per_100: ex100,
+      auto_fixed: perf.auto_fixed,
+      feed_rows: perf.feed_rows,
+      loads: loadsByVendor.get(v.vendor_id) || [],
+    };
+  }).sort((a, b) => (b.processed || 0) - (a.processed || 0));
+}
+
+function round(n, d) {
+  const p = 10 ** d;
+  return Math.round(n * p) / p;
+}
+
+function SummaryStrip() {
+  const { data } = useApi(scoped("/api/analytics/executive"));
+  if (!data) return <Loading />;
   return (
-    <Panel title="Ask the data" sub="Natural-language questions over boarding metrics (QuickSight Q in AWS)">
-      <form className="row" onSubmit={(e) => { e.preventDefault(); run(); }}>
-        <input id="ask-q" className="input" style={{ flex: 1, minWidth: 220 }} value={q} onChange={(e) => setQ(e.target.value)} />
-        <button className="btn primary" type="submit">Ask</button>
-      </form>
-      {ans && <div className="stack" style={{ marginTop: 12 }}>
-        {ans.answer_title ? <><span className="eyebrow">{ans.answer_title}</span>{render(ans.answer)}</> :
-          <div className="row"><span className="muted">Try one of these:</span>{(ans.suggestions || []).map((s) => <button key={s} className="btn sm" onClick={() => { setQ(s); run(s); }}>{s}</button>)}</div>}
-      </div>}
-    </Panel>
+    <Kpis items={[
+      { label: "Boarded (24 h)", value: fmt(data.loans_boarded_24h), detail: `${fmt(data.loans_boarded_total)} total` },
+      { label: "Straight-through", value: pct(data.straight_through_rate), detail: `${fmt(data.loans_processed)} processed` },
+      { label: "Open blocking", value: fmt(data.open_blocking_exceptions), detail: data.compliance_blocks ? `${fmt(data.compliance_blocks)} compliance` : undefined },
+      { label: "Auto-apply rate", value: pct(data.auto_apply_rate) },
+    ]} />
   );
 }
 
-function ExceptionsDash() {
-  const { data } = useApi(scoped("/api/analytics/exceptions"));
-  if (!data) return <Loading />;
+function VendorDetail({ vendor, exceptions }) {
+  const cats = Object.entries(exceptions?.by_category || {}).map(([label, value]) => ({ label, value }));
+  const recent = (vendor.loads || []).slice(0, 8);
   return (
-    <>
-      <Kpis items={[{ label: "Exceptions (30 d)", value: fmt(data.total) }, { label: "Open", value: fmt(data.open) },
-        { label: "Auto-applied", value: fmt(data.auto_applied), detail: `${data.auto_apply_rate}% of all` },
-        ...Object.entries(data.avg_resolution_minutes).slice(0, 2).map(([t, m]) => ({ label: `Avg time to resolve ${t}`, value: `${fmt(m, 1)} min` }))]} />
-      <div className="grid g2">
-        <Panel title="By category"><HBars items={Object.entries(data.by_category).map(([k, v]) => ({ label: k, value: v }))} /></Panel>
-        <Panel title="By vendor · feed"><HBars items={Object.entries(data.by_source).map(([k, v]) => ({ label: k, value: v }))} color="var(--chart-3)" /></Panel>
-        <Panel title="Open exception age"><VBars items={Object.entries(data.aging).map(([k, v]) => ({ label: k, value: v, color: "var(--chart-2)" }))} /></Panel>
-        <Panel title="Bulk-resolution candidates" sub="Same rule and same bad value, many loans" pad={false}>
-          <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Rule</th><th>Value</th><th className="r">Open</th></tr></thead>
-            <tbody>{data.bulk_candidates.map((b, i) => <tr key={i}><td className="mono">{b.rule_id}</td><td className="mono">{b.original_value ?? "(blank)"}</td><td className="r num">{b.count}</td></tr>)}</tbody></table></div>
+    <div className="grid g2" style={{ marginTop: 12 }}>
+      <Panel title="Feeds" pad={false}>
+        {!vendor.feed_rows?.length ? <EmptyState title="No feeds" body="This vendor has no performance history yet." /> : (
+          <div className="tbl-wrap"><table className="tbl"><thead><tr>
+            <th>Feed</th><th className="r">Batches</th><th className="r">Processed</th><th className="r">Boarded</th><th className="r">Success</th><th className="r">Ex / 100</th>
+          </tr></thead><tbody>
+            {vendor.feed_rows.map((s) => (
+              <tr key={s.source_id}>
+                <td>{s.feed_name || s.name}<div className="faint" style={{ fontSize: ".74rem" }}>{s.format}</div></td>
+                <td className="r num">{fmt(s.batches)}</td>
+                <td className="r num">{fmt(s.loans_processed)}</td>
+                <td className="r num">{fmt(s.loans_boarded)}</td>
+                <td className="r num">{pct(s.success_rate)}</td>
+                <td className="r num">{s.exceptions_per_100 ?? "—"}</td>
+              </tr>
+            ))}
+          </tbody></table></div>
+        )}
+      </Panel>
+      <Panel title="Exceptions by category" sub="Last 30 days for this vendor">
+        {cats.length ? <HBars items={cats} /> : <span className="faint">No exceptions in range.</span>}
+      </Panel>
+      <div style={{ gridColumn: "1 / -1" }}>
+        <Panel title="Recent file loads" pad={false}>
+          {!recent.length ? <EmptyState title="No loads" body="No file loads recorded for this vendor." /> : (
+            <div className="tbl-wrap"><table className="tbl"><thead><tr>
+              <th>File</th><th>Type</th><th>Status</th><th className="r">Rows</th><th className="r">Boarded</th><th className="r">Exceptions</th><th className="r">Finished</th>
+            </tr></thead><tbody>
+              {recent.map((b) => (
+                <tr key={b.batch_id}>
+                  <td className="mono">{b.filename}</td>
+                  <td><span className="chip">{b.load_type || "full"}</span></td>
+                  <td><Status s={b.status} /></td>
+                  <td className="r num">{fmt(b.processed)} / {fmt(b.total_rows)}</td>
+                  <td className="r num">{fmt(b.loaded)}</td>
+                  <td className="r num">{fmt(b.exceptions || 0)}{b.open_exceptions ? <span className="faint"> · {fmt(b.open_exceptions)} open</span> : null}</td>
+                  <td className="r num">{ago(b.finished_at || b.created_at)}</td>
+                </tr>
+              ))}
+            </tbody></table></div>
+          )}
         </Panel>
       </div>
+    </div>
+  );
+}
+
+function ByVendor() {
+  const vend = useApi(scoped("/api/analytics/vendors"));
+  const perf = useApi(scoped("/api/analytics/source-performance"));
+  const loads = useApi(scoped("/api/analytics/import-status?limit=200"));
+  const [sel, setSel] = useState(null);
+  const rows = useMemo(
+    () => rollupVendors(vend.data?.by_vendor, perf.data?.sources, loads.data?.batches),
+    [vend.data, perf.data, loads.data],
+  );
+  const selected = rows.find((r) => r.vendor_id === sel) || null;
+  const ex = useApi(selected ? `/api/analytics/exceptions?vendor_id=${encodeURIComponent(selected.vendor_id)}` : null, [selected?.vendor_id]);
+  if (!vend.data || !perf.data || !loads.data) return <Loading />;
+  if (!rows.length) return <EmptyState title="No vendors" body="Onboard a vendor and run a file load to see analytics." />;
+  return (
+    <>
+      <Panel title="By vendor" sub="Boarding outcomes rolled up to the vendor. Select a row for feeds, exceptions, and recent loads." pad={false}>
+        <div className="tbl-wrap"><table className="tbl"><thead><tr>
+          <th>Vendor</th><th>Status</th><th className="r">Feeds</th><th className="r">Processed</th><th className="r">Boarded</th>
+          <th className="r">Success</th><th className="r">Open ex.</th><th className="r">Ex / 100</th><th className="r">Auto-fixed</th>
+          <th className="r">On time</th><th className="r">Last file</th>
+        </tr></thead><tbody>
+          {rows.map((v) => (
+            <tr key={v.vendor_id} className={`click${sel === v.vendor_id ? " selected" : ""}`} onClick={() => setSel(sel === v.vendor_id ? null : v.vendor_id)}>
+              <td>{v.name}</td>
+              <td><Status s={v.status} /></td>
+              <td className="r num">{fmt(v.feeds ?? v.feed_rows?.length ?? 0)}</td>
+              <td className="r num">{fmt(v.processed)}</td>
+              <td className="r num">{fmt(v.boarded)}</td>
+              <td className="r num">{pct(v.success_rate)}</td>
+              <td className="r num">{fmt(v.open_exceptions)}</td>
+              <td className="r num">{v.exceptions_per_100 ?? "—"}</td>
+              <td className="r num">{fmt(v.auto_fixed)}</td>
+              <td className="r num">{v.on_time_pct === null || v.on_time_pct === undefined ? "—" : `${v.on_time_pct}%`}</td>
+              <td className="r num">{ago(v.last_file)}</td>
+            </tr>
+          ))}
+        </tbody></table></div>
+      </Panel>
+      {selected && <VendorDetail vendor={selected} exceptions={ex.data} />}
     </>
   );
 }
 
-function DQ() {
-  const { data } = useApi(scoped("/api/analytics/dq-scorecard"));
-  if (!data) return <Loading />;
+function LoadDetail({ batch }) {
+  const rec = batch.reconciliation || {};
+  const ch = batch.change_summary || {};
+  const pf = batch.preflight;
   return (
-    <>
-      <Kpis items={[{ label: "Overall DQ score", value: fmt(data.overall_score, 1) }, { label: "Required-field completeness", value: `${fmt(data.required_completeness, 1)}%` }, { label: "Loans sampled", value: fmt(data.sampled_loans) }]} />
-      <Panel title="Quality heatmap" sub="Score by vendor feed and SSE module (100 = no exceptions)" pad={false}>
-        <div className="tbl-wrap"><table className="tbl heat"><thead><tr><th>Source</th>{data.modules.map((m) => <th key={m} style={{ textAlign: "center" }}>{m}</th>)}</tr></thead>
-          <tbody>{data.heatmap.map((r) => <tr key={r.source}><td>{r.source}</td>{data.modules.map((m) => <td key={m} className="h" style={{ background: heatColor(r[m]) }} title={`${r.source} · ${m}: ${r[m]}`}>{fmt(r[m], 1)}</td>)}</tr>)}</tbody></table></div>
+    <div className="grid g2" style={{ marginTop: 12 }}>
+      <Panel title="Load outcome">
+        <dl className="kv">
+          <dt>Vendor</dt><dd>{batch.vendor_name || "—"}</dd>
+          <dt>Feed</dt><dd>{batch.source_name || "—"}</dd>
+          <dt>File</dt><dd className="mono">{batch.filename}</dd>
+          <dt>Type</dt><dd><span className="chip">{batch.load_type || "full"}</span></dd>
+          <dt>Status</dt><dd><Status s={batch.status} /></dd>
+          <dt>Submitted by</dt><dd>{batch.submitted_by || "—"}</dd>
+          <dt>Throughput</dt><dd className="num">{batch.throughput_lps ? `${fmt(batch.throughput_lps, 1)} loans/s` : "—"}</dd>
+        </dl>
       </Panel>
-      <Panel title="Lowest-scoring fields" pad={false}>
-        <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Field</th><th>Module</th><th className="r">Completeness</th><th className="r">Exception rate</th><th className="r">Score</th></tr></thead>
-          <tbody>{data.fields.slice(0, 15).map((f) => <tr key={f.field}><td className="mono">{f.field}{f.required && <span style={{ color: "var(--fail)" }}> *</span>}</td><td>{f.module}</td>
-            <td className="r num">{fmt(f.completeness, 1)}%</td><td className="r num">{fmt(f.exception_rate, 2)}%</td><td className="r num"><b>{fmt(f.score, 1)}</b></td></tr>)}</tbody></table></div>
+      <Panel title="Counts">
+        <Kpis items={[
+          { label: "Processed", value: fmt(batch.processed) },
+          { label: "Boarded", value: fmt(batch.loaded) },
+          { label: "Failed / warned", value: `${fmt(batch.failed)} / ${fmt(batch.warned)}` },
+          { label: "Exceptions", value: fmt(batch.exceptions || 0), detail: batch.open_exceptions ? `${fmt(batch.open_exceptions)} still open` : undefined },
+        ]} />
       </Panel>
-    </>
+      {(rec.balanced !== undefined || Object.keys(ch).length > 0) && (
+        <div style={{ gridColumn: "1 / -1" }}>
+          <Panel title="Reconciliation / changes">
+            <dl className="kv">
+              {rec.balanced !== undefined && <><dt>Balanced</dt><dd>{rec.balanced ? "Yes" : "No"}</dd></>}
+              {rec.expected != null && <><dt>Expected</dt><dd className="num">{fmt(rec.expected)}</dd></>}
+              {rec.actual != null && <><dt>Actual</dt><dd className="num">{fmt(rec.actual)}</dd></>}
+              {["adds", "updates", "closes", "unchanged", "conflicts"].filter((k) => ch[k] != null).map((k) => (
+                <React.Fragment key={k}><dt>{k}</dt><dd className="num">{fmt(ch[k])}</dd></React.Fragment>
+              ))}
+            </dl>
+          </Panel>
+        </div>
+      )}
+      {pf && (
+        <div style={{ gridColumn: "1 / -1" }}>
+          <Panel title="Pre-flight">
+            <div className="row"><Status s={pf.decision} /><span className="faint">{pf.summary}</span></div>
+          </Panel>
+        </div>
+      )}
+      {batch.error && (
+        <div style={{ gridColumn: "1 / -1" }}>
+          <Panel title="Error"><span className="fail">{batch.error}</span></Panel>
+        </div>
+      )}
+    </div>
   );
 }
 
-function SourcesDash() {
-  const { data } = useApi(scoped("/api/analytics/source-performance"));
+function ByFileLoad() {
+  const { data } = useApi(scoped("/api/analytics/import-status?limit=100"), [], { poll: 5000 });
+  const [sel, setSel] = useState(null);
   if (!data) return <Loading />;
-  return (
-    <Panel title="Vendor and feed performance" pad={false}>
-      <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Vendor · feed</th><th>Format</th><th>Status</th><th className="r">Batches</th><th className="r">Processed</th><th className="r">Boarded</th>
-        <th className="r">Success</th><th className="r">Exceptions / 100</th><th className="r">Auto-fixed</th><th className="r">Avg loans/s</th></tr></thead>
-        <tbody>{data.sources.map((s) => <tr key={s.source_id}><td>{s.name}</td><td className="mono">{s.format}</td><td><Status s={s.status} /></td><td className="r num">{s.batches}</td>
-          <td className="r num">{fmt(s.loans_processed)}</td><td className="r num">{fmt(s.loans_boarded)}</td><td className="r num">{s.success_rate ?? "—"}%</td>
-          <td className="r num">{s.exceptions_per_100 ?? "—"}</td><td className="r num">{fmt(s.auto_fixed)}</td><td className="r num">{fmt(s.avg_throughput_lps)}</td></tr>)}</tbody></table></div>
-    </Panel>
-  );
-}
-
-function AIDash() {
-  const { data } = useApi(scoped("/api/analytics/ai-mapping"));
-  const mem = useApi("/api/mapping-memory");
-  if (!data) return <Loading />;
-  const e = data.exception_ai;
+  const batches = data.batches || [];
+  const selected = batches.find((b) => b.batch_id === sel) || null;
+  if (!batches.length) return <EmptyState title="No file loads" body="Upload or schedule a file to see per-load analytics." />;
   return (
     <>
-      <Kpis items={[{ label: "T1 auto-applied", value: fmt(e.t1_auto_applied) }, { label: "T1 override rate", value: `${e.t1_override_rate_pct}%`, detail: "control limit < 2%" },
-        { label: "QA samples pending", value: fmt(e.qa_samples_pending) }, { label: "AI proposal acceptance", value: e.ai_proposal_acceptance_pct === null ? "—" : `${e.ai_proposal_acceptance_pct}%`, detail: `${fmt(e.human_resolutions)} human resolutions` }]} />
-      {mem.data && <Panel title="Mapping memory" sub={`${mem.data.approved_pairs} column → field pairs learned from SME approvals · ${mem.data.rejected_pairs} rejected pairs suppressed. New sources with familiar columns start pre-mapped.`} pad={false}>
-        <div className="tbl-wrap" style={{ maxHeight: 260 }}><table className="tbl"><thead><tr><th>Source column</th><th>SSE field</th><th className="r">Approved</th><th className="r">Rejected</th><th>Learned from</th></tr></thead>
-          <tbody>{mem.data.items.slice(0, 60).map((x, i) => <tr key={i}><td className="mono">{x.source_column}</td><td className="mono">{x.target}</td><td className="r num">{x.approved}</td><td className="r num">{x.rejected}</td><td className="faint">{(x.sources || []).join(", ")}</td></tr>)}</tbody></table></div>
-      </Panel>}
-      <Panel title="Mapping quality by vendor feed" pad={false}>
-        <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Source</th><th>Version</th><th>Status</th><th className="r">Fields</th><th className="r">Auto-mapped</th><th>Avg confidence</th><th className="r">Override rate</th><th className="r">Review time</th></tr></thead>
-          <tbody>{data.mappings.map((m) => <tr key={m.mapping_id}><td>{m.source}</td><td>v{m.version}</td><td><Status s={m.status} /></td><td className="r num">{m.fields}</td><td className="r num">{m.auto_mapped_pct}%</td>
-            <td><Conf v={m.avg_confidence} /></td><td className="r num">{m.override_rate}%</td><td className="r num">{m.review_minutes === null ? "—" : `${fmt(m.review_minutes, 1)} min`}</td></tr>)}</tbody></table></div>
+      <Kpis items={[
+        { label: "Loads shown", value: fmt(batches.length) },
+        { label: "Running now", value: fmt(data.running) },
+        { label: "Current throughput", value: data.current_throughput_lps ? `${fmt(data.current_throughput_lps, 1)} /s` : "—" },
+      ]} />
+      <Panel title="By file load" sub="Each boarded file. Select a row for reconciliation, pre-flight, and exception counts." pad={false}>
+        <div className="tbl-wrap"><table className="tbl"><thead><tr>
+          <th>Vendor</th><th>File</th><th>Type</th><th>Status</th>
+          <th className="r">Rows</th><th className="r">Boarded</th><th className="r">Failed</th>
+          <th className="r">Exceptions</th><th className="r">Open</th><th className="r">Loans/s</th><th className="r">When</th>
+        </tr></thead><tbody>
+          {batches.map((b) => (
+            <tr key={b.batch_id} className={`click${sel === b.batch_id ? " selected" : ""}`} onClick={() => setSel(sel === b.batch_id ? null : b.batch_id)}>
+              <td>{b.vendor_name || b.source_name || "—"}</td>
+              <td className="mono">{b.filename}</td>
+              <td><span className="chip">{b.load_type || "full"}</span></td>
+              <td><Status s={b.status} /></td>
+              <td className="r num">{fmt(b.processed)}{b.total_rows ? <span className="faint"> / {fmt(b.total_rows)}</span> : null}</td>
+              <td className="r num">{fmt(b.loaded)}</td>
+              <td className="r num">{fmt(b.failed)}</td>
+              <td className="r num">{fmt(b.exceptions || 0)}</td>
+              <td className="r num">{fmt(b.open_exceptions || 0)}</td>
+              <td className="r num">{b.throughput_lps ? fmt(b.throughput_lps, 1) : "—"}</td>
+              <td className="r num">{ago(b.finished_at || b.started_at || b.created_at)}</td>
+            </tr>
+          ))}
+        </tbody></table></div>
       </Panel>
-    </>
-  );
-}
-
-function VendorsDash() {
-  const { data } = useApi(scoped("/api/analytics/vendors"));
-  if (!data) return <Loading />;
-  const v = data.vendors;
-  const bv = data.by_vendor || [];
-  const tot = (k) => v.reduce((a, x) => a + (x.changes_30d?.[k] || 0), 0);
-  return (
-    <>
-      <Kpis items={[{ label: "Vendors", value: bv.length, detail: `${v.length} feeds · ${v.filter((x) => x.load_type !== "full").length} send change files or snapshots` },
-        { label: "Changes applied (30 d)", value: fmt(tot("updates") + tot("closes") + tot("adds")), detail: `${fmt(tot("updates"))} updates · ${fmt(tot("closes"))} closes · ${fmt(tot("adds"))} adds` },
-        { label: "Unchanged rows skipped", value: fmt(tot("unchanged")), detail: "snapshot rows identical to SSE" },
-        { label: "Concurrent-change conflicts", value: fmt(tot("conflicts")), detail: "held for a person, never overwritten" }]} />
-      <Panel title="By vendor" pad={false}>
-        <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Vendor</th><th>Status</th><th className="r">Feeds</th><th className="r">Active loans</th><th className="r">Open exceptions</th>
-          <th className="r">On time (30 d)</th><th className="r">Late / missed</th><th className="r">Files held</th></tr></thead>
-          <tbody>{bv.map((x) => <tr key={x.vendor_id}><td>{x.name}</td><td><Status s={x.status} /></td><td className="r num">{x.feeds}</td><td className="r num">{fmt(x.active_loans)}</td>
-            <td className="r num">{fmt(x.open_exceptions)}</td><td className="r num">{x.on_time_pct === null ? "—" : `${x.on_time_pct}%`}</td><td className="r num">{x.late_or_missed}</td><td className="r num">{x.attention_files}</td></tr>)}</tbody></table></div>
-      </Panel>
-      <Panel title="Feeds: freshness and change volume" sub="Last 30 days" pad={false}>
-        <div className="tbl-wrap"><table className="tbl"><thead><tr><th>Vendor · feed</th><th>Delivers</th><th className="r">Active loans</th><th className="r">Last file</th><th className="r">Applied #</th>
-          <th className="r">On time</th><th className="r">Late / missed (open)</th><th className="r">Files</th><th className="r">Updates</th><th className="r">Closes</th><th className="r">Adds</th></tr></thead>
-          <tbody>{v.map((x) => <tr key={x.source_id}><td>{x.vendor_name || x.name}{x.vendor_name && x.vendor_name !== x.name && <div className="faint" style={{ fontSize: ".74rem" }}>{x.name}</div>}{x.waiting_files > 0 && <span className="pill warn" style={{ marginLeft: 6 }}>{x.waiting_files} waiting</span>}</td>
-            <td><span className="chip">{x.load_type}</span></td><td className="r num">{fmt(x.active_loans)}</td>
-            <td className="r num">{x.hours_since_arrival === null ? "—" : `${fmt(x.hours_since_arrival, 1)} h ago`}</td><td className="r num">{x.last_sequence ?? "—"}</td>
-            <td className="r num">{x.on_time_pct === null ? "—" : `${x.on_time_pct}%`}</td><td className="r num">{x.open_late_or_missed || 0}</td>
-            <td className="r num">{fmt(x.changes_30d?.files || 0)}</td><td className="r num">{fmt(x.changes_30d?.updates || 0)}</td><td className="r num">{fmt(x.changes_30d?.closes || 0)}</td><td className="r num">{fmt(x.changes_30d?.adds || 0)}</td></tr>)}</tbody></table></div>
-      </Panel>
+      {selected && <LoadDetail batch={selected} />}
     </>
   );
 }
 
 export default function Analytics() {
-  const [tab, setTab] = useState("exceptions");
+  const [tab, setTab] = useState("vendors");
   return (
     <>
       <PageHeader
         eyebrow="Run"
         title="Analytics"
-        sub="Batch KPIs, exception trends, data-quality scoring, and AI performance. In AWS these are Redshift views served through QuickSight."
+        sub="What boarded, what is still held, and which seller is driving it."
         guideHref="#guide?path=execution&step=board"
       />
-      <Ask />
-      <Tabs value={tab} onChange={setTab} tabs={[{ id: "exceptions", label: "Exception analytics" }, { id: "dq", label: "DQ scorecard" }, { id: "sources", label: "Vendor & feed performance" }, { id: "vendors", label: "Vendor deliveries" }, { id: "ai", label: "AI mapping insights" }]} />
-      {tab === "exceptions" && <ExceptionsDash />}{tab === "dq" && <DQ />}{tab === "sources" && <SourcesDash />}{tab === "vendors" && <VendorsDash />}{tab === "ai" && <AIDash />}
+      <SummaryStrip />
+      <Tabs
+        value={tab}
+        onChange={setTab}
+        tabs={[
+          { id: "vendors", label: "By vendor" },
+          { id: "loads", label: "By file load" },
+        ]}
+      />
+      {tab === "vendors" && <ByVendor />}
+      {tab === "loads" && <ByFileLoad />}
     </>
   );
 }

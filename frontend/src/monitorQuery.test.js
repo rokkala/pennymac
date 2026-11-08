@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
-  buildBatchesPath, splitLiveAndHistory, deskOrder, LIVE_STATUSES,
+  buildBatchesPath, splitLiveAndHistory, deskOrder, LIVE_STATUSES, batchStep,
 } from "./monitorQuery.js";
 
 describe("buildBatchesPath", () => {
@@ -52,5 +52,67 @@ describe("deskOrder", () => {
       { batch_id: "old", status: "failed" },
     ];
     assert.deepEqual(deskOrder(rows).map((x) => x.batch_id), ["live", "done", "old"]);
+  });
+});
+
+describe("batchStep", () => {
+  it("prefers the running Step Functions step when pipeline is present", () => {
+    const s = batchStep({
+      status: "running",
+      progress_pct: 40,
+      pipeline: {
+        steps: [
+          { name: "Route", label: "Route", state: "succeeded" },
+          { name: "GlueStandard", label: "Glue", state: "running", summary: "engine glue" },
+        ],
+        current: { name: "GlueStandard", label: "Glue", state: "running", summary: "engine glue" },
+      },
+    });
+    assert.equal(s.label, "Glue");
+    assert.equal(s.state, "running");
+    assert.match(s.detail || "", /engine glue/);
+  });
+  it("falls back to a local phase from status when there is no pipeline", () => {
+    assert.equal(batchStep({ status: "blocked" }).label, "Preflight");
+    assert.equal(batchStep({ status: "waiting" }).label, "Waiting");
+    assert.equal(batchStep({ status: "paused", progress_pct: 20 }).label, "Paused");
+    assert.equal(batchStep({ status: "running", progress_pct: 33.3 }).label, "Processing");
+    assert.match(batchStep({ status: "running", progress_pct: 33.3 }).detail || "", /33/);
+    assert.equal(batchStep({ status: "completed" }).label, "Done");
+    assert.equal(batchStep({ status: "failed" }).label, "Failed");
+    assert.equal(batchStep({ status: "claimed" }).label, "Claimed");
+    assert.equal(batchStep({ status: "queued" }).label, "Queued");
+  });
+  it("prefers the last local pipeline step label when SF current is absent", () => {
+    const s = batchStep({
+      status: "running",
+      progress_pct: 10,
+      pipeline: {
+        steps: [
+          { name: "parse", label: "Parse", state: "succeeded" },
+          { name: "validate", label: "Validate", state: "running", summary: "row 120" },
+        ],
+      },
+    });
+    assert.equal(s.label, "Validate");
+    assert.match(s.detail || "", /row 120/);
+  });
+  it("shows checkpoint detail for local running batches with micro-batches", () => {
+    const s = batchStep({
+      status: "running",
+      progress_pct: 40,
+      micro_batches: 12,
+    });
+    assert.equal(s.label, "Processing");
+    assert.match(s.detail || "", /12/);
+  });
+  it("keeps long errors on title only so the Step cell stays short", () => {
+    const s = batchStep({ status: "failed", error: "PermissionError: [Errno 1] Operation not permitted" });
+    assert.equal(s.label, "Failed");
+    assert.equal(s.detail, null);
+    assert.match(s.title || "", /PermissionError/);
+    const blocked = batchStep({ status: "blocked", error: "Blocked: 1 mapped column(s) missing; and more text" });
+    assert.equal(blocked.detail, null);
+    assert.match(blocked.title || "", /Blocked/);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { buildAttentionRows, buildLoadHealth, DUE_SOON_MS } from "./loadDesk.js";
+import { buildAttentionRows, buildLoadHealth, DUE_SOON_MS, scheduleDays } from "./loadDesk.js";
 
 describe("buildLoadHealth", () => {
   it("counts running late missed stuck and exceptions", () => {
@@ -56,5 +56,39 @@ describe("buildAttentionRows", () => {
     });
     assert.deepEqual(rows.map((r) => r.kind), ["batch"]);
     assert.equal(rows[0].batchId, "b1");
+  });
+
+  it("keeps a queued file on the desk with its current step", () => {
+    const rows = buildAttentionRows({
+      now,
+      batches: [{
+        batch_id: "b-q", filename: "pcg_aws_run_3.csv", status: "queued", started_at: "t",
+        pipeline: { steps: [{ label: "Glue", state: "running", summary: "standard" }] },
+      }],
+      deliveries: [],
+    });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].status, "queued");
+    assert.equal(rows[0].meta, "Glue · standard");
+  });
+});
+
+describe("scheduleDays", () => {
+  const now = new Date("2026-11-06T15:00:00Z");
+
+  it("groups windows by the date on the label and keeps earlier days as filters", () => {
+    const days = scheduleDays([
+      { delivery_id: "today", status: "expected", local_label: "2026-11-06 09:00 EST", due_at: "2026-11-06T14:00:00Z", schedule_name: "PCG", vendor_name: "PennyMac", source_name: "Retail" },
+      { delivery_id: "miss", status: "missed", local_label: "2026-11-05 09:00 EST", due_at: "2026-11-05T14:00:00Z", schedule_name: "Summit", vendor_name: "Summit", source_name: "Tape" },
+      { delivery_id: "tmrw", status: "expected", local_label: "2026-11-07 09:00 EST", due_at: "2026-11-07T14:00:00Z", schedule_name: "Tomorrow" },
+    ], now);
+    assert.equal(days.today, "2026-11-06");
+    assert.deepEqual(days.dates.map((d) => d.id), ["2026-11-06", "2026-11-05"]);
+    assert.equal(days.dates[0].label, "Today");
+    assert.equal(days.dates[0].heading, "Friday, Nov 6, 2026");
+    assert.equal(days.dates[1].label, "Thu, Nov 5");
+    assert.equal(days.dates[1].missed, 1);
+    assert.equal(days.byDate["2026-11-05"][0].delivery.delivery_id, "miss");
+    assert.equal(days.byDate["2026-11-06"][0].when, "2026-11-06 09:00 EST");
   });
 });

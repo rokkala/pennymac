@@ -239,7 +239,7 @@ export default function Maintenance({ persona, go }) {
       <PageHeader
         eyebrow="Govern"
         title="Maintenance"
-        sub="Glue jobs and rule starter templates. Templates appear in Rules → Author."
+        sub="Jobs the platform team can run."
         primary={<button type="button" className="btn" onClick={() => go?.("guide")}>Product guide</button>}
       />
       <div className="row" style={{ gap: 6, marginBottom: 16 }}>

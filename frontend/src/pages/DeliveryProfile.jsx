@@ -202,8 +202,8 @@ export default function DeliveryProfile({ sourceId, persona, go }) {
               {pending && <div className="faint" style={{ fontSize: ".76rem" }}>tested against the proposed profile</div>}</div>}
           </div>
         </Panel>
-        <Panel title="Delivery schedules" actions={<button className="btn sm" onClick={() => go("deliveries")}>Open Vendor Deliveries</button>}>
-          {!sch.data ? <Loading /> : sch.data.schedules.length === 0 ? <EmptyState title="No schedule" body="Files still process on arrival, but nobody is alerted if one doesn’t show up." action={<button type="button" className="btn sm primary" onClick={() => go("deliveries")}>Open Vendor Deliveries</button>} /> : (
+        <Panel title="Delivery schedules" actions={<button className="btn sm" onClick={() => go("deliveries")}>Open delivery schedule</button>}>
+          {!sch.data ? <Loading /> : sch.data.schedules.length === 0 ? <EmptyState title="No schedule" body="Files still process on arrival, but nobody is alerted if one doesn’t show up." action={<button type="button" className="btn sm primary" onClick={() => go("deliveries")}>Open delivery schedule</button>} /> : (
             <div className="stack" style={{ gap: 6 }}>{sch.data.schedules.map((x) => (
               <div key={x.schedule_id} className="row" style={{ fontSize: ".86rem" }}><b>{x.name}</b><Status s={x.status} /><span className="faint">{x.describe} · {(x.config || x.proposed || {}).timezone}</span>
                 {x.next_due_local && <span className="chip">next {x.next_due_local}</span>}</div>))}</div>)}

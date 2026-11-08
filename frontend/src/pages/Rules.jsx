@@ -599,8 +599,8 @@ export default function Rules({ persona }) {
     <>
       <PageHeader
         eyebrow="Setup"
-        title="Rule Engine"
-        sub={<>New rule → submit → peer approves → live. Same person cannot author and approve.{!canEdit && <> Switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> to add or move rules.</>}</>}
+        title="Rules"
+        sub={<>Checks that hold a loan. Drafts need a second person before they go live.{!canEdit && <> Switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> to add or move rules.</>}</>}
         guideHref="#guide?path=setup&step=rules"
         primary={canAuthor ? <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button> : null}
       />

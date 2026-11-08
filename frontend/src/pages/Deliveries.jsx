@@ -217,8 +217,8 @@ export default function Deliveries({ persona }) {
     <>
       <PageHeader
         eyebrow="Setup"
-        title="Vendor Deliveries"
-        sub="When each vendor’s file is due, what arrived, and what is late. The scheduler watches deadlines, pulls when vendors don’t push, and alerts on late or missing files."
+        title="Delivery schedule"
+        sub="See who is late and who is due next."
         guideHref="#guide?path=setup&step=schedule"
         primary={canSched ? <button type="button" className="btn primary" onClick={() => setEdit({})}>New schedule</button> : null}
       />

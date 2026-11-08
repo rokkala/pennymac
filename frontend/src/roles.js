@@ -64,8 +64,49 @@ export const CAPS = {
   managePersonas: ["admin"],
 };
 
+/** Run section: boarding desk, file loads, loans to fix, analytics. Onboarding does not. */
+export function seesRunDesk(user) {
+  return can(user, "monitoring", "compliance");
+}
+
 export const canCap = (user, cap) => {
   const need = CAPS[cap];
   if (!need) throw new Error(`unknown capability: ${cap}`);
   return can(user, ...need);
 };
+
+/** Exception Manager desk (raise / resolve). Monitoring · Reviewer is accept-only in the UI. */
+export function canRaiseExceptions(user) {
+  if (can(user, "admin")) return true;
+  if (canCap(user, "checkerApprove")) return false;
+  return canCap(user, "workExceptions");
+}
+
+/** Exception Manager tabs eligible for this persona. */
+export function exceptionTabsFor(user, tabs) {
+  if (can(user, "admin")) return tabs;
+  if (canCap(user, "checkerApprove")) return tabs.filter((t) => t.id === "checker" || t.id === "resolved");
+  // Monitoring desk: All open + T2–T4; skip T1 QA / submitted / T5.
+  if (canRaiseExceptions(user) && can(user, "monitoring")) {
+    return tabs.filter((t) => ["open", "T2", "T3", "T4", "resolved"].includes(t.id));
+  }
+  // Compliance desk: T5 halt queue only (member or reviewer).
+  if (can(user, "compliance") && !can(user, "monitoring") && !can(user, "onboarding")) {
+    return tabs.filter((t) => t.id === "T5" || t.id === "resolved");
+  }
+  return tabs;
+}
+
+/** First eligible Exception Manager tab for this persona. */
+export function defaultExceptionTab(user) {
+  // Monitoring keeps Suggest (T2) as home; All open is available but not the landing tab.
+  const preferred = isMonitoringExceptionDesk(user)
+    ? [{ id: "T2" }, { id: "open" }, { id: "resolved" }]
+    : [{ id: "open" }, { id: "T2" }, { id: "checker" }, { id: "T5" }, { id: "resolved" }];
+  return exceptionTabsFor(user, preferred)[0]?.id || "open";
+}
+
+/** True when this persona raises/resolves T2–T4 on the Exception Manager desk. */
+export function isMonitoringExceptionDesk(user) {
+  return canRaiseExceptions(user) && can(user, "monitoring");
+}

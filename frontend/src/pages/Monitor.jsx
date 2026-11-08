@@ -4,7 +4,7 @@ import { canCap } from "../roles.js";
 import { useApi, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, PageHeader, EmptyState, Field } from "../ui.jsx";
 import { Segments } from "../charts.jsx";
 import { SCREEN } from "../screenCopy.js";
-import { buildBatchesPath, splitLiveAndHistory, deskOrder } from "../monitorQuery.js";
+import { buildBatchesPath, splitLiveAndHistory, deskOrder, batchStep } from "../monitorQuery.js";
 import { BatchModal, UploadModal } from "./Imports.jsx";
 
 const STEP_PILL = { succeeded: "pass", failed: "fail", running: "accent" };
@@ -35,18 +35,7 @@ function ProgressBar({ pct, status }) {
   );
 }
 
-function PipelinePills({ steps }) {
-  if (!steps?.length) return null;
-  return (
-    <span className="row" style={{ gap: 4, flexWrap: "wrap" }}>
-      {steps.map((s, i) => (
-        <span key={`${s.name}-${i}`} className={`pill ${STEP_PILL[s.state] || ""}`} title={s.summary || s.state}>{s.label}</span>
-      ))}
-    </span>
-  );
-}
-
-function BatchRows({ rows, vendor, sel, onSelect, showProgress }) {
+function BatchRows({ rows, vendor, sel, onSelect, go }) {
   if (!rows.length) return null;
   return (
     <div className="tbl-wrap">
@@ -56,67 +45,97 @@ function BatchRows({ rows, vendor, sel, onSelect, showProgress }) {
             <th>File</th>
             <th>{vendor ? "Feed" : "Vendor · feed"}</th>
             <th>Status</th>
-            {showProgress && <th style={{ minWidth: 100 }}>Progress</th>}
+            <th>Step</th>
+            <th style={{ minWidth: 100 }}>Progress</th>
             <th style={{ minWidth: 120 }}>Outcome</th>
+            <th className="r">To fix</th>
             <th className="r">Rows</th>
             <th className="r">Loans/s</th>
             <th>Started</th>
           </tr>
         </thead>
         <tbody>
-          {rows.map((x) => (
-            <tr key={x.batch_id} className={`click ${sel === x.batch_id ? "sel" : ""}`} onClick={() => onSelect(x.batch_id)}>
-              <td className="mono">
-                {x.filename}
-                {x.load_type && x.load_type !== "full" && (
-                  <div className="row" style={{ gap: 4, marginTop: 2 }}>
-                    <span className="chip">{x.load_type === "snapshot" ? "snapshot" : "changes"}</span>
-                    {x.sequence && <span className="chip">#{x.sequence}</span>}
-                  </div>
-                )}
-              </td>
-              <td>
-                {vendor ? x.source_name : (
-                  <>
-                    {x.vendor_name || x.source_name}
-                    {x.vendor_name && x.vendor_name !== x.source_name && (
-                      <div className="faint" style={{ fontSize: ".76rem" }}>{x.source_name}</div>
-                    )}
-                  </>
-                )}
-              </td>
-              <td>
-                <span className="row" style={{ gap: 4, flexWrap: "wrap" }}>
-                  <Status s={x.status} />
-                  <PipelinePills steps={x.pipeline?.steps} />
-                </span>
-              </td>
-              {showProgress && (
+          {rows.map((x) => {
+            const step = batchStep(x);
+            const openN = x.open_exceptions || 0;
+            return (
+              <tr
+                key={x.batch_id}
+                className={`click ${sel === x.batch_id ? "sel" : ""}`}
+                role="button"
+                tabIndex={0}
+                aria-label={`Open batch ${x.filename}`}
+                onClick={() => onSelect(x.batch_id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onSelect(x.batch_id); }
+                }}
+              >
+                <td className="mono">
+                  {x.filename}
+                  {x.load_type && x.load_type !== "full" && (
+                    <div className="row" style={{ gap: 4, marginTop: 2 }}>
+                      <span className="chip">{x.load_type === "snapshot" ? "snapshot" : "changes"}</span>
+                      {x.sequence && <span className="chip">#{x.sequence}</span>}
+                    </div>
+                  )}
+                </td>
+                <td>
+                  {vendor ? x.source_name : (
+                    <>
+                      {x.vendor_name || x.source_name}
+                      {x.vendor_name && x.vendor_name !== x.source_name && (
+                        <div className="faint" style={{ fontSize: ".76rem" }}>{x.source_name}</div>
+                      )}
+                    </>
+                  )}
+                </td>
+                <td><Status s={x.status} /></td>
+                <td>
+                  <span className="row" style={{ gap: 4, flexWrap: "wrap" }}>
+                    <span className={`pill ${STEP_PILL[step.state] || ""}`} title={step.title || step.detail || step.state}>{step.label}</span>
+                    {step.detail && <span className="faint" style={{ fontSize: ".76rem" }}>{step.detail}</span>}
+                  </span>
+                </td>
                 <td>
                   <div className="stack" style={{ gap: 2 }}>
                     <ProgressBar pct={x.progress_pct} status={x.status} />
                     <span className="faint num" style={{ fontSize: ".76rem" }}>
-                      {fmt(x.processed)} / {fmt(x.total_rows)} ({x.progress_pct}%)
+                      {fmt(x.processed)} / {fmt(x.total_rows)} ({x.progress_pct ?? 0}%)
                       {x.eta_seconds != null && x.status === "running" ? ` · ETA ${x.eta_seconds}s` : ""}
                     </span>
                   </div>
                 </td>
-              )}
-              <td>
-                <Segments
-                  total={x.total_rows || x.processed}
-                  parts={[
-                    { label: "Pass", value: x.passed, color: "var(--pass)" },
-                    { label: "Warn", value: x.warned, color: "var(--warn)" },
-                    { label: "Fail", value: x.failed, color: "var(--fail)" },
-                  ]}
-                />
-              </td>
-              <td className="r num">{fmt(x.processed)}{x.status === "running" || x.status === "queued" ? ` / ${fmt(x.total_rows)}` : ""}</td>
-              <td className="r num">{fmt(x.throughput_lps)}</td>
-              <td className="faint">{ago(x.started_at || x.created_at)}</td>
-            </tr>
-          ))}
+                <td>
+                  <Segments
+                    total={x.total_rows || x.processed}
+                    parts={[
+                      { label: "Pass", value: x.passed, color: "var(--pass)" },
+                      { label: "Warn", value: x.warned, color: "var(--warn)" },
+                      { label: "Fail", value: x.failed, color: "var(--fail)" },
+                    ]}
+                  />
+                </td>
+                <td className="r">
+                  {openN > 0 ? (
+                    <button
+                      type="button"
+                      className="btn sm"
+                      title={`Open ${fmt(openN)} loans to fix for this file`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        go("exceptions", `batch_id=${encodeURIComponent(x.batch_id)}`);
+                      }}
+                    >
+                      {fmt(openN)}
+                    </button>
+                  ) : <span className="faint">—</span>}
+                </td>
+                <td className="r num">{fmt(x.processed)}{x.status === "running" || x.status === "queued" ? ` / ${fmt(x.total_rows)}` : ""}</td>
+                <td className="r num">{fmt(x.throughput_lps)}</td>
+                <td className="faint">{ago(x.started_at || x.created_at)}</td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -242,12 +261,12 @@ export default function Monitor({ persona, go, vendor }) {
         <>
           {live.length > 0 && (
             <Panel title="Live" sub="Queued, running, and paused — progress updates every few seconds" pad={false}>
-              <BatchRows rows={live} vendor={vendor} sel={sel} onSelect={setSel} showProgress />
+              <BatchRows rows={live} vendor={vendor} sel={sel} onSelect={setSel} go={go} />
             </Panel>
           )}
           {history.length > 0 && (
-            <Panel title="History" sub={`${rangeLabel} · click a row to open the batch`} pad={false}>
-              <BatchRows rows={history} vendor={vendor} sel={sel} onSelect={setSel} showProgress={false} />
+            <Panel title="History" sub={`${rangeLabel} · click a row to open the batch · To fix opens Loans to fix for that file`} pad={false}>
+              <BatchRows rows={history} vendor={vendor} sel={sel} onSelect={setSel} go={go} />
             </Panel>
           )}
         </>

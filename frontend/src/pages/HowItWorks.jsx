@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { can, canCap, expandRoles } from "../roles.js";
+import { can, canCap, expandRoles, seesRunDesk } from "../roles.js";
 import { PageHeader } from "../ui.jsx";
+import { SCREEN } from "../screenCopy.js";
 import { parseHash } from "../hash.js";
 
 /** Product guide: Setup vs Execution, filtered by what this persona can do. */
@@ -10,7 +11,7 @@ const SETUP = [
     id: "vendor",
     title: "Register the vendor",
     why: "A vendor is the company sending files. Nothing else works until they exist in the console.",
-    where: "Vendors & Mapping",
+    where: SCREEN.sources.label,
     page: "sources",
     youIf: "editVendors",
     ask: "Analyst or SME",
@@ -20,7 +21,7 @@ const SETUP = [
     id: "feed",
     title: "Add their feed",
     why: "A feed is one file pattern (format, schedule, sequencing). One vendor can have several feeds.",
-    where: "Vendors & Mapping",
+    where: SCREEN.sources.label,
     page: "sources",
     youIf: "editVendors",
     ask: "Analyst or SME",
@@ -30,7 +31,7 @@ const SETUP = [
     id: "mapping",
     title: "Map columns → SSE fields",
     why: "Tell the platform how their columns become PennyMac loan fields. Draft first; SME approves.",
-    where: "Vendors & Mapping",
+    where: SCREEN.sources.label,
     page: "sources",
     youIf: "editMapping",
     youAlt: "approveMapping",
@@ -41,7 +42,7 @@ const SETUP = [
     id: "rules",
     title: "Attach validation rules",
     why: "Rules catch bad data before boarding. Regulated rules need Compliance as well as SME.",
-    where: "Rule Engine",
+    where: SCREEN.rules.label,
     page: "rules",
     youIf: "authorRules",
     ask: "SME / Compliance / Analyst (author)",
@@ -51,7 +52,7 @@ const SETUP = [
     id: "delivery",
     title: "Set the delivery profile",
     why: "How often they send, full vs change files, and sequencing so files don’t board out of order.",
-    where: "Vendors & Mapping · delivery",
+    where: `${SCREEN.sources.label} · delivery`,
     page: "sources",
     youIf: "editDelivery",
     youAlt: "approveDelivery",
@@ -62,7 +63,7 @@ const SETUP = [
     id: "publish",
     title: "Publish the live config",
     why: "Glue only reads a signed, published configuration — never a draft. Publish is the go-live switch.",
-    where: "Vendors & Mapping",
+    where: SCREEN.sources.label,
     page: "sources",
     youIf: "publishConfig",
     ask: "SME",
@@ -73,7 +74,7 @@ const SETUP = [
     id: "schedule",
     title: "Optional: schedule pulls",
     why: "If we fetch from them (SFTP/S3) instead of them dropping files, Ops sets the window; SME or Compliance approves.",
-    where: "Vendor Deliveries",
+    where: SCREEN.deliveries.label,
     page: "deliveries",
     youIf: "schedules",
     youAlt: "approveSchedule",
@@ -84,7 +85,7 @@ const SETUP = [
     id: "ready",
     title: "Ready for files",
     why: "Setup is done. The next file for this feed starts the execution path — upload, pull, or S3 arrival.",
-    where: "Import Monitor",
+    where: SCREEN.imports.label,
     page: "imports",
     youIf: "upload",
     ask: "Ops uploads · or wait for arrival/pull",
@@ -96,8 +97,8 @@ const EXECUTION = [
   {
     id: "arrive",
     title: "A file arrives",
-    why: "Three ways in: they drop to S3, we pull on a schedule, or Ops uploads in Import Monitor.",
-    where: "Import Monitor",
+    why: "Three ways in: they drop to S3, we pull on a schedule, or Ops uploads in File loads.",
+    where: SCREEN.imports.label,
     page: "imports",
     youIf: "upload",
     ask: "Ops (upload) · platform (S3/pull)",
@@ -107,7 +108,7 @@ const EXECUTION = [
     id: "batch",
     title: "We register a batch",
     why: "The file becomes a tracked batch for that feed — including duplicates and sequencing checks.",
-    where: "Import Monitor",
+    where: SCREEN.imports.label,
     page: "imports",
     youIf: "upload",
     ask: "Automatic",
@@ -117,7 +118,7 @@ const EXECUTION = [
     id: "start",
     title: "Boarding starts",
     why: "In AWS this is Step Functions → Glue. Locally/demo it runs in-process. Same business steps either way.",
-    where: "Import Monitor",
+    where: SCREEN.imports.label,
     page: "imports",
     youIf: "resumeBatch",
     ask: "Automatic (Ops/SME can resume if paused)",
@@ -128,7 +129,7 @@ const EXECUTION = [
     id: "board",
     title: "Loans are validated and loaded",
     why: "Map → rules → triage. Good loans board; failures become exceptions by risk tier. Large full tapes may use Spark.",
-    where: "Import Monitor · Exception Manager",
+    where: `${SCREEN.imports.label} · ${SCREEN.exceptions.label}`,
     page: "exceptions",
     youIf: "workExceptions",
     ask: "Automatic · reviewers handle holds",
@@ -138,8 +139,8 @@ const EXECUTION = [
   {
     id: "exceptions",
     title: "Exceptions need people",
-    why: "Held loans wait in Exception Manager. Reviewer works them; Checker / Compliance for the higher bars.",
-    where: "Exception Manager",
+    why: "Held loans wait in Loans to fix. Monitoring confirms or submits; a reviewer accepts; Compliance clears holds.",
+    where: SCREEN.exceptions.label,
     page: "exceptions",
     youIf: "workExceptions",
     ask: "Reviewer → Compliance (checker) by tier",
@@ -149,7 +150,7 @@ const EXECUTION = [
     id: "finish",
     title: "Batch finishes",
     why: "Reconcile, release files waiting in sequence, and notify. Waiting is normal if an earlier file isn’t done yet.",
-    where: "Import Monitor",
+    where: SCREEN.imports.label,
     page: "imports",
     youIf: "pauseBatch",
     ask: "Automatic · Ops watches status",
@@ -159,8 +160,8 @@ const EXECUTION = [
   {
     id: "attention",
     title: "If something’s wrong",
-    why: "Blocked, out of order, or failed batches show in Import Monitor. SME/Compliance handle overrides; Ops can replay when safe.",
-    where: "Import Monitor",
+    why: "Blocked, out of order, or failed batches show in File loads. Onboarding or Compliance can override; Monitoring can replay when safe.",
+    where: SCREEN.imports.label,
     page: "imports",
     youIf: "overridePreflight",
     youAlt: "replay",
@@ -236,7 +237,9 @@ function applyGuideHash(setMode, setSel) {
 
 export default function HowItWorks({ go, persona }) {
   const [mode, setMode] = useState(() => defaultMode(persona));
-  const steps = mode === "setup" ? SETUP : EXECUTION;
+  const runDesk = seesRunDesk(persona);
+  const path = runDesk && mode === "execution" ? "execution" : "setup";
+  const steps = path === "setup" ? SETUP : EXECUTION;
   const firstYours = useMemo(() => steps.find((s) => isYourStep(s, persona))?.id || steps[0].id, [steps, persona]);
   const [sel, setSel] = useState(firstYours);
   const showTech = canCap(persona, "readMaintenance");
@@ -260,7 +263,7 @@ export default function HowItWorks({ go, persona }) {
   }, [firstYours, steps]);
 
   const yoursCount = steps.filter((s) => isYourStep(s, persona)).length;
-  const blurb = mode === "setup"
+  const blurb = path === "setup"
     ? "How a vendor feed becomes live — from registration to published config."
     : "What happens when a file lands — from arrival to boarded loans or exceptions.";
 
@@ -281,18 +284,21 @@ export default function HowItWorks({ go, persona }) {
 
       <div className="guide-intro callout">
         <p style={{ margin: 0 }}>
-          Think in two paths: <b>Setup</b> (configure a feed once) and <b>Execution</b> (every file that arrives).
-          Click a step for where to go and whether you can do it.
+          {runDesk
+            ? <>Think in two paths: <b>Setup</b> (configure a feed once) and <b>Run</b> (every file that arrives). Click a step for where to go and whether you can do it.</>
+            : <>Your work is setup: register the seller, map their columns, and publish the feed. Monitoring runs the files after that.</>}
         </p>
       </div>
 
       <div className="row" style={{ gap: 8, margin: "14px 0 12px", flexWrap: "wrap" }} role="tablist" aria-label="Guide path">
-        <button type="button" role="tab" aria-selected={mode === "setup"} className={`btn ${mode === "setup" ? "primary" : ""}`} onClick={() => setMode("setup")}>
+        <button type="button" role="tab" aria-selected={path === "setup"} className={`btn ${path === "setup" ? "primary" : ""}`} onClick={() => setMode("setup")}>
           1 · Setup a feed
         </button>
-        <button type="button" role="tab" aria-selected={mode === "execution"} className={`btn ${mode === "execution" ? "primary" : ""}`} onClick={() => setMode("execution")}>
-          2 · Run a file
-        </button>
+        {runDesk && (
+          <button type="button" role="tab" aria-selected={path === "execution"} className={`btn ${path === "execution" ? "primary" : ""}`} onClick={() => setMode("execution")}>
+            2 · Run a file
+          </button>
+        )}
         {showTech && (
           <button type="button" className="btn" style={{ marginLeft: "auto" }} onClick={() => go("maintenance")}>
             Platform code (SME)…

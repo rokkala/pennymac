@@ -60,7 +60,7 @@ const ROWS = [
   { t: "T2", conf: (p) => `${p.t2_min_confidence} – ${p.t1_min_confidence}`, risk: "Medium (addresses, non-regulated)", route: "Single reviewer; AI pre-fills", control: () => "Rationale and top-3 precedents shown" },
   { t: "T3", conf: (p) => `< ${p.t2_min_confidence}`, risk: "Any", route: "Standard review queue; hints only", control: () => "Full manual edit, AI optional" },
   { t: "T4", conf: () => "Any", risk: "High (rate, term, FICO, DTI, HMDA, identity)", route: "Maker-checker, two distinct users", control: () => "No AI auto-apply, ever" },
-  { t: "T5", conf: () => "Any", risk: "Critical (fraud, OFAC hit)", route: "Halt loan; alert Compliance", control: () => "Investigation outside the Exception Manager" },
+  { t: "T5", conf: () => "Any", risk: "Critical (fraud, OFAC hit)", route: "Halt loan; alert Compliance", control: () => "Investigation stays with Compliance" },
 ];
 
 function DemoSetupModal({ onClose }) {
@@ -134,8 +134,8 @@ export default function Governance({ persona }) {
     <>
       <PageHeader
         eyebrow="Govern"
-        title="Policy & Audit"
-        sub="Routing thresholds live in the policy store. Changes need a Compliance approver who is not the requester; every action is written to the audit trail."
+        title="Policy"
+        sub="Who may auto-apply a fix, and the audit of every change."
         primary={showDemo ? <button type="button" className="btn" onClick={() => setDemoModal(true)}>Load demo scenario…</button> : null}
       />
       <Panel title="Confidence × risk routing" sub="The hard gate. Risk tier wins over confidence." pad={false}

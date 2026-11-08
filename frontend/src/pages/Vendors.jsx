@@ -72,8 +72,8 @@ export function VendorList({ persona, onOpen, onCreated }) {
     <>
       <PageHeader
         eyebrow="Setup"
-        title="Vendors & Mapping"
-        sub="Each vendor owns one or more feeds. Every feed has mapping versions, a delivery profile, and a schedule — configuration, not a code change."
+        title="Vendors"
+        sub="Set up a seller's files and how their columns map."
         guideHref="#guide?path=setup&step=vendor"
         primary={canCap(persona, "editVendors") ? <button type="button" className="btn primary" onClick={() => setCreate(true)}>Onboard vendor</button> : null}
       />

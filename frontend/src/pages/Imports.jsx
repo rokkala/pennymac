@@ -3,20 +3,31 @@ import { api, setIntent, scoped } from "../api.js";
 import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, Modal, ReasonModal, useDialog, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { Segments, Sparkline } from "../charts.jsx";
+import { batchStep } from "../monitorQuery.js";
 import { SCREEN } from "../screenCopy.js";
 
 const STEP_PILL = { succeeded: "pass", failed: "fail", running: "accent" };
 
-function PipelineSteps({ steps }) {
-  if (!steps?.length) return null;
+function PipelineSteps({ batch }) {
+  const steps = batch?.pipeline?.steps;
+  if (steps?.length) {
+    return (
+      <div className="timeline" aria-label="Pipeline steps">
+        {steps.map((s, i) => (
+          <div key={`${s.name}-${i}`}>
+            <span className={`pill ${STEP_PILL[s.state] || ""}`}>{s.label}</span>{" "}
+            <span className="faint">{s.state === "running" ? "in progress" : s.summary || s.state}</span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  const step = batchStep(batch || {});
   return (
-    <div className="timeline" aria-label="Pipeline steps">
-      {steps.map((s, i) => (
-        <div key={`${s.name}-${i}`}>
-          <span className={`pill ${STEP_PILL[s.state] || ""}`}>{s.label}</span>{" "}
-          <span className="faint">{s.state === "running" ? "in progress" : s.summary || s.state}</span>
-        </div>
-      ))}
+    <div className="row" style={{ gap: 8 }} aria-label="Pipeline step">
+      <span className="eyebrow">Step</span>
+      <span className={`pill ${STEP_PILL[step.state] || ""}`} title={step.title || step.detail || undefined}>{step.label}</span>
+      {step.detail && <span className="faint" style={{ fontSize: ".85rem" }}>{step.detail}</span>}
     </div>
   );
 }
@@ -305,19 +316,53 @@ export function BatchModal({ id, onClose, persona, go, nav }) {
   const { data, reload } = useApi(`/api/batches/${id}`, [], { poll: 1500 });
   const act = useAction();
   const [changes, setChanges] = useState(false);
+  // Optimistic chrome so Pause/Resume don't look dead while the 1.5s poll catches up.
+  const [pending, setPending] = useState(null); // "pause" | "resume" | null
+  useEffect(() => { setPending(null); }, [id]);
+  useEffect(() => {
+    if (!data || !pending) return;
+    if (pending === "pause" && data.status !== "running") setPending(null);
+    if (pending === "resume" && data.status !== "paused") setPending(null);
+  }, [data?.status, pending]);
   if (!data) return <Modal title="Loading…" size="xl" onClose={onClose} nav={nav}><Loading /></Modal>;
   const r = data.reconciliation;
   const incr = data.load_type && data.load_type !== "full";
+  const status = pending === "pause" ? "pausing" : pending === "resume" ? "running" : data.status;
+  const step = batchStep({ ...data, status });
+  const openN = data.open_exceptions || 0;
+  const pause = () => {
+    setPending("pause");
+    act(() => api(`/api/batches/${id}/pause`, { method: "POST" }), "Pausing at the next checkpoint")
+      .then((ok) => { if (!ok) setPending(null); else return reload(); });
+  };
+  const resume = () => {
+    setPending("resume");
+    act(() => api(`/api/batches/${id}/resume`, { method: "POST" }), "Resumed from checkpoint")
+      .then((ok) => { if (!ok) setPending(null); else return reload(); });
+  };
   return (
-    <Modal title={<span className="row" style={{ gap: 8 }}><span className="mono">{data.filename}</span><Status s={data.status} /></span>} size="xl" onClose={onClose} nav={nav}
+    <Modal title={<span className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+      <span className="mono">{data.filename}</span>
+      <Status s={status} />
+      <span className={`pill ${STEP_PILL[step.state] || ""}`} title={step.title || step.detail || undefined}>{step.label}</span>
+      {step.detail && <span className="faint" style={{ fontSize: ".78rem" }}>{step.detail}</span>}
+    </span>} size="xl" onClose={onClose} nav={nav}
       sub={`${data.vendor_name && data.vendor_name !== data.source_name ? `${data.vendor_name} · ` : ""}${data.source_name} · ${data.batch_id}`} actions={<>
-      {data.status === "running" && canCap(persona, "pauseBatch") && <button className="btn sm" onClick={() => act(() => api(`/api/batches/${id}/pause`, { method: "POST" }), "Pausing at the next checkpoint")}>Pause</button>}
-      {data.status === "paused" && canCap(persona, "resumeBatch") && <button className="btn sm primary" onClick={() => act(() => api(`/api/batches/${id}/resume`, { method: "POST" }), "Resumed from checkpoint")}>Resume</button>}</>}>
+      {status === "running" && canCap(persona, "pauseBatch") && <button type="button" className="btn sm" onClick={pause}>Pause</button>}
+      {status === "pausing" && canCap(persona, "pauseBatch") && <button type="button" className="btn sm" disabled>Pausing…</button>}
+      {status === "paused" && canCap(persona, "resumeBatch") && <button type="button" className="btn sm primary" onClick={resume}>Resume</button>}
+      {openN > 0 && go && (
+        <button type="button" className="btn sm" title={`Open ${fmt(openN)} loans to fix for this file`}
+          onClick={() => go("exceptions", `batch_id=${encodeURIComponent(data.batch_id)}`)}>
+          {fmt(openN)} to fix
+        </button>
+      )}
+      </>}>
       <div className="grid" style={{ gridTemplateColumns: "minmax(0, 1.25fr) minmax(0, 1fr)", alignItems: "start", gap: 16 }}>
       <div className="stack">
-        <PipelineSteps steps={data.pipeline?.steps} />
+        <PipelineSteps batch={{ ...data, status }} />
         <dl className="kv">
-          <dt>Status</dt><dd><Status s={data.status} /></dd>
+          <dt>Status</dt><dd><Status s={status} /></dd>
           <dt>File type</dt><dd>{human(data.load_type || "full")}{data.sequence && <span className="chip" style={{ marginLeft: 6 }}>#{data.sequence}</span>}{data.delivery_id && <span className="faint" style={{ marginLeft: 6, fontSize: ".78rem" }}>scheduled delivery</span>}</dd>
           <dt>Progress</dt><dd className="num">{fmt(data.processed)} / {fmt(data.total_rows)} rows ({data.progress_pct}%)</dd>
           <dt>Throughput</dt><dd className="num">{fmt(data.throughput_lps)} loans/s · {fmtCompact(data.projected_24h)} per 24h</dd>
@@ -396,7 +441,17 @@ export default function Imports({ persona, go, vendor }) {
           <div className="tbl-wrap"><table className="tbl">
             <thead><tr><th>File</th><th>{vendor ? "Feed" : "Vendor · feed"}</th><th>Status</th><th style={{ minWidth: 140 }}>Outcome</th><th className="r">Rows</th><th className="r">Loans/s</th><th>Micro-batch time</th><th>Started</th></tr></thead>
             <tbody>{batches.map((x) => (
-              <tr key={x.batch_id} className={`click ${sel === x.batch_id ? "sel" : ""}`} onClick={() => setSel(x.batch_id)}>
+              <tr
+                key={x.batch_id}
+                className={`click ${sel === x.batch_id ? "sel" : ""}`}
+                role="button"
+                tabIndex={0}
+                aria-label={`Open batch ${x.filename}`}
+                onClick={() => setSel(x.batch_id)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setSel(x.batch_id); }
+                }}
+              >
                 <td className="mono">{x.filename}{x.load_type && x.load_type !== "full" && <div className="row" style={{ gap: 4, marginTop: 2 }}><span className="chip">{x.load_type === "snapshot" ? "snapshot" : "changes"}</span>{x.sequence && <span className="chip">#{x.sequence}</span>}</div>}</td><td>{vendor ? x.source_name : <>{x.vendor_name || x.source_name}{x.vendor_name && x.vendor_name !== x.source_name && <div className="faint" style={{ fontSize: ".76rem" }}>{x.source_name}</div>}</>}</td><td><span className="row" style={{ gap: 4, flexWrap: "wrap" }}><Status s={x.status} />{x.preflight?.decision === "warn" && <span className="pill warn" title={x.preflight.summary}>drift</span>}{(x.replays || []).length > 0 && <span className="pill accent">replayed</span>}{(x.pipeline?.steps || []).map((s, i) => <span key={`${s.name}-${i}`} className={`pill ${STEP_PILL[s.state] || ""}`} title={s.summary || s.state}>{s.label}</span>)}</span></td>
                 <td><Segments total={x.total_rows || x.processed} parts={[{ label: "Pass", value: x.passed, color: "var(--pass)" }, { label: "Warn", value: x.warned, color: "var(--warn)" }, { label: "Fail", value: x.failed, color: "var(--fail)" }]} /></td>
                 <td className="r num">{fmt(x.processed)}{x.status === "running" || x.status === "queued" ? ` / ${fmt(x.total_rows)}` : ""}</td>

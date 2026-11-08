@@ -79,7 +79,7 @@ export default function Personas({ persona, go }) {
       <PageHeader
         eyebrow="Govern"
         title="Personas"
-        sub="User and role directory for Cognito (one role each). Local demo seeds six people into this list; the Signed-in-as switcher reads the same cast. API permissions stay fixed in code."
+        sub="Who can sign in, and which screens they see."
         primary={tab === "screens" ? <button type="button" className="btn primary" onClick={saveMatrix}>Save access</button> : <button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>Add user</button>}
         secondary={(
           <>
