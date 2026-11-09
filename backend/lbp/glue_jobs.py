@@ -24,12 +24,28 @@ import os
 import socket
 import time
 from collections.abc import Callable, Iterable
+from contextlib import contextmanager
 
 from sqlalchemy import select
 
 from .store import db
 
 log = logging.getLogger("lbp.glue")
+
+
+@contextmanager
+def stage_timer(stage: str, timings: dict | None = None, **extra):
+    """Wall-clock one pipeline stage; prints a JSON line and records secs into `timings`."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        secs = round(time.monotonic() - t0, 3)
+        if timings is not None:
+            timings[stage] = round(timings.get(stage, 0) + secs, 3)
+        payload = {"event": "stage_timing", "stage": stage, "secs": secs, **extra}
+        print(json.dumps(payload, default=str), flush=True)
+        log.info("stage_timing %s", payload)
 
 
 # ------------------------------------------------------------------ pipeline metrics
@@ -56,14 +72,13 @@ def emit_metrics(res: dict, seconds: float, engine: str) -> None:
 
 # ------------------------------------------------------------------ lbp-feed: one batch
 def process_batch(batch_id: str) -> dict:
-    from .dispatch import dispatch
+    """Run one standard batch. Does not start followers — Step Functions Finalize (or local
+    start_batch_async) owns that, so Glue + Finalize cannot double-dispatch the same file."""
     from .pipeline.batch import run_batch
 
     t0 = time.monotonic()
     res = run_batch(batch_id)
     emit_metrics(res, time.monotonic() - t0, "standard")
-    for nxt in res.get("released", []):  # files that were waiting behind this one
-        dispatch(nxt)
     return res
 
 
@@ -364,8 +379,11 @@ def _spark_db_free_on() -> bool:
 
 
 def _s3_import_on() -> bool:
-    """Clean parts as CSV; load prefers aws_s3.table_import_from_s3 (STDIN CSV fallback)."""
-    return os.environ.get("LBP_S3_IMPORT", "0").lower() in ("1", "true", "yes")
+    """Clean parts as CSV; load prefers aws_s3.table_import_from_s3 (STDIN CSV fallback).
+
+    Default on to match Terraform Glue job args — set LBP_S3_IMPORT=0 for legacy JSONL parts.
+    """
+    return os.environ.get("LBP_S3_IMPORT", "1").lower() not in ("0", "false", "no")
 
 
 def _bulk_load_root(batch_id: str):
@@ -838,11 +856,16 @@ def _revive_sse_row(r: dict) -> dict:
     return r
 
 
-def load_dirty_files(batch_id: str) -> dict:
+def load_dirty_files(batch_id: str, timings: dict | None = None) -> dict:
     """Driver: COPY dirty parts one at a time (never hold all 15M exceptions in RAM).
 
     Does not wipe the whole bulk-load root — oltp/ clean/ must survive until finalize/run_load_bulk.
     """
+    with stage_timer("load_dirty", timings, batch_id=batch_id):
+        return _load_dirty_files_body(batch_id)
+
+
+def _load_dirty_files_body(batch_id: str) -> dict:
     import shutil
 
     from .pipeline.loader import copy_insert_exceptions, copy_insert_loans, copy_insert_staging
@@ -1193,7 +1216,7 @@ def _dup_hold_row(batch_id: str, source_id: str, row: dict, st_by_ln: dict, rule
 
 
 def _apply_clean_sse_batch(batch_id: str, source_id: str, sse_rows: list, staging: list | None,
-                           seen: set[str] | None = None) -> tuple[int, int, int]:
+                           seen: set[str] | None = None, timings: dict | None = None) -> tuple[int, int, int]:
     """DUP01 (cross-file via `seen`) + DUP02 split + COPY. Returns (n_st, n_sse, n_dup)."""
     from .pipeline.batch import DUP_RULES
     from .pipeline.loader import copy_insert_exceptions, copy_insert_loans, copy_insert_staging
@@ -1206,13 +1229,14 @@ def _apply_clean_sse_batch(batch_id: str, source_id: str, sse_rows: list, stagin
         seen = set()
     nums = [str(r.get("loan_number")) for r in sse_rows if r.get("loan_number")]
     existing: set[str] = set()
-    with db.get_engine().connect() as c:
-        for i in range(0, len(nums), 900):
-            chunk = nums[i:i + 900]
-            existing |= {x for (x,) in c.execute(
-                select(db.sse_loans.c.loan_number).where(
-                    db.sse_loans.c.loan_number.in_(chunk),
-                    db.sse_loans.c.lbp_batch_id != batch_id)).all()}
+    with stage_timer("dup02", timings, batch_id=batch_id, keys=len(nums)):
+        with db.get_engine().connect() as c:
+            for i in range(0, len(nums), 900):
+                chunk = nums[i:i + 900]
+                existing |= {x for (x,) in c.execute(
+                    select(db.sse_loans.c.loan_number).where(
+                        db.sse_loans.c.loan_number.in_(chunk),
+                        db.sse_loans.c.lbp_batch_id != batch_id)).all()}
     keep_sse, keep_st, dup_ex, dup_st = [], [], [], []
     st_by_ln = {str(s.get("loan_number")): s for s in staging}
     n_dup = 0
@@ -1301,46 +1325,49 @@ def _read_sse_csv_file(local_path: str, s3_key: str | None) -> list[dict]:
     return _read_csv(Path(local_path))
 
 
-def load_clean_files(batch_id: str) -> dict:
+def load_clean_files(batch_id: str, timings: dict | None = None) -> dict:
     """Driver: coalesced clean/sse/*.csv (preferred) or legacy p-* JSONL/CSV; DUP01/DUP02 held."""
     import shutil
 
-    n_st = n_sse = n_dup = 0
-    seen: set[str] = set()
-    with db.get_engine().connect() as c:
-        source_id = c.execute(select(db.batches.c.source_id).where(db.batches.c.batch_id == batch_id)).scalar()
+    with stage_timer("load_clean", timings, batch_id=batch_id):
+        n_st = n_sse = n_dup = 0
+        seen: set[str] = set()
+        with db.get_engine().connect() as c:
+            source_id = c.execute(select(db.batches.c.source_id).where(db.batches.c.batch_id == batch_id)).scalar()
 
-    coalesced = clean_sse_csv_uris(batch_id)
-    if coalesced:
-        for local, key in coalesced:
-            sse_rows = _read_sse_csv_file(local, key)
-            a, b, d = _apply_clean_sse_batch(batch_id, source_id, sse_rows, None, seen=seen)
+        coalesced = clean_sse_csv_uris(batch_id)
+        if coalesced:
+            for local, key in coalesced:
+                sse_rows = _read_sse_csv_file(local, key)
+                a, b, d = _apply_clean_sse_batch(
+                    batch_id, source_id, sse_rows, None, seen=seen, timings=timings)
+                n_st += a
+                n_sse += b
+                n_dup += d
+            shutil.rmtree(_bulk_load_root(batch_id) / "clean" / "sse", ignore_errors=True)
+            return {"staging": n_st, "sse": n_sse, "dup02": n_dup}
+
+        parts = _list_kind_part_names(batch_id, "clean")
+        if not parts:
+            return {"staging": 0, "sse": 0, "dup02": 0}
+        for name in parts:
+            part = _ensure_kind_part(
+                batch_id, "clean", name,
+                ("staging.csv", "sse.csv", "staging.jsonl", "sse.jsonl"))
+            if (part / "sse.csv").exists() or (part / "staging.csv").exists():
+                staging, sse_rows = _load_clean_csv_part(batch_id, part)
+            else:
+                staging = _read_jsonl(part / "staging.jsonl")
+                sse_rows = _read_jsonl(part / "sse.jsonl")
+            if not staging and not sse_rows:
+                continue
+            a, b, d = _apply_clean_sse_batch(
+                batch_id, source_id, sse_rows, staging or None, seen=seen, timings=timings)
             n_st += a
             n_sse += b
             n_dup += d
-        shutil.rmtree(_bulk_load_root(batch_id) / "clean" / "sse", ignore_errors=True)
+            shutil.rmtree(part, ignore_errors=True)
         return {"staging": n_st, "sse": n_sse, "dup02": n_dup}
-
-    parts = _list_kind_part_names(batch_id, "clean")
-    if not parts:
-        return {"staging": 0, "sse": 0, "dup02": 0}
-    for name in parts:
-        part = _ensure_kind_part(
-            batch_id, "clean", name,
-            ("staging.csv", "sse.csv", "staging.jsonl", "sse.jsonl"))
-        if (part / "sse.csv").exists() or (part / "staging.csv").exists():
-            staging, sse_rows = _load_clean_csv_part(batch_id, part)
-        else:
-            staging = _read_jsonl(part / "staging.jsonl")
-            sse_rows = _read_jsonl(part / "sse.jsonl")
-        if not staging and not sse_rows:
-            continue
-        a, b, d = _apply_clean_sse_batch(batch_id, source_id, sse_rows, staging or None, seen=seen)
-        n_st += a
-        n_sse += b
-        n_dup += d
-        shutil.rmtree(part, ignore_errors=True)
-    return {"staging": n_st, "sse": n_sse, "dup02": n_dup}
 
 
 
@@ -1366,7 +1393,7 @@ def _load_oltp_parts(batch_id: str, cfg) -> None:
         shutil.rmtree(part, ignore_errors=True)
 
 
-def _complete_from_staging(batch_id: str, cfg, t0: float, engine: str) -> dict:
+def _complete_from_staging(batch_id: str, cfg, t0: float, engine: str, timings: dict | None = None) -> dict:
     from sqlalchemy import func
 
     from .pipeline import sequencing
@@ -1387,17 +1414,20 @@ def _complete_from_staging(batch_id: str, cfg, t0: float, engine: str) -> dict:
             st.c.batch_id == batch_id, st.c.boarded.is_(True))).scalar() or 0
         max_row = c.execute(select(func.max(st.c.row_number)).where(st.c.batch_id == batch_id)).scalar()
     counters = {"processed": processed, "passed": passed, "warned": warned, "failed": failed, "loaded": loaded}
-    with db.get_engine().begin() as c:
-        rec = reconcile(c, batch_id, processed)
-        c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(
-            status="completed" if rec["balanced"] else "failed", total_rows=processed, finished_at=db.now(),
-            checkpoint=(max_row + 1) if max_row is not None else (b.checkpoint or 0),
-            reconciliation=rec, worker_id=None, throughput_lps=round(processed / max(time.monotonic() - t0, 1e-6), 1),
-            error=None if rec["balanced"] else "reconciliation mismatch", **counters))
-        db.audit(c, "pipeline", "batch.completed", "batch", batch_id,
-                 {**counters, "reconciliation": rec, "engine": engine})
-        released = sequencing.advance(c, b) if rec["balanced"] else []
+    with stage_timer("reconcile", timings, batch_id=batch_id, processed=processed):
+        with db.get_engine().begin() as c:
+            rec = reconcile(c, batch_id, processed)
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(
+                status="completed" if rec["balanced"] else "failed", total_rows=processed, finished_at=db.now(),
+                checkpoint=(max_row + 1) if max_row is not None else (b.checkpoint or 0),
+                reconciliation=rec, worker_id=None, throughput_lps=round(processed / max(time.monotonic() - t0, 1e-6), 1),
+                error=None if rec["balanced"] else "reconciliation mismatch", **counters))
+            db.audit(c, "pipeline", "batch.completed", "batch", batch_id,
+                     {**counters, "reconciliation": rec, "engine": engine, "timings": timings or {}})
+            released = sequencing.advance(c, b) if rec["balanced"] else []
     out = {"batch_id": batch_id, **counters, "reconciliation": rec, "released": released}
+    if timings:
+        out["timings"] = timings
     emit_metrics(out, time.monotonic() - t0, engine)
     return out
 
@@ -1407,13 +1437,15 @@ def finalize_bulk(batch_id: str, cfg) -> dict:
     import shutil
 
     t0 = time.monotonic()
+    timings: dict = {}
     if _file_load_on():
         if _spark_db_free_on() or _list_kind_part_names(batch_id, "clean"):
-            load_clean_files(batch_id)
-        load_dirty_files(batch_id)
-        _load_oltp_parts(batch_id, cfg)
+            load_clean_files(batch_id, timings)
+        load_dirty_files(batch_id, timings)
+        with stage_timer("load_oltp", timings, batch_id=batch_id):
+            _load_oltp_parts(batch_id, cfg)
         shutil.rmtree(_bulk_load_root(batch_id), ignore_errors=True)
-    return _complete_from_staging(batch_id, cfg, t0, "spark-bulk")
+    return _complete_from_staging(batch_id, cfg, t0, "spark-bulk", timings)
 
 
 def run_load_bulk(batch_id: str, cfg) -> dict:
@@ -1428,13 +1460,15 @@ def run_load_bulk(batch_id: str, cfg) -> dict:
     if b.status not in ("staged", "failed", "paused", "running"):
         raise ValueError(f"load refuses batch status={b.status!r}; want staged|failed|paused|running")
     t0 = time.monotonic()
+    timings: dict = {}
     _orphan_cleanup(batch_id, 0)
     # Keep S3/local bulk-load parts — only wipe DB orphans.
-    load_clean_files(batch_id)
-    load_dirty_files(batch_id)
-    _load_oltp_parts(batch_id, cfg)
+    load_clean_files(batch_id, timings)
+    load_dirty_files(batch_id, timings)
+    with stage_timer("load_oltp", timings, batch_id=batch_id):
+        _load_oltp_parts(batch_id, cfg)
     shutil.rmtree(_bulk_load_root(batch_id), ignore_errors=True)
-    return _complete_from_staging(batch_id, cfg, t0, "glue-load")
+    return _complete_from_staging(batch_id, cfg, t0, "glue-load", timings)
 
 
 def persist_bulk(batch_id: str, cfg, results: Iterable[dict], chunk: int | None = None) -> dict:

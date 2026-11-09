@@ -9,6 +9,9 @@ db_allocated_storage     = 200
 db_max_allocated_storage = 200
 ai_provider              = "bedrock"
 glue_feed_concurrency    = 8
+# Default 500k → Spark. For a 1M-row standard-path A/B (lbp-feed vs Spark), raise above the tape:
+# glue_threshold_rows = 2000000
+glue_threshold_rows      = 500000
 alert_email              = "loan-boarding-alerts@example.com"
 # Required: ACM certificate for CloudFront (us-east-1) and the custom domain
 web_certificate_arn = ""

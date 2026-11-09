@@ -44,10 +44,22 @@ else:
     out_path = f"{base if base.startswith('/') else 's3://' + base}/processed/batch_id={batch_id}/"
 
     force_remap = os.environ.get("LBP_FORCE_REMAP", "0").lower() in ("1", "true", "yes")
+    # Only reuse parquet when the Hadoop commit left _SUCCESS — a crashed overwrite can leave
+    # readable but incomplete files that would otherwise skip remap forever.
     already = False
     if not force_remap:
         try:
-            already = spark.read.parquet(out_path).limit(1).count() > 0
+            success = f"{out_path.rstrip('/')}/_SUCCESS"
+            if success.startswith("s3://"):
+                import boto3
+                from urllib.parse import urlparse
+                u = urlparse(success)
+                boto3.client("s3", region_name=os.environ.get("LBP_AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")).head_object(
+                    Bucket=u.netloc, Key=u.path.lstrip("/"))
+                already = spark.read.parquet(out_path).limit(1).count() > 0
+            else:
+                from pathlib import Path
+                already = Path(success).exists() and spark.read.parquet(out_path).limit(1).count() > 0
         except Exception:
             already = False
 
@@ -80,20 +92,22 @@ else:
                     yield (idx0, json.dumps(o, default=str))
 
         schema = StructType([StructField("row", LongType(), False), StructField("payload", StringType(), False)])
-        mapped = raw.rdd.zipWithIndex().mapPartitions(map_partitions)
-        (spark.createDataFrame(mapped, schema)
-         .coalesce(nfiles)
-         .write.mode("overwrite")
-         .parquet(out_path))
+        with glue_jobs.stage_timer("spark_map_write", batch_id=batch_id, files=nfiles, map_chunk=chunk):
+            mapped = raw.rdd.zipWithIndex().mapPartitions(map_partitions)
+            (spark.createDataFrame(mapped, schema)
+             .coalesce(nfiles)
+             .write.mode("overwrite")
+             .parquet(out_path))
         print(json.dumps({"event": "parquet_written", "path": out_path, "files": nfiles, "map_chunk": chunk}))
 
     map_only = os.environ.get("LBP_SPARK_MAP_ONLY", "0").lower() in ("1", "true", "yes")
     if map_only:
-        print(glue_jobs.summary(glue_jobs.mark_staged(batch_id)))
+        # Debug stop after parquet — must NOT mark_staged or the load job COPYs empty parts.
+        print(json.dumps({"batch_id": batch_id, "status": "map_only", "path": out_path}))
     else:
         legacy = os.environ.get("LBP_BULK_PERSIST", "1").lower() in ("0", "false", "no")
         db_free = os.environ.get("LBP_SPARK_DB_FREE", "1").lower() not in ("0", "false", "no")
-        s3_import = os.environ.get("LBP_S3_IMPORT", "0").lower() in ("1", "true", "yes")
+        s3_import = os.environ.get("LBP_S3_IMPORT", "1").lower() not in ("0", "false", "no")
         if legacy:
             results = (json.loads(r["payload"]) for r in spark.read.parquet(out_path).orderBy("row").toLocalIterator())
             print(glue_jobs.summary(glue_jobs.persist_bulk(batch_id, cfg, results)))
@@ -163,6 +177,8 @@ else:
                     s = get_settings()
                     if s.env == "aws" and s.processed_bucket:
                         import boto3
+                        if not s.aws_region:
+                            raise ValueError("aws_region is required when env=aws (no silent default)")
                         boto3.client("s3", region_name=s.aws_region).upload_file(
                             str(path), s.processed_bucket, f"bulk-load/{bid_b.value}/clean/sse/{csv_name}")
 
@@ -214,14 +230,17 @@ else:
             # File count follows parquet splits (~dozens OK for aws_s3). Do not coalesce —
             # that hid S3 progress behind giant tasks.
             pdf = spark.read.parquet(out_path)
-            if db_free and s3_import:
-                npart = pdf.rdd.getNumPartitions()
-                print(json.dumps({"event": "persist_start", "partitions": npart, "target_files": nfiles,
-                                  "mode": "serialize_mapped"}))
-                pdf.rdd.mapPartitionsWithIndex(write_coalesced).count()
-                print(json.dumps({"event": "clean_sse_csv", "partitions": npart, "path": f"bulk-load/{batch_id}/clean/sse/"}))
-            else:
-                pdf.foreachPartition(write_part)
+            with glue_jobs.stage_timer("spark_materialize", batch_id=batch_id,
+                                      mode="s3_import" if (db_free and s3_import) else "legacy"):
+                if db_free and s3_import:
+                    npart = pdf.rdd.getNumPartitions()
+                    print(json.dumps({"event": "persist_start", "partitions": npart, "target_files": nfiles,
+                                      "mode": "serialize_mapped"}))
+                    pdf.rdd.mapPartitionsWithIndex(write_coalesced).count()
+                    print(json.dumps({"event": "clean_sse_csv", "partitions": npart,
+                                      "path": f"bulk-load/{batch_id}/clean/sse/"}))
+                else:
+                    pdf.foreachPartition(write_part)
             if db_free:
                 print(glue_jobs.summary(glue_jobs.mark_staged(batch_id)))
             else:

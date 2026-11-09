@@ -102,8 +102,88 @@ def test_arrival_routes_to_glue_and_finalize_releases_followers(onboarded, monke
         assert float(row.current_principal_balance) == 2222 and row.lbp_version == 3
 
 
+def test_route_unknown_batch_raises(onboarded, monkeypatch):
+    from moto import mock_aws
+
+    with mock_aws():
+        h = _load(monkeypatch)
+        try:
+            h.route_batch({"batch_id": "bat_missing"}, None)
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "unknown batch" in str(e)
+
+
+def test_process_batch_does_not_dispatch_followers(onboarded, monkeypatch):
+    """AWS Finalize owns follower start; Glue process_batch must not also dispatch (double SFN)."""
+    import csv
+
+    from moto import mock_aws
+    from sqlalchemy import select
+
+    from lbp import glue_jobs
+    from lbp.dispatch import dispatch
+    from lbp.pipeline.batch import create_batch, run_batch
+    from lbp.pipeline.delivery import decide_profile, propose_profile
+    from lbp.store import db
+
+    src = onboarded["pcg_retail"]
+    run_batch(create_batch(src["source_id"], src["path"], src["path"].name, "ops1"), workers=1, micro_batch_size=100)
+    propose_profile(src["source_id"], {"load_type": "incremental", "action": {"mode": "upsert"},
+                                       "sequence": {"source": "filename", "pattern": r"_(\d+)\.csv$", "kind": "integer"}}, "a1", ["analyst"])
+    decide_profile(src["source_id"], "sme1", ["sme"], True)
+    with db.get_engine().connect() as c:
+        ln = c.execute(select(db.sse_loans.c.loan_number).where(db.sse_loans.c.lbp_source_id == src["source_id"]).limit(1)).scalar()
+
+    calls = []
+    monkeypatch.setattr("lbp.dispatch.dispatch", lambda bid: calls.append(bid) or "arn:fake")
+
+    with mock_aws():
+        h = _load(monkeypatch)
+        _aws(monkeypatch)
+        from pathlib import Path
+        import tempfile
+        td = Path(tempfile.mkdtemp())
+        for n, upb in ((1, 1111), (2, 2222)):
+            p = td / f"PCG_DELTA_{n}.csv"
+            with open(p, "w", newline="") as f:
+                csv.writer(f).writerows([["LoanID", "CurrentUPB"], [ln, upb]])
+            create_batch(src["source_id"], str(p), p.name, "s3")
+        with db.get_engine().connect() as c:
+            bids = [r[0] for r in c.execute(select(db.batches.c.batch_id).where(
+                db.batches.c.source_id == src["source_id"], db.batches.c.load_type != "full").order_by(db.batches.c.sequence))]
+        first, second = bids[0], bids[1]
+        glue_jobs.process_batch(second)  # waiting
+        calls.clear()
+        glue_jobs.process_batch(first)
+        assert calls == [], f"process_batch must not dispatch; got {calls}"
+        fin = h.finalize_batch({"batch_id": first}, None)
+        assert fin["started_followers"] == [second]
+
+
+def test_mark_failed_does_not_kill_running_batch(onboarded, monkeypatch):
+    from moto import mock_aws
+    from sqlalchemy import select
+
+    from lbp.pipeline.batch import create_batch
+    from lbp.store import db
+
+    with mock_aws():
+        h = _load(monkeypatch)
+        src = onboarded["pcg_retail"]
+        bid = create_batch(src["source_id"], src["path"], src["path"].name, "s3")
+        with db.get_engine().begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == bid).values(
+                status="running", worker_id="glue:1", checkpoint=100))
+        h.mark_failed({"batch_id": bid, "error": {"Error": "BatchBusyError"}}, None)
+        with db.get_engine().connect() as c:
+            b = c.execute(select(db.batches).where(db.batches.c.batch_id == bid)).first()
+        assert b.status == "running" and b.worker_id == "glue:1" and b.checkpoint == 100
+
+
 def test_route_sends_large_full_tapes_to_spark(onboarded, monkeypatch):
     from moto import mock_aws
+    from sqlalchemy import select
 
     from lbp.pipeline.batch import create_batch
     from lbp.store import db
@@ -118,8 +198,10 @@ def test_route_sends_large_full_tapes_to_spark(onboarded, monkeypatch):
         bid2 = create_batch(xl["source_id"], xl["path"], "big.xlsx", "s3")
         assert h.route_batch({"batch_id": bid2}, None)["engine"] == "standard"  # Excel is not splittable
         with db.get_engine().begin() as c:
-            c.execute(db.batches.update().where(db.batches.c.batch_id == bid).values(status="running"))
+            c.execute(db.batches.update().where(db.batches.c.batch_id == bid).values(status="staged"))
         assert h.mark_failed({"batch_id": bid, "error": {"Cause": "x"}}, None)["status"] == "failed"
+        with db.get_engine().connect() as c:
+            assert c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == bid)).scalar() == "failed"
 
 
 def test_api_uploads_dispatch_to_step_functions_not_inline(onboarded, monkeypatch):

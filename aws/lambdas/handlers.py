@@ -75,6 +75,8 @@ def route_batch(event, _ctx):
     batch_id = event["batch_id"]
     with db.get_engine().connect() as c:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        if not b:
+            raise ValueError(f"unknown batch {batch_id}")
         fmt = c.execute(select(db.sources.c.format).where(db.sources.c.source_id == b.source_id)).scalar()
     spark = (b.load_type or "full") == "full" and fmt in ("csv", "txt", "psv", "dat") and (b.total_rows or 0) > SPARK_THRESHOLD_ROWS \
         and (b.checkpoint or 0) == 0
@@ -94,6 +96,8 @@ def finalize_batch(event, _ctx):
     batch_id = event["batch_id"]
     with db.get_engine().connect() as c:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        if not b:
+            raise ValueError(f"unknown batch {batch_id}")
         follow = [r[0] for r in c.execute(select(db.batches.c.batch_id).where(
             db.batches.c.source_id == b.source_id, db.batches.c.status == "queued", db.batches.c.batch_id != batch_id,
             db.batches.c.load_type != "full").order_by(db.batches.c.sequence))] if b.status == "completed" else []
@@ -118,7 +122,8 @@ def mark_failed(event, _ctx):
     with db.get_engine().begin() as c:
         q = db.batches.update().where(db.batches.c.batch_id == batch_id)
         if not force:
-            q = q.where(db.batches.c.status != "completed")
+            # Never clobber an active worker (e.g. duplicate SFN for the same batch hit BatchBusyError).
+            q = q.where(db.batches.c.status.notin_(("completed", "running", "pausing")))
         c.execute(q.values(**values))
         db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err, "force": force})
     return {"batch_id": batch_id, "status": "failed", "force": force}
@@ -202,4 +207,3 @@ def api(event, ctx):
     if _api_handler is None:
         _api_handler = _api()
     return _api_handler(event, ctx)
-# force-reopen 20261108032141

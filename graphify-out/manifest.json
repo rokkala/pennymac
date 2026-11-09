@@ -5,8 +5,8 @@
     "semantic_hash": "1613ee5e51d3cfbcfcec88591cc1999f"
   },
   "aws/glue/feed_spark_job.py": {
-    "mtime": 1794146758.009432,
-    "ast_hash": "1ed93994e1630e8536b21c85eae467a6",
+    "mtime": 1794149314.9317214,
+    "ast_hash": "a5f89ed243f1a997677b369dd2870b3f",
     "semantic_hash": ""
   },
   "aws/glue/vendor_pull_job.py": {
@@ -15,8 +15,8 @@
     "semantic_hash": "169b63796ee6e87b720c540833afb8d8"
   },
   "aws/lambdas/handlers.py": {
-    "mtime": 1794108101.2933726,
-    "ast_hash": "79896915f34a9ed72919d7f61801fb9a",
+    "mtime": 1794148629.8285422,
+    "ast_hash": "75384c75391d80216333328818d58e9f",
     "semantic_hash": ""
   },
   "aws/stepfunctions/boarding.asl.json": {
@@ -85,8 +85,8 @@
     "semantic_hash": ""
   },
   "aws/terraform/variables.tf": {
-    "mtime": 1793772347.868929,
-    "ast_hash": "8770caeb5f7a0e17085466d0f872fc7a",
+    "mtime": 1794149320.664307,
+    "ast_hash": "0a1bc01a0f1dab384d396a455debd22e",
     "semantic_hash": ""
   },
   "aws/terraform/web.tf": {
@@ -170,8 +170,8 @@
     "semantic_hash": "862f6ee6586db1dfa34472c7a99163f9"
   },
   "backend/lbp/glue_jobs.py": {
-    "mtime": 1794146762.8521063,
-    "ast_hash": "613286ef2a3fba838e62e551c7a2314a",
+    "mtime": 1794149295.3856275,
+    "ast_hash": "e6cd6c28f55103467ae68f854067cc0a",
     "semantic_hash": ""
   },
   "backend/lbp/ingestion/__init__.py": {
@@ -445,8 +445,8 @@
     "semantic_hash": "2b4d58adb0937951ea56d1d1f5c567a3"
   },
   "backend/tests/test_lambdas.py": {
-    "mtime": 1793861361.2213798,
-    "ast_hash": "2e4bb03d031f92ce0d9749a7e8ffdc8c",
+    "mtime": 1794148743.1319196,
+    "ast_hash": "30c59d00fb29a2037bfa9237dd85c624",
     "semantic_hash": ""
   },
   "backend/tests/test_mapping.py": {
@@ -635,8 +635,8 @@
     "semantic_hash": "2bfc310b769c98714670b7c694ae082f"
   },
   "docs/ARCHITECTURE.md": {
-    "mtime": 1793802314.9897208,
-    "ast_hash": "964b077050aa4a84462677cd8c54edb1",
+    "mtime": 1794148641.8745277,
+    "ast_hash": "fdf5f69442b26f80fdd2bfc7fe6b4d5b",
     "semantic_hash": ""
   },
   "docs/INCREMENTAL_AND_SCHEDULING.md": {
@@ -1235,8 +1235,13 @@
     "semantic_hash": ""
   },
   "backend/tests/test_bulk_load_fixes.py": {
-    "mtime": 1794146596.2665436,
-    "ast_hash": "ca01043771494a2b85a1b9db85f4fbc8",
+    "mtime": 1794147071.191596,
+    "ast_hash": "43a04f0da54d4e20eac7ac7d16722f87",
+    "semantic_hash": ""
+  },
+  "backend/tests/test_stage_timing.py": {
+    "mtime": 1794149226.8985791,
+    "ast_hash": "9db79042bfe56c6afdd89541547a83c7",
     "semantic_hash": ""
   }
 }
