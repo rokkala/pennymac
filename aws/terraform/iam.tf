@@ -56,8 +56,13 @@ data "aws_iam_policy_document" "app_access" {
   }
   statement {
     sid       = "StartPipeline"
-    actions   = ["states:StartExecution"]
+    actions   = ["states:StartExecution", "states:ListExecutions"]
     resources = ["arn:aws:states:${var.region}:${local.account_id}:stateMachine:${local.name}-boarding"]
+  }
+  statement {
+    sid       = "ReadPipeline"
+    actions   = ["states:DescribeExecution", "states:GetExecutionHistory"]
+    resources = ["arn:aws:states:${var.region}:${local.account_id}:execution:${local.name}-boarding:*"]
   }
   statement {
     sid       = "ConfigSigning"
@@ -78,6 +83,11 @@ data "aws_iam_policy_document" "app_access" {
     sid       = "Alerts"
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.alerts.arn]
+  }
+  statement {
+    sid       = "AsyncDlq"
+    actions   = ["sqs:SendMessage"]
+    resources = [aws_sqs_queue.dlq.arn]
   }
   dynamic "statement" {
     for_each = length(var.vendor_pull_buckets) > 0 ? [1] : []
@@ -147,7 +157,7 @@ resource "aws_iam_role_policy" "sfn" {
     Statement = [
       { Effect = "Allow", Action = ["lambda:InvokeFunction"], Resource = [for f in aws_lambda_function.fn : f.arn] },
       { Effect = "Allow", Action = ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"],
-      Resource = [aws_glue_job.feed.arn, aws_glue_job.feed_spark.arn] },
+      Resource = [aws_glue_job.feed.arn, aws_glue_job.feed_spark.arn, aws_glue_job.feed_load.arn] },
       { Effect = "Allow", Action = ["sns:Publish"], Resource = aws_sns_topic.alerts.arn },
       { Effect = "Allow", Action = ["kms:GenerateDataKey*", "kms:Decrypt"], Resource = aws_kms_key.data.arn },
       { Effect = "Allow", Action = ["logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery", "logs:DeleteLogDelivery",
@@ -174,4 +184,19 @@ resource "aws_iam_role_policy_attachment" "glue_service" {
 resource "aws_iam_role_policy" "glue" {
   role   = aws_iam_role.glue.id
   policy = data.aws_iam_policy_document.app_access.json
+}
+
+# Security configuration encrypts Glue CloudWatch logs with the data key. The service role can write
+# logs, but only AssociateKmsKey lets Glue attach that key to the job log group.
+resource "aws_iam_role_policy" "glue_logs" {
+  role = aws_iam_role.glue.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "EncryptJobLogs"
+      Effect   = "Allow"
+      Action   = ["logs:AssociateKmsKey"]
+      Resource = "arn:aws:logs:${var.region}:${local.account_id}:log-group:/aws-glue/*"
+    }]
+  })
 }

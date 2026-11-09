@@ -31,8 +31,7 @@ Run `start_demo.sh` within a few hours of the demo. Delivery due times, "late" f
 | Dan · SME | sme, analyst | Approving mappings and profiles (it must be a different person from the preparer), overrides, republishing configuration |
 | Maria · Boarding Ops | ops | Uploads, pause / resume, skipping a sequence gap, waiving deliveries, pull-now |
 | Lee · Exception Reviewer | reviewer | T2 / T3 fixes, T4 maker |
-| Sam · Checker | checker, reviewer | T4 checker: approving another person's fix |
-| Ana · Compliance | compliance, checker | T5 OFAC / fraud, policy thresholds, the T1 kill switch, audit-chain verification |
+| Ana · Compliance | compliance, checker | T4 checker (second pair of eyes after Lee), T5 OFAC / fraud, policy thresholds, T1 kill switch, audit-chain verification |
 | Platform Admin | all | Avoid in the demo: it hides the maker-checker story |
 
 ## The pre-loaded state

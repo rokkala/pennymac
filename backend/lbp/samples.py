@@ -136,7 +136,7 @@ def canonical_loans(n: int, prefix: str, seed: int = 7, defect_rate: float = 0.0
 
 
 # ---------------------------------------------------------------- source writers
-def write_pcg_retail(path: Path, n: int, seed: int = 11, offset: int = 0) -> Path:
+def write_pcg_retail(path: Path, n: int, seed: int = 11, offset: int = 0, defect_rate: float = 0.06) -> Path:
     cols = {
         "LoanID": "loan_number", "LoanType": "loan_type", "LoanPurpose": "loan_purpose", "LienPosition": "lien_position",
         "AmortizationType": "amortization_type", "OriginalLoanAmount": "original_loan_amount",
@@ -157,7 +157,7 @@ def write_pcg_retail(path: Path, n: int, seed: int = 11, offset: int = 0) -> Pat
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(cols.keys())
-        for r in canonical_loans(n, "PCG", seed, offset=offset):
+        for r in canonical_loans(n, "PCG", seed, defect_rate=defect_rate, offset=offset):
             out = []
             for c in cols.values():
                 v = r[c]
@@ -170,7 +170,7 @@ def write_pcg_retail(path: Path, n: int, seed: int = 11, offset: int = 0) -> Pat
     return path
 
 
-def write_bulk_excel(path: Path, n: int, seed: int = 22, offset: int = 0) -> Path:
+def write_bulk_excel(path: Path, n: int, seed: int = 22, offset: int = 0, defect_rate: float = 0.06) -> Path:
     from openpyxl import Workbook
 
     cols = {
@@ -191,7 +191,7 @@ def write_bulk_excel(path: Path, n: int, seed: int = 22, offset: int = 0) -> Pat
     wb = Workbook(write_only=True)
     ws = wb.create_sheet("Loan Tape")
     ws.append(list(cols.keys()))
-    for r in canonical_loans(n, "BLK", seed, offset=offset):
+    for r in canonical_loans(n, "BLK", seed, defect_rate=defect_rate, offset=offset):
         out = []
         for c in cols.values():
             if c is None:
@@ -215,7 +215,7 @@ def write_bulk_excel(path: Path, n: int, seed: int = 22, offset: int = 0) -> Pat
     return path
 
 
-def write_subservicing_txt(path: Path, n: int, seed: int = 33, offset: int = 0) -> Path:
+def write_subservicing_txt(path: Path, n: int, seed: int = 33, offset: int = 0, defect_rate: float = 0.06) -> Path:
     cols = {
         "LN_NBR": "loan_number", "LN_TYP": "loan_type", "PURP_CD": "loan_purpose", "LIEN_POS": "lien_position",
         "AMRT_TYP": "amortization_type", "ORIG_AMT": "original_loan_amount", "CUR_UPB": "current_principal_balance",
@@ -234,7 +234,7 @@ def write_subservicing_txt(path: Path, n: int, seed: int = 33, offset: int = 0) 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as f:
         f.write("|".join(cols.keys()) + "\n")
-        for r in canonical_loans(n, "SUB", seed, offset=offset):
+        for r in canonical_loans(n, "SUB", seed, defect_rate=defect_rate, offset=offset):
             out = []
             for c in cols.values():
                 v = r[c]
@@ -249,7 +249,7 @@ def write_subservicing_txt(path: Path, n: int, seed: int = 33, offset: int = 0) 
     return path
 
 
-def write_correspondent_csv(path: Path, n: int, seed: int = 44, offset: int = 0) -> Path:
+def write_correspondent_csv(path: Path, n: int, seed: int = 44, offset: int = 0, defect_rate: float = 0.06) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     headers = ["Correspondent Loan Number", "Loan Program", "Purpose of Loan", "Lien Priority", "Fixed or ARM",
                "Note Amount", "Unpaid Principal Balance", "Current Rate", "Term (Months)", "Closing Date",
@@ -260,7 +260,7 @@ def write_correspondent_csv(path: Path, n: int, seed: int = 44, offset: int = 0)
     with path.open("w", newline="") as f:
         w = csv.writer(f)
         w.writerow(headers)
-        for r in canonical_loans(n, "COR", seed, offset=offset):
+        for r in canonical_loans(n, "COR", seed, defect_rate=defect_rate, offset=offset):
             occ = {"P": "Primary", "S": "Second Home", "I": "Investment"}.get(r["occupancy_type"], r["occupancy_type"])
             addr = f"{r['property_address_line1']}, {r['property_city']}, {r['property_state']} {r['property_zip']}"
             w.writerow([

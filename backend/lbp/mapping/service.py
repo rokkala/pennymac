@@ -383,14 +383,17 @@ def submit(mapping_id: str, actor: str) -> dict:
 
 
 def approve(mapping_id: str, actor: str, roles: list[str], approve_: bool = True, comment: str | None = None) -> dict:
+    from ..security import expand_roles
+
+    roles = list(expand_roles(roles))
     with db.get_engine().begin() as c:
         m = c.execute(select(db.mappings).where(db.mappings.c.mapping_id == mapping_id)).first()
         if not m or m.status != "in_review":
             raise MappingError("mapping is not awaiting approval")
-        if not set(roles) & {"sme", "admin"}:
-            raise MappingError("SME role required to approve mappings")
+        if not set(roles) & {"onboarding_reviewer", "admin"}:
+            raise MappingError("Onboarding reviewer role required to approve mappings")
         if actor in (m.created_by, m.reviewed_by):
-            raise MappingError("approver must differ from the analyst who prepared the mapping")
+            raise MappingError("approver must differ from the person who prepared the mapping")
         comments = list(m.comments or []) + ([{"actor": actor, "comment": comment, "ts": db.now().isoformat()}] if comment else [])
         if not approve_:
             c.execute(db.mappings.update().where(db.mappings.c.mapping_id == mapping_id).values(status="draft", comments=comments))

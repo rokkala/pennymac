@@ -45,7 +45,8 @@ def now() -> datetime:
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+    # Full uuid4 hex — [:12] birthday-collides under parallel 10M exception inserts.
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 # A vendor (seller, correspondent, sub-servicer, bulk seller, internal channel) owns one or more feeds.
@@ -110,7 +111,7 @@ batches = Table(
     Column("mapping_id", String(40)),
     Column("filename", String(300)),
     Column("file_path", String(500)),
-    Column("status", String(20), default="queued"),  # queued | running | paused | completed | failed
+    Column("status", String(20), default="queued"),  # queued | claimed | running | staged | paused | completed | failed | blocked
     Column("total_rows", Integer, default=0),
     Column("processed", Integer, default=0),
     Column("passed", Integer, default=0),
@@ -310,6 +311,32 @@ rules = Table(
     Column("updated_at", DateTime, default=now),
 )
 
+rule_templates = Table(
+    "rule_templates", metadata,
+    Column("id", String(80), primary_key=True),
+    Column("name", String(200), nullable=False),
+    Column("description", Text, default=""),
+    Column("tree", JSON, nullable=False),
+    Column("builtin", Boolean, default=False),
+    Column("hidden", Boolean, default=False),
+    Column("version", Integer, default=1),
+    Column("updated_by", String(80)),
+    Column("updated_at", DateTime, default=now),
+)
+
+notifications = Table(
+    "notifications", metadata,
+    Column("id", String(40), primary_key=True),
+    Column("user_id", String(80), nullable=False, index=True),
+    Column("kind", String(60), nullable=False),
+    Column("title", String(200), nullable=False),
+    Column("body", Text, default=""),
+    Column("entity_type", String(30), default="rule"),
+    Column("entity_id", String(80), index=True),
+    Column("read_at", DateTime),
+    Column("created_at", DateTime, default=now, index=True),
+)
+
 policy = Table(
     "policy", metadata,
     Column("key", String(80), primary_key=True),
@@ -487,7 +514,7 @@ def row_to_dict(row) -> dict:
 
 
 __all__ = [
-    "metadata", "vendors", "sources", "mappings", "batches", "loans_staging", "sse_loans", "exceptions", "rules", "policy", "mapping_memory",
+    "metadata", "vendors", "sources", "mappings", "batches", "loans_staging", "sse_loans", "exceptions", "rules", "rule_templates", "policy", "mapping_memory",
     "precedents", "loan_changes", "delivery_schedules", "deliveries", "pulled_files", "scheduler_state", "config_publications", "audit_log", "audit_chain", "verify_audit_chain", "check_schema_current", "get_engine", "reset_engine", "audit", "row_to_dict", "now", "new_id", "select",
     "insert", "update",
 ]

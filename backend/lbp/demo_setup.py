@@ -121,6 +121,9 @@ def run_demo_setup(
         wipe_data_dir(settings.data_dir)
         settings = get_settings()
     RuleRegistry().seed_defaults()
+    from .personas import ensure_demo_cast
+
+    ensure_demo_cast(actor="demo_setup")
 
     work = settings.data_dir / "demo_work"
     work.mkdir(parents=True, exist_ok=True)
@@ -167,6 +170,7 @@ def _build_scenario(tmp: Path, rows: int) -> None:
 
     from sqlalchemy import select as _sel
 
+    from .config import get_settings
     from . import samples, vendors as vs
     from .exceptions.manager import ExceptionActionError, ExceptionManager
     from .mapping import service as ms
@@ -192,34 +196,34 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         v = vs.create_vendor(
             {"name": vname, "vendor_type": vtype, "external_ref": ref,
              "contact": {"name": "Delivery desk", "email": f"loanops@{vname.split()[0].lower()}.example"}},
-            "priya.analyst", ["analyst"],
+            "onboarding", ["onboarding"],
         )
-        vs.update_vendor(v["vendor_id"], {"status": "active"}, "dan.sme", ["sme"])
+        vs.update_vendor(v["vendor_id"], {"status": "active"}, "onboarding.reviewer", ["onboarding_reviewer"])
         vendor_ids[key] = v["vendor_id"]
 
     reg_by_key = {}
     for key, path in files.items():
         label = VENDORS[key][3]
-        reg = ms.register_source(label, path, "priya.analyst", f"{VENDORS[key][0]} {label.lower()}", vendor_id=vendor_ids[key])
-        ms.accept_all(reg["mapping_id"], "priya.analyst", 0.0)
-        ms.submit(reg["mapping_id"], "priya.analyst")
-        ms.approve(reg["mapping_id"], "dan.sme", ["sme"], True, "Reviewed against SSE data dictionary")
+        reg = ms.register_source(label, path, "onboarding", f"{VENDORS[key][0]} {label.lower()}", vendor_id=vendor_ids[key])
+        ms.accept_all(reg["mapping_id"], "onboarding", 0.0)
+        ms.submit(reg["mapping_id"], "onboarding")
+        ms.approve(reg["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Reviewed against SSE data dictionary")
         reg_by_key[key] = reg
         for i in range(2 if key in ("pcg_retail", "sub_servicing") else 1):
             p = path if i == 0 else samples.SOURCES[key][2](
                 tmp / f"{key}_day2.{samples.SOURCES[key][1]}", rows, seed=99 + i, offset=rows * i)
-            run_batch(create_batch(reg["source_id"], p, p.name, "maria.ops"))
+            run_batch(create_batch(reg["source_id"], p, p.name, "monitoring"))
 
     m = ExceptionManager()
     for ex in m.list(status="open", limit=2000)["items"]:
         r = rng.random()
         try:
             if ex["tier"] == "T2" and r < 0.45:
-                m.resolve(ex["exception_id"], "lee.reviewer", ["reviewer"], use_proposal=True)
+                m.resolve(ex["exception_id"], "monitoring", ["monitoring"], use_proposal=True)
             elif ex["tier"] == "T4" and r < 0.12 and ex["proposal"]:
-                m.resolve(ex["exception_id"], "lee.reviewer", ["reviewer"], use_proposal=True)
+                m.resolve(ex["exception_id"], "monitoring", ["monitoring"], use_proposal=True)
                 if r < 0.07:
-                    m.checker_decision(ex["exception_id"], "sam.checker", ["checker"], True, "Verified against note")
+                    m.checker_decision(ex["exception_id"], "monitoring.reviewer", ["monitoring_reviewer"], True, "Verified against note")
         except ExceptionActionError:
             pass
 
@@ -231,14 +235,14 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         "description": "DTI above 45% flagged for review (tightened from 50%).",
         "tests": [{"record": base["tests"][0]["record"], "expect": True},
                   {"record": {**base["tests"][0]["record"], "dti_ratio": 47}, "expect": False}],
-    }, "dan.sme")
-    rr.transition("R015", v2["version"], "in_review", "dan.sme")
-    rr.transition("R015", v2["version"], "approved", "ana.compliance", ["compliance"], "OK per ATR/QM guidance")
-    rr.transition("R015", v2["version"], "canary", "ana.compliance", canary_pct=10)
+    }, "onboarding.reviewer")
+    rr.transition("R015", v2["version"], "in_review", "onboarding.reviewer")
+    rr.transition("R015", v2["version"], "approved", "compliance.reviewer", ["compliance_reviewer"], "OK per ATR/QM guidance")
+    rr.transition("R015", v2["version"], "canary", "compliance.reviewer", canary_pct=10)
     drafted = draft_from_text("If loan type is VA, investor category must be GNMA")
     if drafted.get("draft"):
         body = {**drafted["draft"], "name": "VA loans securitized with GNMA"}
-        rr.create_draft(body, "dan.sme")
+        rr.create_draft(body, "onboarding.reviewer")
 
     def rewrite(src, dst, fn, rename=None):
         with open(src) as f, open(dst, "w", newline="") as g:
@@ -259,14 +263,14 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         lambda i, r: {**r, "MaturityDate": _dt.strptime(r["MaturityDate"], "%Y-%m-%d").strftime("%m/%d/%Y")},
         rename={"NoteRate": "Note_Rate_Pct"},
     )
-    run_batch(create_batch(pcg["source_id"], pcg3, pcg3.name, "maria.ops"))
+    run_batch(create_batch(pcg["source_id"], pcg3, pcg3.name, "monitoring"))
 
     sub_ = reg_by_key["sub_servicing"]
     lines = files["sub_servicing"].read_text().splitlines()
     resent_n = min(120, max(10, len(lines) - 1))
     resent = tmp / "sub_servicing_resend.txt"
     resent.write_text("\n".join(lines[:1] + lines[1:resent_n + 1]) + "\n")
-    run_batch(create_batch(sub_["source_id"], resent, resent.name, "maria.ops"))
+    run_batch(create_batch(sub_["source_id"], resent, resent.name, "monitoring"))
 
     cor = reg_by_key["correspondent"]
     cor_extra = max(50, min(1500, rows))
@@ -275,21 +279,21 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         corw_src, tmp / "correspondent_2026-11-02.csv",
         lambda i, r: {**r, "Occupancy Status": "Owner-Occ" if i % 3 == 0 else r["Occupancy Status"]},
     )
-    cor_bid = create_batch(cor["source_id"], corw, corw.name, "maria.ops")
+    cor_bid = create_batch(cor["source_id"], corw, corw.name, "monitoring")
     run_batch(cor_bid)
-    v2c = ms.new_version(cor["source_id"], "priya.analyst")
+    v2c = ms.new_version(cor["source_id"], "onboarding")
     occ = next(f for f in v2c["fields"] if f["target"] == "occupancy_type")
     ms.update_field(
-        v2c["mapping_id"], "occupancy_type", "override", "priya.analyst",
+        v2c["mapping_id"], "occupancy_type", "override", "onboarding",
         transform=with_value_map(occ["transform"], {"Owner-Occ": "P", "Primary": "P", "Second Home": "S", "Investment": "I"}),
     )
     ms.add_field(
-        v2c["mapping_id"], "investor_loan_number", "priya.analyst",
+        v2c["mapping_id"], "investor_loan_number", "onboarding",
         ["Correspondent Loan Number"], [{"op": "trim"}, {"op": "truncate", "length": 20}],
     )
-    ms.submit(v2c["mapping_id"], "priya.analyst")
-    ms.approve(v2c["mapping_id"], "dan.sme", ["sme"], True, "Adds Owner-Occ translation")
-    replay_batch(cor_bid, "maria.ops", dry_run=True)
+    ms.submit(v2c["mapping_id"], "onboarding")
+    ms.approve(v2c["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Adds Owner-Occ translation")
+    replay_batch(cor_bid, "monitoring", dry_run=True)
 
     now = _db.now()
     loc = now.replace(tzinfo=_Z("UTC")).astimezone(_Z("America/New_York"))
@@ -299,8 +303,8 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         return (t.minute // 15) * 15, t.hour
 
     def schedule(src_id, name, cfg):
-        s_ = sched.create_schedule(src_id, name, cfg, "maria.ops", ["ops"])
-        sched.decide(s_["schedule_id"], "dan.sme", ["sme"], True, "Matches the vendor SLA")
+        s_ = sched.create_schedule(src_id, name, cfg, "monitoring", ["monitoring"])
+        sched.decide(s_["schedule_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Matches the vendor SLA")
         with _db.get_engine().begin() as c:
             c.execute(
                 _db.delivery_schedules.update()
@@ -310,10 +314,10 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         return s_["schedule_id"]
 
     def new_feed(key, name, path):
-        r_ = ms.register_source(name, path, "priya.analyst", f"{VENDORS[key][0]} {name.lower()}", vendor_id=vendor_ids[key])
-        ms.accept_all(r_["mapping_id"], "priya.analyst", 0.0)
-        ms.submit(r_["mapping_id"], "priya.analyst")
-        ms.approve(r_["mapping_id"], "dan.sme", ["sme"], True, "Same layout family as the vendor's boarding tape")
+        r_ = ms.register_source(name, path, "onboarding", f"{VENDORS[key][0]} {name.lower()}", vendor_id=vendor_ids[key])
+        ms.accept_all(r_["mapping_id"], "onboarding", 0.0)
+        ms.submit(r_["mapping_id"], "onboarding")
+        ms.approve(r_["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Same layout family as the vendor's boarding tape")
         return r_
 
     sub_delta = new_feed("sub_servicing", "Intraday change files", files["sub_servicing"])
@@ -337,7 +341,8 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         "holiday_rule": "next_business_day", "grace_minutes": 60, "miss_after_minutes": 360, "load_type": "snapshot",
         "pull": {
             "protocol": "sftp", "host": "sftp.westside-partner.example", "port": 22, "path": "/outbound/lbp",
-            "pattern": "correspondent_snapshot_*.csv", "secret_ref": "lbp/vendors/correspondent",
+            "pattern": "correspondent_snapshot_*.csv",
+            "secret_ref": f"{get_settings().vendor_secret_prefix}correspondent",
             "host_key_sha256": "SHA256:Zq3nY8d9r1QeVb7kq0m6l3c4w2xT5uJpA1sD9fG8hKk", "poll_minutes": 15,
         },
     })
@@ -357,7 +362,7 @@ def _build_scenario(tmp: Path, rows: int) -> None:
                 "late_alerted_at": None if st == "received" else d.due_at, "missed_alerted_at": None,
             }
             if st == "missed" and i % 2:
-                vals.update(status="waived", waived_by="maria.ops", waive_reason="Vendor holiday confirmed by email")
+                vals.update(status="waived", waived_by="monitoring", waive_reason="Vendor holiday confirmed by email")
             c.execute(_db.deliveries.update().where(_db.deliveries.c.delivery_id == d.delivery_id).values(**vals))
     sched.tick(pull=False)
     _ = (s_pcg, s_sub, s_bulk)
@@ -366,8 +371,8 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         "load_type": "incremental",
         "action": {"mode": "column", "column": "ACTN_CD", "values": {"N": "add", "C": "update", "P": "close", "T": "close"}},
         "sequence": {"source": "filename", "pattern": r"_(\d{6})\.txt$", "kind": "integer", "strict": True},
-    }, "priya.analyst", ["analyst"])
-    decide_profile(sub_delta["source_id"], "dan.sme", ["sme"], True, "Intraday delta feed agreed with the sub-servicer")
+    }, "onboarding", ["onboarding"])
+    decide_profile(sub_delta["source_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Intraday delta feed agreed with the sub-servicer")
 
     with _db.get_engine().connect() as c:
         live = c.execute(
@@ -451,9 +456,9 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         chg = [e for e in m.list(status="open", rule_id="CHG01", limit=50)["items"] if e["loan_number"] == frm[0].loan_number]
         if chg:
             try:
-                m.resolve(chg[0]["exception_id"], "lee.reviewer", ["reviewer"], use_proposal=True,
+                m.resolve(chg[0]["exception_id"], "monitoring", ["monitoring"], use_proposal=True,
                           comment="Rate modification letter on file")
-                m.checker_decision(chg[0]["exception_id"], "sam.checker", ["checker"], True,
+                m.checker_decision(chg[0]["exception_id"], "monitoring.reviewer", ["monitoring_reviewer"], True,
                                    "Verified against modification agreement")
             except ExceptionActionError:
                 pass
@@ -468,8 +473,8 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         "load_type": "snapshot",
         "sequence": {"source": "filename", "pattern": r"_(\d{8})\.csv$", "kind": "date", "strict": False},
         "snapshot": {"missing_action": "review", "max_missing_pct": 5.0},
-    }, "priya.analyst", ["analyst"])
-    decide_profile(cor_snap["source_id"], "dan.sme", ["sme"], True, "Partner sends full portfolio every Monday")
+    }, "onboarding", ["onboarding"])
+    decide_profile(cor_snap["source_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Partner sends full portfolio every Monday")
     snap_rows, hdr = [], None
     for fp in (files["correspondent"], corw):
         with open(fp) as f:
@@ -503,7 +508,7 @@ def _build_scenario(tmp: Path, rows: int) -> None:
         "name": "Westside Lending", "vendor_type": "correspondent", "external_ref": "COR-3104",
         "contact": {"name": "Jordan Price", "email": "jprice@westside.example"},
         "notes": "New correspondent partner; first tape under review",
-    }, "priya.analyst", ["analyst"])
+    }, "onboarding", ["onboarding"])
     ms.register_source(
-        "Loan tape", newp, "priya.analyst", "New correspondent partner, first tape", vendor_id=west["vendor_id"],
+        "Loan tape", newp, "onboarding", "New correspondent partner, first tape", vendor_id=west["vendor_id"],
     )

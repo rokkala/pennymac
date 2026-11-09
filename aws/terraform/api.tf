@@ -18,13 +18,13 @@ resource "aws_cognito_user_pool" "main" {
 
 resource "aws_cognito_user_group" "roles" {
   for_each = {
-    analyst    = "Data analyst: onboards sources, prepares mappings"
-    sme        = "Subject-matter expert: approves mappings, authors rules"
-    ops        = "Loan boarding operations: uploads files, monitors batches"
-    reviewer   = "Exception reviewer (T2/T3, T4 maker)"
-    checker    = "Exception checker (T4 second pair of eyes)"
-    compliance = "Compliance: T5 blocks, regulatory rule and policy approvals, PII view"
-    admin      = "Platform administrator"
+    onboarding            = "Onboarding: vendors, mappings, rule drafts, schedule proposals"
+    onboarding_reviewer   = "Onboarding reviewer: approve mappings, rules, schedules"
+    monitoring            = "Monitoring: uploads, boarding desk, T2/T3, T4 maker"
+    monitoring_reviewer   = "Monitoring reviewer: T4 checker and dual-control ops gates"
+    compliance            = "Compliance: investigate regulated queues"
+    compliance_reviewer   = "Compliance reviewer: T5, policy, regulated rule gate, audit"
+    admin                 = "Platform administrator"
   }
   name         = each.key
   description  = each.value

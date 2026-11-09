@@ -91,13 +91,16 @@ def validate_config(cfg: dict) -> list[str]:
 
 
 def _role(roles, *need):
+    from ..security import expand_roles
+
+    roles = expand_roles(roles or [])
     if not set(roles) & set(need + ("admin",)):
         raise ScheduleError(f"requires one of: {', '.join(need)}")
 
 
 # ------------------------------------------------------------------ maker-checker
 def create_schedule(source_id: str, name: str, cfg: dict, actor: str, roles: list[str]) -> dict:
-    _role(roles, "ops", "sme")
+    _role(roles, "monitoring", "onboarding", "onboarding_reviewer")
     errs = validate_config(cfg)
     if errs:
         raise ScheduleError("; ".join(errs))
@@ -113,7 +116,7 @@ def create_schedule(source_id: str, name: str, cfg: dict, actor: str, roles: lis
 
 
 def propose_change(schedule_id: str, cfg: dict, actor: str, roles: list[str], name: str | None = None) -> dict:
-    _role(roles, "ops", "sme")
+    _role(roles, "monitoring", "onboarding", "onboarding_reviewer")
     errs = validate_config(cfg)
     if errs:
         raise ScheduleError("; ".join(errs))
@@ -128,7 +131,7 @@ def propose_change(schedule_id: str, cfg: dict, actor: str, roles: list[str], na
 
 
 def decide(schedule_id: str, actor: str, roles: list[str], approve: bool, comment: str | None = None) -> dict:
-    _role(roles, "sme", "compliance")
+    _role(roles, "onboarding_reviewer", "compliance_reviewer")
     with db.get_engine().begin() as c:
         s = _load(c, schedule_id)
         if not s.proposed:
@@ -159,7 +162,7 @@ def decide(schedule_id: str, actor: str, roles: list[str], approve: bool, commen
 
 
 def set_status(schedule_id: str, actor: str, roles: list[str], status: str, reason: str | None = None) -> dict:
-    _role(roles, "ops", "sme")
+    _role(roles, "monitoring", "onboarding", "onboarding_reviewer")
     if status not in ("active", "paused", "retired"):
         raise ScheduleError("status must be active, paused or retired")
     with db.get_engine().begin() as c:
@@ -179,7 +182,7 @@ def set_status(schedule_id: str, actor: str, roles: list[str], status: str, reas
 
 def waive(delivery_id: str, actor: str, roles: list[str], reason: str) -> dict:
     """No file is coming for this window (vendor holiday, agreed skip): stops late/missed alerts for it."""
-    _role(roles, "ops", "sme")
+    _role(roles, "monitoring", "onboarding", "onboarding_reviewer")
     if not reason:
         raise ScheduleError("a reason is required")
     with db.get_engine().begin() as c:
@@ -368,7 +371,7 @@ def pull_now(schedule_id: str, actor: str, roles: list[str], now=None) -> dict:
     from ..pipeline.batch import DuplicateFileError, create_batch
     from ..storage import persist_upload
 
-    _role(roles, "ops", "sme")
+    _role(roles, "monitoring", "onboarding", "onboarding_reviewer")
     now = now or _now()
     with db.get_engine().begin() as c:
         s = _load(c, schedule_id)

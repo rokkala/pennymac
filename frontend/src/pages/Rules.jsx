@@ -1,16 +1,40 @@
 import React, { useEffect, useState } from "react";
-import { api } from "../api.js";
+import { api, getPersona } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Loading, ago, fmt, human, Modal, ReasonModal, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Loading, ago, fmt, human, Modal, ReasonModal, Field, PageHeader, EmptyState } from "../ui.jsx";
+import { blankLeaf, ensureTree, LeafEditor } from "../ruleTree.jsx";
+
+function sameUser(a, b) {
+  if (a == null || b == null || a === "" || b === "") return false;
+  return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+}
+function isRuleAuthor(persona, rule) {
+  const me = persona?.id || persona?.name || getPersona()?.id;
+  return sameUser(me, rule?.author) || sameUser(me, rule?.owner);
+}
+function isRuleSubmitter(persona, rule) {
+  const me = persona?.id || persona?.name || getPersona()?.id;
+  const submittedBy = [...(rule?.history || [])].reverse().find((h) => h.to === "in_review")?.actor;
+  return sameUser(me, submittedBy);
+}
 
 const STAGES = [
-  { id: "author", label: "Draft", desc: "Build the check with fields and options", states: ["draft"] },
-  { id: "review", label: "Review", desc: "Peer sign-off; Compliance if regulatory", states: ["in_review", "approved"] },
-  { id: "deploy", label: "Try safely", desc: "Run quietly or on a share of loans", states: ["shadow", "canary"] },
+  { id: "author", label: "Draft", desc: "Build the check", states: ["draft"] },
+  { id: "review", label: "Review", desc: "Peer sign-off", states: ["in_review", "approved"] },
+  { id: "deploy", label: "Try safely", desc: "Shadow or canary", states: ["shadow", "canary"] },
   { id: "monitor", label: "Live", desc: "On for all loans", states: ["active"] },
-  { id: "retire", label: "Off", desc: "Stopped; history kept", states: ["retired"] },
+  { id: "retire", label: "Off", desc: "History kept", states: ["retired"] },
 ];
-const NEXT = { draft: ["in_review"], in_review: ["approved", "draft"], approved: ["shadow", "canary", "active"], shadow: ["canary", "active", "retired"], canary: ["active", "shadow", "retired"], active: ["retired"], rejected: ["draft"], retired: [] };
+const NEXT = {
+  draft: ["in_review"],
+  in_review: ["approved", "draft"],
+  approved: ["shadow", "canary", "active"],
+  shadow: ["canary", "active", "retired"],
+  canary: ["active", "shadow", "retired"],
+  active: ["retired"],
+  rejected: ["draft"],
+  retired: [],
+};
 const ACTION_LABEL = {
   in_review: "Submit for review",
   approved: "Approve",
@@ -21,14 +45,23 @@ const ACTION_LABEL = {
   retired: "Retire",
 };
 const STATUS_LABEL = {
-  draft: "Not submitted",
-  in_review: "Waiting for a peer",
-  approved: "Ready to try safely",
-  shadow: "Running quietly",
-  canary: "Trying on a slice",
+  draft: "Draft — not submitted",
+  in_review: "In review — waiting for a peer",
+  approved: "Approved — ready to try safely",
+  shadow: "Shadow — running quietly",
+  canary: "Canary — trying on a slice",
   active: "Live on all loans",
-  retired: "Off; history kept",
+  retired: "Retired",
   rejected: "Sent back",
+};
+const NEXT_HELP = {
+  draft: "Save your checks, then submit for peer review. You cannot approve your own rule.",
+  in_review: "Another SME must approve (not the author). Regulatory-tagged rules also need Compliance.",
+  approved: "Try quietly (shadow), on a share of loans (canary), or turn on for everyone.",
+  shadow: "Promote to canary or live, or retire.",
+  canary: "Turn on for all loans, drop back to shadow, or retire.",
+  active: "This version is live. To change the logic, create a new draft version, then submit it for review.",
+  retired: "This version is off. Create a new draft from another version if you need changes.",
 };
 const TRANSITION_HELP = {
   in_review: "Sends the rule to a peer. Sample checks must pass first.",
@@ -39,183 +72,29 @@ const TRANSITION_HELP = {
   active: "Turns this version on for all loans. Live feed configs are republished.",
   retired: "Stops the rule. History is kept. Live feed configs are republished.",
 };
-const blankLeaf = () => ({ shape: "required", field: "loan_number" });
-const SHAPE_OPTS = [
-  { id: "required", label: "Must be filled" },
-  { id: "between", label: "Between two numbers" },
-  { id: "compare_num", label: "Compare to a number" },
-  { id: "compare_field", label: "Compare to another field" },
-  { id: "one_of", label: "Must be one of" },
-  { id: "equals", label: "Equals a value" },
-  { id: "digits", label: "Exactly N digits" },
-  { id: "date_order", label: "Date before / after another" },
-  { id: "if_then", label: "If … then …" },
-  { id: "all_present", label: "All fields filled" },
+const AUTHOR_STEPS = [
+  { id: "start", label: "Start" },
+  { id: "build", label: "Build" },
+  { id: "preview", label: "Preview & save" },
 ];
 
-function FieldSelect({ id, label, fields, value, onChange, filter }) {
-  const list = (fields || []).filter((f) => !filter || filter(f));
+function Stepper({ steps, current }) {
+  const idx = steps.findIndex((s) => s.id === current);
   return (
-    <Field id={id} label={label}>
-      <select id={id} className="input" value={value || ""} onChange={(e) => onChange(e.target.value)}>
-        <option value="">Choose a field…</option>
-        {list.map((f) => (
-          <option key={f.name} value={f.name}>{f.name} · {f.module} ({f.dtype})</option>
-        ))}
-      </select>
-    </Field>
-  );
-}
-
-function LeafEditor({ node, fields, onChange, depth = 0 }) {
-  if (node?.op) {
-    return <GroupEditor node={node} fields={fields} onChange={onChange} depth={depth} />;
-  }
-  const shape = node?.shape || "required";
-  const set = (patch) => onChange({ ...node, ...patch });
-  const attr = (fields || []).find((f) => f.name === node.field);
-  return (
-    <div className="stack" style={{ padding: "10px 12px", background: "var(--bg-elev, rgba(0,0,0,.03))", borderRadius: 8 }}>
-      <Field id={`sh-${depth}`} label="Check type">
-        <select id={`sh-${depth}`} className="input" value={shape} onChange={(e) => {
-          const id = e.target.value;
-          if (id === "if_then") onChange({ shape: "if_then", when: blankLeaf(), then: blankLeaf() });
-          else if (id === "all_present") onChange({ shape: "all_present", fields: ["loan_number"] });
-          else if (id === "date_order") onChange({ shape: "date_order", field_a: "note_date", order: "before", field_b: "maturity_date" });
-          else if (id === "between") onChange({ shape: "between", field: "interest_rate", min: 0.5, max: 15 });
-          else if (id === "compare_num") onChange({ shape: "compare_num", field: "borrower_fico", op: ">=", number: 580 });
-          else if (id === "one_of") onChange({ shape: "one_of", field: "occupancy_type", values: ["P", "S", "I"] });
-          else onChange({ shape: id, field: node.field || "loan_number" });
-        }}>
-          {SHAPE_OPTS.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
-        </select>
-      </Field>
-      {shape === "if_then" ? (
-        <>
-          <span className="eyebrow">When</span>
-          <LeafEditor node={node.when || blankLeaf()} fields={fields} onChange={(when) => set({ when })} depth={depth + 1} />
-          <span className="eyebrow">Then</span>
-          <LeafEditor node={node.then || blankLeaf()} fields={fields} onChange={(then) => set({ then })} depth={depth + 1} />
-        </>
-      ) : shape === "all_present" ? (
-        <Field id={`ap-${depth}`} label="Fields (comma-separated)">
-          <input id={`ap-${depth}`} className="input mono" value={(node.fields || []).join(", ")}
-            onChange={(e) => set({ fields: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} />
-        </Field>
-      ) : shape === "date_order" ? (
-        <div className="grid g2">
-          <FieldSelect id={`da-${depth}`} label="First date" fields={fields} value={node.field_a} onChange={(field_a) => set({ field_a })} filter={(f) => f.dtype === "date"} />
-          <Field id={`ord-${depth}`} label="Order">
-            <select id={`ord-${depth}`} className="input" value={node.order || "before"} onChange={(e) => set({ order: e.target.value })}>
-              <option value="before">must be before</option>
-              <option value="after">must be after</option>
-            </select>
-          </Field>
-          <FieldSelect id={`db-${depth}`} label="Second date" fields={fields} value={node.field_b} onChange={(field_b) => set({ field_b })} filter={(f) => f.dtype === "date"} />
-        </div>
-      ) : (
-        <>
-          {shape !== "date_order" && (
-            <FieldSelect id={`f-${depth}`} label="Field" fields={fields} value={node.field} onChange={(field) => {
-              const a = (fields || []).find((x) => x.name === field);
-              const patch = { field };
-              if (shape === "one_of" && a?.codes?.length) patch.values = [...a.codes];
-              set(patch);
-            }} />
-          )}
-          {shape === "between" && (
-            <div className="grid g2">
-              <Field id={`mn-${depth}`} label="Minimum"><input id={`mn-${depth}`} className="input" type="number" value={node.min ?? ""} onChange={(e) => set({ min: +e.target.value })} /></Field>
-              <Field id={`mx-${depth}`} label="Maximum"><input id={`mx-${depth}`} className="input" type="number" value={node.max ?? ""} onChange={(e) => set({ max: +e.target.value })} /></Field>
-            </div>
-          )}
-          {shape === "compare_num" && (
-            <div className="grid g2">
-              <Field id={`op-${depth}`} label="Operator">
-                <select id={`op-${depth}`} className="input" value={node.op || ">="} onChange={(e) => set({ op: e.target.value })}>
-                  {[[">=", "at least"], ["<=", "at most"], [">", "greater than"], ["<", "less than"]].map(([v, l]) => <option key={v} value={v}>{l}</option>)}
-                </select>
-              </Field>
-              <Field id={`num-${depth}`} label="Number"><input id={`num-${depth}`} className="input" type="number" value={node.number ?? ""} onChange={(e) => set({ number: +e.target.value })} /></Field>
-            </div>
-          )}
-          {shape === "compare_field" && (
-            <div className="grid g2">
-              <Field id={`op2-${depth}`} label="Operator">
-                <select id={`op2-${depth}`} className="input" value={node.op || "<="} onChange={(e) => set({ op: e.target.value })}>
-                  {["<=", ">=", "<", ">", "==", "!="].map((v) => <option key={v} value={v}>{v}</option>)}
-                </select>
-              </Field>
-              <FieldSelect id={`oth-${depth}`} label="Other field" fields={fields} value={node.other} onChange={(other) => set({ other })} />
-            </div>
-          )}
-          {shape === "one_of" && (
-            <Field id={`vals-${depth}`} label="Allowed values" hint={attr?.codes?.length ? `Codes: ${attr.codes.join(", ")}` : "Comma-separated"}>
-              <input id={`vals-${depth}`} className="input" value={(node.values || []).join(", ")}
-                onChange={(e) => set({ values: e.target.value.split(",").map((x) => x.trim()).filter(Boolean) })} />
-            </Field>
-          )}
-          {shape === "equals" && (
-            <Field id={`eq-${depth}`} label="Value">
-              {attr?.codes?.length ? (
-                <select id={`eq-${depth}`} className="input" value={node.value || ""} onChange={(e) => set({ value: e.target.value })}>
-                  <option value="">Choose…</option>
-                  {attr.codes.map((c) => <option key={c} value={c}>{c}</option>)}
-                </select>
-              ) : (
-                <input id={`eq-${depth}`} className="input" value={node.value ?? ""} onChange={(e) => set({ value: e.target.value })} />
-              )}
-            </Field>
-          )}
-          {shape === "digits" && (
-            <Field id={`n-${depth}`} label="Number of digits">
-              <input id={`n-${depth}`} className="input" type="number" min={1} value={node.n ?? 9} onChange={(e) => set({ n: +e.target.value })} />
-            </Field>
-          )}
-        </>
-      )}
-    </div>
-  );
-}
-
-function GroupEditor({ node, fields, onChange, depth = 0 }) {
-  const kids = node.children || [];
-  const setKid = (i, child) => onChange({ ...node, children: kids.map((c, j) => (j === i ? child : c)) });
-  const add = () => onChange({ ...node, children: [...kids, blankLeaf()] });
-  const remove = (i) => onChange({ ...node, children: kids.filter((_, j) => j !== i) });
-  return (
-    <div className="stack">
-      <Field id={`grp-${depth}`} label="Combine checks">
-        <select id={`grp-${depth}`} className="input" value={node.op} onChange={(e) => onChange({ ...node, op: e.target.value })}>
-          <option value="and">All must pass</option>
-          <option value="or">Any may pass</option>
-          <option value="xor">Exactly one must pass</option>
-        </select>
-      </Field>
-      {kids.map((c, i) => (
-        <div key={i} className="stack">
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <span className="eyebrow">Check {i + 1}</span>
-            {kids.length > 1 && <button type="button" className="btn sm" onClick={() => remove(i)}>Remove</button>}
-          </div>
-          <LeafEditor node={c} fields={fields} onChange={(n) => setKid(i, n)} depth={depth + 1} />
-        </div>
+    <div className="row" style={{ gap: 8, flexWrap: "wrap" }} aria-label="Steps">
+      {steps.map((s, i) => (
+        <span key={s.id} className={`chip ${i === idx ? "" : "faint"}`} style={i === idx ? { fontWeight: 600 } : undefined}>
+          {i + 1}. {s.label}
+        </span>
       ))}
-      {depth < 2 && <button type="button" className="btn" onClick={add}>Add check</button>}
     </div>
   );
-}
-
-function ensureTree(tree) {
-  if (!tree) return { op: "and", children: [blankLeaf()] };
-  if (tree.op || tree.shape) return tree;
-  return { op: "and", children: [blankLeaf()] };
 }
 
 function AuthorModal({ persona, onCreated, onClose }) {
   const { data: fieldData } = useApi("/api/rules/fields");
   const { data: tplData } = useApi("/api/rules/templates");
-  const [tab, setTab] = useState("templates"); // templates | build | ai
+  const [step, setStep] = useState("start");
   const [tree, setTree] = useState(() => ensureTree(null));
   const [name, setName] = useState("");
   const [severity, setSeverity] = useState("FAIL");
@@ -223,6 +102,7 @@ function AuthorModal({ persona, onCreated, onClose }) {
   const [preview, setPreview] = useState(null);
   const [text, setText] = useState("Interest rate must be between 0.5 and 15");
   const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
   const act = useAction();
   const canSave = canCap(persona, "editRules");
   const fields = fieldData?.fields || [];
@@ -237,10 +117,19 @@ function AuthorModal({ persona, onCreated, onClose }) {
 
   useEffect(() => { setPreview(null); }, [tree, severity, tag]);
 
+  const goPreview = async () => {
+    setBusy(true);
+    const res = await compose();
+    setBusy(false);
+    if (!res?.draft) { setErr(res?.problems?.join(" ") || "Fix the rule before previewing."); return; }
+    setStep("preview");
+  };
+
   const save = async () => {
+    setBusy(true);
     const res = preview || await compose();
-    if (!res?.draft) { setErr(res?.problems?.join(" ") || "Fix the rule before saving."); return; }
-    if (res.problems?.length) { setErr(res.problems.join(" ")); return; }
+    if (!res?.draft) { setBusy(false); setErr(res?.problems?.join(" ") || "Fix the rule before saving."); return; }
+    if (res.problems?.length) { setBusy(false); setErr(res.problems.join(" ")); return; }
     const body = {
       name: name || res.draft.name || res.summary,
       description: res.summary,
@@ -248,59 +137,84 @@ function AuthorModal({ persona, onCreated, onClose }) {
       severity,
       regulatory_tag: tag || null,
     };
-    const r = await act(() => api("/api/rules", { method: "POST", body }), (x) => `Draft ${x.rule_id} created`);
+    const r = await act(() => api("/api/rules", { method: "POST", body }), (x) => `Draft ${x.rule_id} created — submit it for review next`);
+    setBusy(false);
     if (r) onCreated(r.rule_id);
   };
 
   const fromAi = async () => {
     setErr("");
+    setBusy(true);
     const res = await act(() => api("/api/rules/author", { method: "POST", body: { text } }));
+    setBusy(false);
     if (res?.draft?.tree) {
       setTree(ensureTree(res.draft.tree));
       setName(res.draft.name || text);
-      setTab("build");
       setPreview({ draft: res.draft, test_results: res.test_results, problems: res.problems, summary: res.draft.summary || res.draft.description });
+      setStep("build");
     } else setErr((res?.problems || ["Could not turn that into a guided rule."]).join(" "));
   };
 
+  const startBlank = () => {
+    setTree(ensureTree(null));
+    setName("");
+    setPreview(null);
+    setErr("");
+    setStep("build");
+  };
+
+  const footer = step === "start" ? (
+    <button type="button" className="btn" onClick={onClose}>Cancel</button>
+  ) : step === "build" ? (
+    <>
+      <button type="button" className="btn" onClick={() => setStep("start")} disabled={busy}>Back</button>
+      <button type="button" className="btn" onClick={onClose} disabled={busy}>Cancel</button>
+      <button type="button" className="btn primary" onClick={goPreview} disabled={busy}>{busy ? "Checking…" : "Preview checks"}</button>
+    </>
+  ) : (
+    <>
+      <button type="button" className="btn" onClick={() => setStep("build")} disabled={busy}>Back to build</button>
+      <button type="button" className="btn" onClick={() => compose()} disabled={busy}>Re-check</button>
+      {canSave && <button type="button" className="btn primary" onClick={save} disabled={busy || preview?.problems?.length}>{busy ? "Saving…" : "Save draft"}</button>}
+    </>
+  );
+
   return (
-    <Modal title="Author a rule" sub="Pick a template or build with fields and options. No JSON required. Preview sample checks, then save a draft." size="xl" onClose={onClose}
-      footer={<>
-        <button className="btn" onClick={onClose}>Cancel</button>
-        <button className="btn" onClick={() => compose()}>Preview checks</button>
-        {canSave && <button className="btn primary" onClick={save}>Save as draft</button>}
-      </>}>
+    <Modal title="New rule" sub="Three steps: choose a start, build the check, preview and save a draft." size="xl" onClose={onClose} busy={busy} footer={footer}>
       <div className="stack">
+        <Stepper steps={AUTHOR_STEPS} current={step} />
         {!canSave && <div className="callout t4" style={{ fontSize: ".84rem" }}>You can build a preview. Switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> to save.</div>}
-        <div className="row" style={{ gap: 6 }}>
-          {[["templates", "Templates"], ["build", "Build"], ["ai", "AI assist"]].map(([id, label]) => (
-            <button key={id} type="button" className={`btn sm ${tab === id ? "primary" : ""}`} onClick={() => setTab(id)}>{label}</button>
-          ))}
-        </div>
-        {tab === "templates" && (
+        {err && <div className="callout t5" style={{ fontSize: ".84rem" }}>{err}</div>}
+
+        {step === "start" && (
           <div className="stack">
-            <p className="muted" style={{ margin: 0 }}>Start from a common mortgage check, then adjust on the Build tab.</p>
+            <p className="muted" style={{ margin: 0 }}>How do you want to start?</p>
             <div className="grid g2">
+              <button type="button" className="btn primary" style={{ textAlign: "left", height: "auto", padding: "14px 16px" }} onClick={startBlank}>
+                <b>Blank rule</b>
+                <div className="faint" style={{ fontSize: ".82rem", marginTop: 4, color: "inherit", opacity: 0.9 }}>Guided form — pick fields and options yourself</div>
+              </button>
               {(tplData?.templates || []).map((t) => (
-                <button key={t.id} type="button" className="btn" style={{ textAlign: "left", height: "auto", padding: "12px 14px" }}
-                  onClick={() => { setTree(ensureTree(t.tree)); setName(t.name); setTab("build"); setPreview(null); }}>
+                <button key={t.id} type="button" className="btn" style={{ textAlign: "left", height: "auto", padding: "14px 16px" }}
+                  onClick={() => { setTree(ensureTree(t.tree)); setName(t.name); setPreview(null); setErr(""); setStep("build"); }}>
                   <b>{t.name}</b>
                   <div className="faint" style={{ fontSize: ".82rem", marginTop: 4 }}>{t.description}</div>
                 </button>
               ))}
             </div>
+            {!tplData?.templates?.length && <p className="faint" style={{ margin: 0 }}>No catalog templates — use Blank rule, or add starters under Maintenance → Rule templates.</p>}
+            <div className="stack" style={{ marginTop: 8, paddingTop: 12, borderTop: "1px solid var(--line)" }}>
+              <span className="eyebrow">Or describe it (AI assist)</span>
+              <Field id="ai-text" label="Plain English">
+                <textarea id="ai-text" className="input" rows={2} value={text} onChange={(e) => setText(e.target.value)} />
+              </Field>
+              <button type="button" className="btn" disabled={!text.trim() || busy} onClick={fromAi}>Fill builder from this text</button>
+              <p className="faint" style={{ fontSize: ".82rem", margin: 0 }}>Always review the Build step — AI can pick the wrong field.</p>
+            </div>
           </div>
         )}
-        {tab === "ai" && (
-          <div className="stack">
-            <Field id="ai-text" label="Describe the rule (optional shortcut)">
-              <textarea id="ai-text" className="input" rows={3} value={text} onChange={(e) => setText(e.target.value)} />
-            </Field>
-            <button type="button" className="btn primary" disabled={!text.trim()} onClick={fromAi}>Fill the builder from this text</button>
-            <p className="faint" style={{ fontSize: ".82rem", margin: 0 }}>Always review the Build tab before saving — AI can pick the wrong field.</p>
-          </div>
-        )}
-        {tab === "build" && (
+
+        {step === "build" && (
           <div className="stack">
             <div className="grid g2">
               <Field id="rn" label="Name"><input id="rn" className="input" data-autofocus value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Interest rate range" /></Field>
@@ -321,9 +235,12 @@ function AuthorModal({ persona, onCreated, onClose }) {
             <LeafEditor node={tree} fields={fields} onChange={setTree} />
           </div>
         )}
-        {err && <div className="callout t5" style={{ fontSize: ".84rem" }}>{err}</div>}
-        {preview?.draft && (
+
+        {step === "preview" && preview?.draft && (
           <div className="stack">
+            <div className="callout" style={{ fontSize: ".9rem" }}>
+              After you save, open the draft and use <b>Submit for review</b> — that starts peer sign-off.
+            </div>
             <span className="eyebrow">In plain English</span>
             <p style={{ margin: 0 }}>{preview.summary || preview.draft.summary || preview.draft.description}</p>
             <span className="eyebrow">Sample checks</span>
@@ -335,9 +252,9 @@ function AuthorModal({ persona, onCreated, onClose }) {
                 expect {String(t.expect)} · <span className="mono faint">{Object.entries(t.record || {}).filter(([k]) => (preview.draft.fields || []).includes(k)).map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(", ")}</span>
               </span>
             ))}
+            {preview.problems?.length > 0 && <div className="callout t4">{preview.problems.join(" ")}</div>}
           </div>
         )}
-        {preview?.problems?.length > 0 && <div className="callout t4">{preview.problems.join(" ")}</div>}
       </div>
     </Modal>
   );
@@ -370,17 +287,17 @@ function EditRuleModal({ rule, onClose, onSaved }) {
     const r = await act(() => api(`/api/rules/${rule.rule_id}/${rule.version}`, {
       method: "PUT",
       body: { name, severity, regulatory_tag: tag || null, tree, description: res.summary },
-    }), "Draft updated");
+    }), "Draft updated — submit for review when ready");
     setBusy(false);
     if (r) onSaved(r);
   };
 
   return (
-    <Modal title={`Edit draft ${rule.rule_id} v${rule.version}`} sub="Change the guided checks. Live rules need a new version." size="xl" onClose={onClose} busy={busy}
+    <Modal title={`Edit draft · ${rule.rule_id} v${rule.version}`} sub="Change the guided checks, then return to the rule to submit for review." size="xl" onClose={onClose} busy={busy}
       footer={<>
-        <button className="btn" onClick={onClose} disabled={busy}>Cancel</button>
-        <button className="btn" disabled={busy} onClick={compose}>Preview</button>
-        <button className="btn primary" disabled={busy || !name.trim()} onClick={save}>{busy ? "Saving…" : "Save draft"}</button>
+        <button type="button" className="btn" onClick={onClose} disabled={busy}>Cancel</button>
+        <button type="button" className="btn" disabled={busy} onClick={compose}>Preview</button>
+        <button type="button" className="btn primary" disabled={busy || !name.trim()} onClick={save}>{busy ? "Saving…" : "Save draft"}</button>
       </>}>
       <div className="stack">
         {noTree && <div className="callout t4" style={{ fontSize: ".84rem" }}>This draft had no guided tree. Rebuild with the form below (replaces the old expression).</div>}
@@ -404,102 +321,396 @@ function EditRuleModal({ rule, onClose, onSaved }) {
   );
 }
 
-function RuleModal({ ruleId, persona, onChanged, onClose, nav }) {
+function primaryTransition(status) {
+  const next = NEXT[status] || [];
+  if (!next.length) return null;
+  if (status === "draft") return "in_review";
+  if (status === "in_review") return "approved";
+  if (status === "approved") return "active";
+  if (status === "shadow" || status === "canary") return "active";
+  if (status === "active") return "retired";
+  return next[0];
+}
+
+function RuleModal({ ruleId, persona, onChanged, onClose, onDeleted, nav, editIntent, onEditIntentHandled }) {
   const { data, reload } = useApi(`/api/rules/${ruleId}`, [ruleId]);
   const [ver, setVer] = useState(null);
   const [to, setTo] = useState(null);
   const [pct, setPct] = useState(10);
   const [editing, setEditing] = useState(false);
+  const [editSnapshot, setEditSnapshot] = useState(null);
+  const [deleting, setDeleting] = useState(false);
   const act = useAction();
+  const canEdit = canCap(persona, "editRules");
+
+  const openEditor = (rule) => {
+    setVer(rule.version);
+    setEditSnapshot(rule);
+    setEditing(true);
+  };
+
+  const newVersionFrom = async (src, { openEdit = false } = {}) => {
+    const body = src.tree
+      ? { rule_id: ruleId, name: src.name, description: src.description, tree: src.tree, severity: src.severity, category: src.category, regulatory_tag: src.regulatory_tag }
+      : {
+        rule_id: ruleId, name: src.name, description: src.description, field: src.field, severity: src.severity,
+        category: src.category, regulatory_tag: src.regulatory_tag, expression: src.expression, tests: src.tests || [], message: src.message,
+      };
+    const res = await act(() => api("/api/rules", { method: "POST", body }), (x) => `Draft v${x.version} ready — edit if needed, then submit for review`);
+    if (res) {
+      setVer(res.version);
+      await reload();
+      onChanged();
+      if (openEdit) openEditor(res);
+    }
+    return res;
+  };
+
+  useEffect(() => {
+    if (!editIntent || !data || data.rule_id !== ruleId || !canEdit) return;
+    const vs = data.versions;
+    const draft = vs.find((v) => v.status === "draft");
+    if (editIntent === "draft" && draft) {
+      openEditor(draft);
+      onEditIntentHandled?.();
+      return;
+    }
+    if (editIntent === "new-version") {
+      const src = vs.find((v) => v.status === "canary" || v.status === "active" || v.status === "approved" || v.status === "shadow" || v.status === "in_review") || vs[vs.length - 1];
+      onEditIntentHandled?.();
+      if (src?.status === "draft") openEditor(src);
+      else if (src && src.status !== "retired") newVersionFrom(src, { openEdit: false });
+    }
+  }, [editIntent, data, ruleId, canEdit]);
+
   if (!data || data.rule_id !== ruleId) return <Modal title="Loading…" size="lg" onClose={onClose} nav={nav}><Loading /></Modal>;
   const vs = data.versions;
-  const r = vs.find((v) => v.version === ver) || vs.find((v) => v.status === "canary" || v.status === "in_review" || v.status === "draft") || vs.find((v) => v.status === "active") || vs[vs.length - 1];
+  const r = vs.find((v) => v.version === ver) || vs.find((v) => v.status === "draft") || vs.find((v) => v.status === "in_review" || v.status === "canary") || vs.find((v) => v.status === "active") || vs[vs.length - 1];
   const stage = STAGES.find((s) => s.states.includes(r.status));
-  const canEdit = canCap(persona, "editRules");
+  const isAuthor = isRuleAuthor(persona, r);
+  const isSubmitter = isRuleSubmitter(persona, r);
+  const cannotApprove = isAuthor || isSubmitter;
+  const nexts = (NEXT[r.status] || []).filter((t) => !(t === "approved" && cannotApprove));
+  const primary = nexts.includes(primaryTransition(r.status)) ? primaryTransition(r.status) : (nexts.find((t) => t !== "draft") || nexts[0] || null);
+  const sendBack = nexts.includes("draft") ? "draft" : null;
+
   const move = async (comment) => {
+    if (to === "approved" && cannotApprove) {
+      return null; // maker-checker: never call the API as author/submitter
+    }
     const res = await act(() => api(`/api/rules/${ruleId}/${r.version}/transition`, { method: "POST", body: { to, comment: comment || `${human(to)} by ${persona.id}`, canary_pct: to === "canary" ? pct : undefined } }),
       (x) => (x.pending ? "Peer approval recorded. Compliance approval still required." : `${ruleId} v${r.version}: ${STATUS_LABEL[to] || human(to)}`));
     if (res) { reload(); onChanged(); }
     return res;
   };
-  const newVersion = async () => {
-    const body = r.tree
-      ? { rule_id: ruleId, name: r.name, description: r.description, tree: r.tree, severity: r.severity, category: r.category, regulatory_tag: r.regulatory_tag }
-      : {
-        rule_id: ruleId, name: r.name, description: r.description, field: r.field, severity: r.severity,
-        category: r.category, regulatory_tag: r.regulatory_tag, expression: r.expression, tests: r.tests || [], message: r.message,
-      };
-    const res = await act(() => api("/api/rules", { method: "POST", body }), (x) => `Draft v${x.version} created from v${r.version}`);
-    if (res) { setVer(res.version); reload(); onChanged(); }
+
+  const doDelete = async (reason) => {
+    const q = reason ? `?reason=${encodeURIComponent(reason)}` : "";
+    const res = await act(() => api(`/api/rules/${ruleId}${q}`, { method: "DELETE" }), () => `${ruleId} deleted`);
+    if (res) { onDeleted?.(); onClose(); }
+    return res;
   };
+
+  const startEdit = () => {
+    if (r.status === "draft") openEditor(r);
+    else if (r.status !== "retired") newVersionFrom(r, { openEdit: true });
+  };
+
+  const footer = (
+    <>
+      {canEdit && <button type="button" className="btn danger" onClick={() => setDeleting(true)}>Delete…</button>}
+      {canEdit && r.status !== "retired" && (
+        <button type="button" className="btn" onClick={startEdit}>{r.status === "draft" ? "Edit" : "Edit (new draft)"}</button>
+      )}
+      {!canEdit && <span className="lead faint">Switch to Dan · SME or Ana · Compliance to change this rule</span>}
+      {canEdit && r.status === "in_review" && cannotApprove && (
+        <span className="lead faint">Waiting for a peer — switch to Ana · Compliance to approve</span>
+      )}
+      {canEdit && sendBack && (
+        <button type="button" className="btn" onClick={() => setTo(sendBack)}>{ACTION_LABEL[sendBack]}…</button>
+      )}
+      {canEdit && primary && primary !== sendBack && (
+        <button type="button" className={`btn ${primary === "retired" ? "danger" : "primary"}`} onClick={() => setTo(primary)}>
+          {ACTION_LABEL[primary]}…
+        </button>
+      )}
+    </>
+  );
+
   return (
-    <Modal title={`${r.rule_id} · ${r.name}`} sub={`v${r.version} · ${STATUS_LABEL[r.status] || human(r.status)} · owner ${r.owner}${r.regulatory_tag ? ` · ${r.regulatory_tag}` : ""}`} size="lg" onClose={onClose} nav={nav}
-      footer={<>
-        {canEdit && r.status === "draft" && <button className="btn" onClick={() => setEditing(true)}>Edit draft…</button>}
-        {canEdit && r.status !== "draft" && r.status !== "retired" && <button className="btn" onClick={newVersion}>Edit as new version…</button>}
-        {(NEXT[r.status] || []).length && canEdit ? <><span className="lead faint">{STATUS_LABEL[r.status] || human(r.status)}{r.status === "canary" ? ` (${r.canary_pct}%)` : ""}</span>
-          {(NEXT[r.status] || []).map((t) => <button key={t} className={`btn ${t === "active" || t === "approved" ? "primary" : t === "retired" ? "danger" : ""}`} onClick={() => setTo(t)}>{ACTION_LABEL[t]}…</button>)}</>
-          : !canEdit ? <span className="lead faint">Switch to Dan · SME or Ana · Compliance to edit or move this rule</span> : null}
-      </>}>
+    <Modal title={r.name || r.rule_id} sub={`${r.rule_id} · v${r.version}${r.regulatory_tag ? ` · ${r.regulatory_tag}` : ""}`} size="lg" onClose={onClose} nav={nav} footer={footer}>
       <div className="stack">
-        <div className="lifecycle">{STAGES.map((s) => <div key={s.id} className={`st ${stage?.id === s.id ? "on" : ""}`}><b>{s.label}</b><span>{s.desc}</span></div>)}</div>
-        <div className="row">{vs.map((v) => <button key={v.version} className={`btn sm ${v.version === r.version ? "primary" : ""}`} onClick={() => setVer(v.version)}>v{v.version} · {STATUS_LABEL[v.status] || human(v.status)}{v.status === "canary" ? ` ${v.canary_pct}%` : ""}</button>)}</div>
-        <p className="muted">{r.summary || r.description}</p>
-        <dl className="kv"><dt>Field</dt><dd className="mono">{r.field}</dd><dt>Severity</dt><dd><span className={`pill ${r.severity === "FAIL" ? "fail" : "warn"}`}>{r.severity}</span></dd>
-          <dt>Category</dt><dd>{r.category}</dd><dt>Author</dt><dd>{r.author}</dd></dl>
+        <div className="callout" style={{ fontSize: ".9rem" }}>
+          <div className="row" style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <b>{STATUS_LABEL[r.status] || human(r.status)}{r.status === "canary" ? ` (${r.canary_pct}%)` : ""}</b>
+            <span className="row" style={{ gap: 6 }}>
+              <span className="chip">Author {r.author}</span>
+              {r.status === "in_review" && cannotApprove && <span className="chip">You authored / submitted this</span>}
+              {r.status === "in_review" && !cannotApprove && canEdit && <span className="chip">Your review needed</span>}
+            </span>
+          </div>
+          <p style={{ margin: "8px 0 0", fontSize: ".86rem" }}>
+            {r.status === "in_review" && cannotApprove
+              ? "Submitted. Switch to Ana · Compliance (or another SME) in the rail to approve — the same user cannot author and approve."
+              : NEXT_HELP[r.status]}
+          </p>
+        </div>
+
+        <div className="lifecycle">
+          {STAGES.map((s) => (
+            <div key={s.id} className={`st ${stage?.id === s.id ? "on" : ""}`}>
+              <b>{s.label}</b>
+              <span>{s.desc}</span>
+            </div>
+          ))}
+        </div>
+
+        {vs.length > 1 && (
+          <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+            <span className="eyebrow" style={{ marginRight: 4 }}>Versions</span>
+            {vs.map((v) => (
+              <button key={v.version} type="button" className={`btn sm ${v.version === r.version ? "primary" : ""}`} onClick={() => setVer(v.version)}>
+                v{v.version} · {STATUS_LABEL[v.status]?.split("—")[0]?.trim() || human(v.status)}
+              </button>
+            ))}
+          </div>
+        )}
+
+        <p className="muted" style={{ margin: 0 }}>{r.summary || r.description}</p>
+        <dl className="kv">
+          <dt>Field</dt><dd className="mono">{r.field || "—"}</dd>
+          <dt>Severity</dt><dd><span className={`pill ${r.severity === "FAIL" ? "fail" : "warn"}`}>{r.severity}</span></dd>
+          <dt>Category</dt><dd>{r.category}</dd>
+          <dt>Author</dt><dd>{r.author}</dd>
+        </dl>
+
         {r.tree ? (
-          <div className="callout" style={{ fontSize: ".88rem" }}>Guided rule — edit via the form. Runtime expression is kept for Glue.</div>
+          <p className="faint" style={{ fontSize: ".84rem", margin: 0 }}>Guided rule — use <b>Edit</b> to change it (creates a new draft if this version is already past Draft).</p>
         ) : (
           <pre className="code">{JSON.stringify(r.expression, null, 2)}</pre>
         )}
+
         <span className="eyebrow">Sample checks ({(r.tests || []).length})</span>
-        <div className="row">{(r.tests || []).map((t, i) => <span key={i} className={`pill ${t.expect ? "pass" : "fail"}`}>case {i + 1}: expect {t.expect ? "pass" : "fail"}</span>)}</div>
-        {r.history?.length > 0 && <div className="timeline">{r.history.slice().reverse().map((h, i) => <div key={i}><b>{STATUS_LABEL[h.to] || human(h.to)}</b> · {h.actor}{h.comment ? ` · ${h.comment}` : ""} · <span className="faint">{ago(h.ts)}</span></div>)}</div>}
-      </div>
-      {to && <ReasonModal title={`${ACTION_LABEL[to]}: ${r.rule_id} v${r.version}`} help={TRANSITION_HELP[to]} label="Comment (audited)" confirmLabel={ACTION_LABEL[to]}
-        danger={to === "retired"} required={["draft", "retired"].includes(to)} onClose={() => setTo(null)} onSubmit={move}
-        presets={to === "approved" ? ["Checks look right; matches the procedure"] : to === "draft" ? ["Please fix the sample checks"] : []}>
-        {to === "canary" && <Field id="cn-pct" label="Share of loans on the new version"><select id="cn-pct" className="input" value={pct} onChange={(e) => setPct(+e.target.value)}>
-          {[5, 10, 25, 50].map((x) => <option key={x} value={x}>{x}%</option>)}</select></Field>}
-        {(to === "shadow" || to === "canary" || to === "active" || to === "retired") && (
-          <p className="faint" style={{ fontSize: ".82rem" }}>This updates every live feed’s signed config.</p>
+        <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
+          {(r.tests || []).map((t, i) => (
+            <span key={i} className={`pill ${t.expect ? "pass" : "fail"}`}>case {i + 1}: expect {t.expect ? "pass" : "fail"}</span>
+          ))}
+        </div>
+
+        {r.history?.length > 0 && (
+          <div className="timeline">
+            {r.history.slice().reverse().map((h, i) => (
+              <div key={i}>
+                <b>{STATUS_LABEL[h.to]?.split("—")[0]?.trim() || human(h.to)}</b> · {h.actor}
+                {h.comment ? ` · ${h.comment}` : ""} · <span className="faint">{ago(h.ts)}</span>
+              </div>
+            ))}
+          </div>
         )}
-      </ReasonModal>}
-      {editing && <EditRuleModal rule={r} onClose={() => setEditing(false)} onSaved={() => { setEditing(false); reload(); onChanged(); }} />}
+      </div>
+
+      {to && (
+        <ReasonModal title={`${ACTION_LABEL[to]}: ${r.rule_id} v${r.version}`} help={TRANSITION_HELP[to]} label="Comment (audited)" confirmLabel={ACTION_LABEL[to]}
+          danger={to === "retired"} required={["draft", "retired"].includes(to)} onClose={() => setTo(null)} onSubmit={move}
+          presets={to === "approved" ? ["Checks look right; matches the procedure"] : to === "draft" ? ["Please fix the sample checks"] : []}>
+          {to === "canary" && (
+            <Field id="cn-pct" label="Share of loans on the new version">
+              <select id="cn-pct" className="input" value={pct} onChange={(e) => setPct(+e.target.value)}>
+                {[5, 10, 25, 50].map((x) => <option key={x} value={x}>{x}%</option>)}
+              </select>
+            </Field>
+          )}
+          {(to === "shadow" || to === "canary" || to === "active" || to === "retired") && (
+            <p className="faint" style={{ fontSize: ".82rem" }}>This updates every live feed’s signed config.</p>
+          )}
+        </ReasonModal>
+      )}
+
+      {deleting && (
+        <ReasonModal title={`Delete ${r.rule_id}?`} help="Removes every version of this rule. If it was live, feed configs are republished." label="Reason (audited)"
+          confirmLabel="Delete rule" danger required onClose={() => setDeleting(false)} onSubmit={doDelete}
+          presets={["Created by mistake", "Superseded", "No longer needed"]} />
+      )}
+
+      {editing && (editSnapshot || r.status === "draft") && (
+        <EditRuleModal
+          rule={editSnapshot || r}
+          onClose={() => { setEditing(false); setEditSnapshot(null); }}
+          onSaved={() => { setEditing(false); setEditSnapshot(null); reload(); onChanged(); }}
+        />
+      )}
     </Modal>
   );
 }
 
+function queueFromHash() {
+  const raw = (window.location.hash || "").replace(/^#/, "");
+  const qs = raw.includes("?") ? raw.slice(raw.indexOf("?") + 1) : "";
+  return new URLSearchParams(qs).get("queue") || "";
+}
+
 export default function Rules({ persona }) {
-  const { data, error, reload } = useApi("/api/rules");
+  const [queue, setQueue] = useState(() => queueFromHash()); // "" | awaiting_review | my_drafts
+  const path = queue === "awaiting_review" || queue === "my_drafts" ? `/api/rules?queue=${queue}` : "/api/rules";
+  const { data, error, reload } = useApi(path, [queue, persona.id]);
   const [sel, setSel] = useState(null);
+  const [editIntent, setEditIntent] = useState(null);
   const [authoring, setAuthoring] = useState(false);
+  const [deleteId, setDeleteId] = useState(null);
+  const act = useAction();
+  const { data: ntfData, reload: reloadNtf } = useApi("/api/notifications", [persona.id], { poll: 20000 });
+
+  useEffect(() => {
+    const sync = () => setQueue(queueFromHash());
+    window.addEventListener("hashchange", sync);
+    return () => window.removeEventListener("hashchange", sync);
+  }, []);
+
   if (!data) return <Loading error={error} />;
   const idx = data.rules.findIndex((r) => r.rule_id === sel);
   const canAuthor = canCap(persona, "authorRules");
   const canEdit = canCap(persona, "editRules");
+
+  const setQueueNav = (q) => {
+    setQueue(q);
+    window.location.hash = q ? `rules?queue=${q}` : "rules";
+  };
+
+  const closeRule = () => { setSel(null); setEditIntent(null); reloadNtf(); };
+
+  const deleteRule = async (ruleId, reason) => {
+    const q = reason ? `?reason=${encodeURIComponent(reason)}` : "";
+    const res = await act(() => api(`/api/rules/${ruleId}${q}`, { method: "DELETE" }), () => `${ruleId} deleted`);
+    if (res) {
+      setDeleteId(null);
+      if (sel === ruleId) setSel(null);
+      reload();
+    }
+    return res;
+  };
+
+  const unread = ntfData?.notifications?.filter((n) => !n.read_at).slice(0, 5) || [];
+  const markAllRead = async () => {
+    await api("/api/notifications/read-all", { method: "POST" });
+    reloadNtf();
+  };
+
   return (
     <>
-      <div className="page-head"><div><span className="eyebrow">Pillar 3.A · rules</span><h1>Rule Engine</h1>
-        <p className="sub">Build checks with fields and options — templates, a guided form, or optional AI assist. Peers review; try quietly or on a slice before going live.</p>
-        {!canEdit && <p className="faint" style={{ fontSize: ".84rem", marginTop: 6 }}>Signed in without SME/Compliance — switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> in the rail to author or move rules.</p>}</div>
-        {canAuthor && <button className="btn primary" onClick={() => setAuthoring(true)}>Author a rule</button>}</div>
-      {authoring && canAuthor && <AuthorModal persona={persona} onClose={() => setAuthoring(false)} onCreated={(id) => { reload(); setAuthoring(false); setSel(id); }} />}
-      <Panel pad={false} title={`${data.rules.length} rules`} sub="Open a rule to edit a draft, create a new version, or move it through review → try safely → live.">
-          <div className="tbl-wrap"><table className="tbl">
-            <thead><tr><th>Rule</th><th>Field</th><th>Severity</th><th>Tag</th><th>Versions</th><th className="r">Exceptions</th></tr></thead>
-            <tbody>{data.rules.map((r) => (
-              <tr key={r.rule_id} className={`click ${sel === r.rule_id ? "sel" : ""}`} onClick={() => setSel(r.rule_id)}>
-                <td><span className="mono">{r.rule_id}</span> {r.name}</td><td className="mono">{r.field}</td>
-                <td><span className={`pill ${r.severity === "FAIL" ? "fail" : "warn"}`}>{r.severity}</span></td><td>{r.regulatory_tag || <span className="faint">—</span>}</td>
-                <td><span className="row" style={{ gap: 4 }}>{r.versions.map(([v, s]) => <Status key={v} s={s} />)}</span></td>
-                <td className="r num">{fmt(r.exception_count)}</td>
-              </tr>))}</tbody>
-          </table></div>
+      <PageHeader
+        eyebrow="Setup"
+        title="Rules"
+        sub={<>Checks that hold a loan. Drafts need a second person before they go live.{!canEdit && <> Switch to <b>Dan · SME</b> or <b>Ana · Compliance</b> to add or move rules.</>}</>}
+        guideHref="#guide?path=setup&step=rules"
+        primary={canAuthor ? <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button> : null}
+      />
+
+      {unread.length > 0 && (
+        <div className="callout" style={{ marginBottom: 12, fontSize: ".88rem" }}>
+          <div className="row" style={{ justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <b>Notifications</b>
+            <button type="button" className="btn sm" onClick={markAllRead}>Mark all read</button>
+          </div>
+          <div className="stack" style={{ gap: 6, marginTop: 8 }}>
+            {unread.map((n) => (
+              <button key={n.id} type="button" className="btn" style={{ textAlign: "left", height: "auto", padding: "8px 10px" }}
+                onClick={async () => {
+                  await api(`/api/notifications/${n.id}/read`, { method: "POST" });
+                  reloadNtf();
+                  if (n.entity_id) { setQueueNav("awaiting_review"); setSel(n.entity_id); }
+                }}>
+                <b>{n.title}</b>
+                <div className="faint" style={{ fontSize: ".8rem", marginTop: 2 }}>{n.body}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {authoring && canAuthor && (
+        <AuthorModal
+          persona={persona}
+          onClose={() => setAuthoring(false)}
+          onCreated={(id) => { reload(); setAuthoring(false); setEditIntent(null); setSel(id); }}
+        />
+      )}
+
+      <div className="row" style={{ gap: 6, marginBottom: 12, flexWrap: "wrap" }}>
+        {[
+          ["", "All rules"],
+          ["awaiting_review", "Needs my review"],
+          ["my_drafts", "My drafts"],
+        ].map(([id, label]) => (
+          <button key={id || "all"} type="button" className={`btn sm ${queue === id ? "primary" : ""}`} onClick={() => setQueueNav(id)}>{label}</button>
+        ))}
+      </div>
+
+      <Panel
+        pad={false}
+        title={`${data.rules.length} rules${queue === "awaiting_review" ? " awaiting your review" : queue === "my_drafts" ? " you drafted" : ""}`}
+        sub="Open a row for the next step. Delete removes the rule entirely."
+      >
+        {!data.rules.length ? (
+          <EmptyState
+            title="No rules yet"
+            body="Author a draft, submit it for peer review, then promote to live."
+            action={canAuthor ? <button type="button" className="btn primary" onClick={() => setAuthoring(true)}>New rule</button> : null}
+          />
+        ) : (
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead>
+                <tr>
+                  <th>Rule</th><th>Field</th><th>Severity</th><th>Tag</th><th>Versions</th>
+                  <th className="r">Exceptions</th>
+                  {canEdit && <th></th>}
+                </tr>
+              </thead>
+              <tbody>
+                {data.rules.map((r) => (
+                  <tr key={r.rule_id} className={`click ${sel === r.rule_id ? "sel" : ""}`} onClick={() => { setEditIntent(null); setSel(r.rule_id); }}>
+                    <td><span className="mono">{r.rule_id}</span> {r.name}</td>
+                    <td className="mono">{r.field}</td>
+                    <td><span className={`pill ${r.severity === "FAIL" ? "fail" : "warn"}`}>{r.severity}</span></td>
+                    <td>{r.regulatory_tag || <span className="faint">—</span>}</td>
+                    <td><span className="row" style={{ gap: 4 }}>{r.versions.map(([v, s]) => <Status key={v} s={s} />)}</span></td>
+                    <td className="r num">{fmt(r.exception_count)}</td>
+                    {canEdit && (
+                      <td onClick={(e) => e.stopPropagation()}>
+                        <button type="button" className="btn sm danger" onClick={() => setDeleteId(r.rule_id)}>Delete</button>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Panel>
-      {sel && <RuleModal ruleId={sel} persona={persona} onChanged={reload} onClose={() => setSel(null)}
-        nav={{ label: idx >= 0 ? `${idx + 1} of ${data.rules.length}` : "", onPrev: idx > 0 ? () => setSel(data.rules[idx - 1].rule_id) : null,
-          onNext: idx >= 0 && idx < data.rules.length - 1 ? () => setSel(data.rules[idx + 1].rule_id) : null }} />}
+
+      {deleteId && (
+        <ReasonModal title={`Delete ${deleteId}?`} help="Removes every version. Live rules trigger a config republish." label="Reason (audited)"
+          confirmLabel="Delete rule" danger required onClose={() => setDeleteId(null)}
+          onSubmit={(reason) => deleteRule(deleteId, reason)}
+          presets={["Created by mistake", "Superseded", "No longer needed"]} />
+      )}
+
+      {sel && (
+        <RuleModal
+          ruleId={sel}
+          persona={persona}
+          onChanged={reload}
+          onClose={closeRule}
+          onDeleted={reload}
+          editIntent={editIntent}
+          onEditIntentHandled={() => setEditIntent(null)}
+          nav={{
+            label: idx >= 0 ? `${idx + 1} of ${data.rules.length}` : "",
+            onPrev: idx > 0 ? () => { setEditIntent(null); setSel(data.rules[idx - 1].rule_id); } : null,
+            onNext: idx >= 0 && idx < data.rules.length - 1 ? () => { setEditIntent(null); setSel(data.rules[idx + 1].rule_id); } : null,
+          }}
+        />
+      )}
     </>
   );
 }

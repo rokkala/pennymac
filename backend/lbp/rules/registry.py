@@ -19,7 +19,7 @@ import hashlib
 import json
 from typing import Protocol
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, delete, select
 
 from ..store import db
 from .jsonlogic import compile_logic, validate
@@ -63,6 +63,7 @@ class RuleStore(Protocol):
     def get(self, rule_id: str, version: int | None = None) -> dict | None: ...
     def list(self, status: str | None = None) -> list[dict]: ...
     def versions(self, rule_id: str) -> list[dict]: ...
+    def delete_all(self, rule_id: str) -> int: ...
 
 
 class SqlRuleStore:
@@ -94,6 +95,11 @@ class SqlRuleStore:
     def versions(self, rule_id):
         with db.get_engine().connect() as c:
             return [r[0] for r in c.execute(select(db.rules.c.body).where(db.rules.c.rule_id == rule_id).order_by(db.rules.c.version))]
+
+    def delete_all(self, rule_id):
+        with db.get_engine().begin() as c:
+            res = c.execute(delete(db.rules).where(db.rules.c.rule_id == rule_id))
+            return res.rowcount or 0
 
 
 class DynamoRuleStore:
@@ -130,6 +136,17 @@ class DynamoRuleStore:
         from boto3.dynamodb.conditions import Key
 
         return [_undecimal(i) for i in self.table.query(KeyConditionExpression=Key("rule_id").eq(rule_id))["Items"]]
+
+    def delete_all(self, rule_id):
+        from boto3.dynamodb.conditions import Key
+
+        items = self.table.query(KeyConditionExpression=Key("rule_id").eq(rule_id))["Items"]
+        n = 0
+        with self.table.batch_writer() as batch:
+            for it in items:
+                batch.delete_item(Key={"rule_id": it["rule_id"], "version": it["version"]})
+                n += 1
+        return n
 
 
 def _undecimal(o):
@@ -203,14 +220,30 @@ class RuleRegistry:
                 raise RuleError(f"{len(failed)} test case(s) failing: {failed}")
             body["test_results"] = results
         if to == "approved":
-            if actor == body.get("author"):
+            author = body.get("author") or body.get("owner")
+            if not author:
+                raise RuleError("maker-checker: rule has no author recorded; cannot approve")
+            if actor == author:
                 raise RuleError("maker-checker: the author cannot approve their own rule")
+            submitted_by = next(
+                (h.get("actor") for h in reversed(body.get("history") or []) if h.get("to") == "in_review"),
+                None,
+            )
+            if submitted_by and actor == submitted_by:
+                raise RuleError("maker-checker: the submitter cannot approve their own submission")
             body["approvals"] = [*body.get("approvals", []), {"actor": actor, "roles": roles, "ts": db.now().isoformat(), "comment": comment}]
             approver_roles = {r for a in body["approvals"] for r in a.get("roles", [])}
-            if body.get("regulatory_tag") and "compliance" not in approver_roles:
+            if body.get("regulatory_tag") and "compliance_reviewer" not in approver_roles and "compliance" not in approver_roles:
                 self.store.put(body, cur)
                 self._audit(actor, "rule.peer_approved", body)
-                return {**body, "status": cur, "pending": "compliance approval required"}
+                out = {**body, "status": cur, "pending": "compliance approval required"}
+                try:
+                    from ..notifications import on_rule_transition
+
+                    on_rule_transition(body, to, actor, pending=out["pending"])
+                except Exception:  # noqa: BLE001 - notifications must not block governance
+                    pass
+                return out
         if to == "canary":
             body["canary_pct"] = int(canary_pct if canary_pct is not None else body.get("canary_pct") or 1)
         if to == "active":
@@ -226,6 +259,12 @@ class RuleRegistry:
             from ..config_store import publish_all
 
             publish_all(actor, f"rule {rule_id} v{version} {to}")  # every feed's bundle carries the runtime rule set
+        try:
+            from ..notifications import on_rule_transition
+
+            on_rule_transition(body, to, actor)
+        except Exception:  # noqa: BLE001
+            pass
         return body
 
     # ------------------------------------------------------------- queries
@@ -242,6 +281,25 @@ class RuleRegistry:
 
     def versions(self, rule_id: str) -> list[dict]:
         return self.store.versions(rule_id)
+
+    def delete_rule(self, rule_id: str, actor: str, reason: str | None = None) -> dict:
+        """Hard-delete every version of a rule. Republishes live feeds if any version was running."""
+        vs = self.store.versions(rule_id)
+        if not vs:
+            raise RuleError(f"rule {rule_id} not found")
+        was_live = any(v.get("status") in ("active", "canary", "shadow") for v in vs)
+        n = self.store.delete_all(rule_id)
+        with db.get_engine().begin() as c:
+            db.audit(c, actor, "rule.delete", "rule", rule_id, {
+                "versions_removed": n,
+                "reason": reason,
+                "statuses": [v.get("status") for v in vs],
+            })
+        if was_live:
+            from ..config_store import publish_all
+
+            publish_all(actor, f"rule {rule_id} deleted")
+        return {"ok": True, "rule_id": rule_id, "versions_removed": n, "republished": was_live}
 
     def seed_defaults(self, actor: str = "system") -> int:
         from .default_rules import DEFAULT_RULES

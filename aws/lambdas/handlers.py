@@ -75,6 +75,8 @@ def route_batch(event, _ctx):
     batch_id = event["batch_id"]
     with db.get_engine().connect() as c:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        if not b:
+            raise ValueError(f"unknown batch {batch_id}")
         fmt = c.execute(select(db.sources.c.format).where(db.sources.c.source_id == b.source_id)).scalar()
     spark = (b.load_type or "full") == "full" and fmt in ("csv", "txt", "psv", "dat") and (b.total_rows or 0) > SPARK_THRESHOLD_ROWS \
         and (b.checkpoint or 0) == 0
@@ -94,6 +96,8 @@ def finalize_batch(event, _ctx):
     batch_id = event["batch_id"]
     with db.get_engine().connect() as c:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        if not b:
+            raise ValueError(f"unknown batch {batch_id}")
         follow = [r[0] for r in c.execute(select(db.batches.c.batch_id).where(
             db.batches.c.source_id == b.source_id, db.batches.c.status == "queued", db.batches.c.batch_id != batch_id,
             db.batches.c.load_type != "full").order_by(db.batches.c.sequence))] if b.status == "completed" else []
@@ -109,11 +113,20 @@ def mark_failed(event, _ctx):
 
     batch_id = event.get("batch_id")
     err = json.dumps(event.get("error", {}))[:2000]
+    # force=true: reopen a completed batch for re-persist tests (also resets checkpoint).
+    force = bool(event.get("force"))
+    values = {"status": "failed", "error": err, "worker_id": None}
+    if force:
+        values["checkpoint"] = 0
+        values["finished_at"] = None
     with db.get_engine().begin() as c:
-        c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status != "completed")
-                  .values(status="failed", error=err, worker_id=None))
-        db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err})
-    return {"batch_id": batch_id, "status": "failed"}
+        q = db.batches.update().where(db.batches.c.batch_id == batch_id)
+        if not force:
+            # Never clobber an active worker (e.g. duplicate SFN for the same batch hit BatchBusyError).
+            q = q.where(db.batches.c.status.notin_(("completed", "running", "pausing")))
+        c.execute(q.values(**values))
+        db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err, "force": force})
+    return {"batch_id": batch_id, "status": "failed", "force": force}
 
 
 # ---------------------------------------------------------------- 4. delivery scheduler
@@ -144,6 +157,35 @@ def migrate(_event, _ctx):
     if code:
         raise RuntimeError(f"migration failed: {out}")
     return out
+
+
+def demo_setup(event, _ctx):
+    """Load the compact demo scenario into RDS. Invoked directly; not exposed on the API."""
+    import os
+
+    os.environ["LBP_DATA_DIR"] = "/tmp/lbp-data"
+    from lbp import config
+    from lbp.demo_setup import DemoSetupConflict, run_demo_setup
+    from lbp.store import db
+
+    config.reset_settings()
+    db.reset_engine()
+    event = event or {}
+    if event.get("reset"):
+        from sqlalchemy import text
+
+        with db.get_engine().begin() as conn:
+            names = [r[0] for r in conn.execute(text(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+            ))]
+            if names:
+                conn.execute(text("TRUNCATE " + ", ".join(f'"{n}"' for n in names) + " RESTART IDENTITY CASCADE"))
+        db.reset_engine()
+    try:
+        result = run_demo_setup(scale=event.get("scale") or "compact", force=bool(event.get("force")))
+    except DemoSetupConflict as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, **result.to_dict()}
 
 
 # ---------------------------------------------------------------- API (control plane)

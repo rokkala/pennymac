@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api, scoped } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Loading, Kpis, Modal, Tabs, fmt, ago, human, useDialog } from "../ui.jsx";
+import { useApi, useAction, Panel, Status, Loading, Kpis, Modal, Tabs, fmt, ago, human, useDialog, PageHeader, EmptyState, ActionBar } from "../ui.jsx";
 
 const TZS = ["America/New_York", "America/Chicago", "America/Denver", "America/Phoenix", "America/Los_Angeles", "UTC", "Europe/London", "Asia/Kolkata"];
 const DOW = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
@@ -215,11 +215,13 @@ export default function Deliveries({ persona }) {
   const due24 = all.filter((d) => d.status === "expected" && new Date(d.due_at) - Date.now() < 24 * 3600e3 && new Date(d.due_at) > Date.now()).length;
   return (
     <>
-      <div className="page-head">
-        <div><span className="eyebrow">Workflow 2 · vendor deliveries</span><h1>Vendor Deliveries</h1>
-          <p className="sub">When each vendor's file is due, what arrived, and what is late. Files are processed the moment they land; the scheduler watches deadlines, pulls from vendors that don't push, and alerts when a file is late or missing.</p></div>
-        {canSched && <button className="btn primary" onClick={() => setEdit({})}>New schedule</button>}
-      </div>
+      <PageHeader
+        eyebrow="Setup"
+        title="Delivery schedule"
+        sub="See who is late and who is due next."
+        guideHref="#guide?path=setup&step=schedule"
+        primary={canSched ? <button type="button" className="btn primary" onClick={() => setEdit({})}>New schedule</button> : null}
+      />
       <Kpis items={[
         { label: "Due in next 24 h", value: due24 },
         { label: "Late or missed", value: all.filter((d) => ["late", "missed"].includes(d.status)).length, detail: "open, not waived" },
@@ -231,7 +233,7 @@ export default function Deliveries({ persona }) {
           actions={<Tabs value={filter} onChange={setFilter} tabs={[{ id: "attention", label: "Needs attention" }, { id: "expected", label: "Expected" }, { id: "received", label: "Received" }, { id: "all", label: "All" }]} />}>
           <div className="tbl-wrap"><table className="tbl">
             <thead><tr><th>Due</th><th>Vendor · feed</th><th>Status</th><th>File(s)</th><th></th></tr></thead>
-            <tbody>{shown.length === 0 ? <tr><td colSpan={5}><div className="empty">{filter === "attention" ? "Nothing needs attention." : "No deliveries in this view."}</div></td></tr> : shown.map((d) => (
+            <tbody>{shown.length === 0 ? <tr><td colSpan={5}><EmptyState title={filter === "attention" ? "Nothing needs attention" : "No deliveries in this view"} body="Switch the board filter, or open Schedules below." /></td></tr> : shown.map((d) => (
               <tr key={d.delivery_id}>
                 <td><b className="num">{d.local_label}</b><div className="faint" style={{ fontSize: ".76rem" }}>{until(d.due_at)}</div></td>
                 <td>{d.vendor_name || d.source_name}<div className="faint" style={{ fontSize: ".76rem" }}>{d.vendor_name && d.vendor_name !== d.source_name ? `${d.source_name} · ` : ""}{d.schedule_name}</div></td>
@@ -259,7 +261,7 @@ export default function Deliveries({ persona }) {
       <Panel title="Schedules" sub="Timetables live in the application (per-vendor timezone and business calendar); changes need a second approver" pad={false}>
         <div className="tbl-wrap"><table className="tbl">
           <thead><tr><th>Schedule</th><th>Vendor · feed</th><th>When</th><th>Channel</th><th>Next due</th><th className="r">On time (30 d)</th><th>Status</th><th></th></tr></thead>
-          <tbody>{sch.data.schedules.length === 0 ? <tr><td colSpan={8}><div className="empty">No schedules yet. Add one per vendor feed.</div></td></tr> : sch.data.schedules.map((x) => {
+          <tbody>{sch.data.schedules.length === 0 ? <tr><td colSpan={8}><EmptyState title="No schedules yet" body="Add one per vendor feed that needs a timetable." action={canSched ? <button type="button" className="btn primary" onClick={() => setEdit({})}>New schedule</button> : null} /></td></tr> : sch.data.schedules.map((x) => {
             const cfg = x.config || x.proposed || {};
             const pending = !!x.proposed;
             const canDecide = canApprove && persona.id !== x.proposed_by;
@@ -273,13 +275,16 @@ export default function Deliveries({ persona }) {
                 <td className="r num">{x.stats_30d?.on_time_pct ?? "—"}{x.stats_30d?.on_time_pct != null ? "%" : ""}</td>
                 <td><Status s={x.status} />{pending && x.status !== "pending_approval" && <span className="pill warn" style={{ marginLeft: 4 }}>change pending</span>}
                   {pending && <div className="faint" style={{ fontSize: ".74rem" }}>proposed by {x.proposed_by}{x.proposed?.cron && x.config && x.proposed.cron !== x.config.cron ? ` · ${x.config.cron} → ${x.proposed.cron}` : ""}</div>}</td>
-                <td className="r"><span className="row" style={{ gap: 4, justifyContent: "flex-end", flexWrap: "nowrap" }}>
-                  {pending && canDecide && <><button className="btn sm primary" onClick={() => decide(x, true)}>Approve…</button>
-                    <button className="btn sm" onClick={() => decide(x, false)}>Reject…</button></>}
+                <td className="r"><ActionBar
+                  primary={pending && canDecide ? <button type="button" className="btn sm primary" onClick={() => decide(x, true)}>Approve…</button>
+                    : canSched && x.status === "paused" ? <button type="button" className="btn sm primary" onClick={() => act(() => api(`/api/schedules/${x.schedule_id}/status`, { method: "POST", body: { status: "active" } }), "Resumed").then(reloadAll)}>Resume</button>
+                    : null}
+                >
+                  {pending && canDecide && <button type="button" className="btn sm" onClick={() => decide(x, false)}>Reject…</button>}
                   {pending && canApprove && persona.id === x.proposed_by && <span className="faint" style={{ fontSize: ".74rem" }}>Awaiting another approver</span>}
-                  {canSched && x.status === "active" && <button className="btn sm" onClick={() => pause(x)}>Pause…</button>}
-                  {canSched && x.status === "paused" && <button className="btn sm" onClick={() => act(() => api(`/api/schedules/${x.schedule_id}/status`, { method: "POST", body: { status: "active" } }), "Resumed").then(reloadAll)}>Resume</button>}
-                  {canSched && ["active", "paused", "pending_approval"].includes(x.status) && <button className="btn sm" onClick={() => setEdit(x)}>Change…</button>}</span></td>
+                  {canSched && x.status === "active" && <button type="button" className="btn sm" onClick={() => pause(x)}>Pause…</button>}
+                  {canSched && ["active", "paused", "pending_approval"].includes(x.status) && <button type="button" className="btn sm" onClick={() => setEdit(x)}>Change…</button>}
+                </ActionBar></td>
               </tr>);
           })}</tbody>
         </table></div>

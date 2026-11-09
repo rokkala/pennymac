@@ -109,8 +109,9 @@ class ExceptionManager:
     # ------------------------------------------------------------------ reads
     def list(self, status: str | None = None, tier: str | None = None, queue: str | None = None, batch_id: str | None = None,
              rule_id: str | None = None, source_id: str | None = None, q: str | None = None, limit: int = 100, offset: int = 0,
-             source_ids: list[str] | None = None) -> dict:
+             source_ids: list[str] | None = None, loaded_on: str | None = None) -> dict:
         t = db.exceptions
+        b = db.batches
         conds = []
         if status == "open":
             conds.append(t.c.status.in_(OPEN_STATES))
@@ -123,17 +124,35 @@ class ExceptionManager:
             conds.append(t.c.source_id.in_(source_ids or ["-"]))
         if q:
             conds.append(t.c.loan_number.like(f"%{q}%"))
+        if loaded_on:
+            # calendar day of the batch load (UTC date of started_at, else created_at)
+            load_ts = func.coalesce(b.c.started_at, b.c.created_at)
+            conds.append(func.date(load_ts) == loaded_on)
+        join = t.outerjoin(b, b.c.batch_id == t.c.batch_id)
         where = and_(*conds) if conds else True
         with db.get_engine().connect() as c:
-            total = c.execute(select(func.count()).select_from(t).where(where)).scalar()
-            rows = c.execute(select(t).where(where).order_by(t.c.created_at.desc(), t.c.exception_id).limit(limit).offset(offset)).all()
+            total = c.execute(select(func.count()).select_from(join).where(where)).scalar()
+            rows = c.execute(
+                select(t, b.c.filename.label("filename"),
+                       func.coalesce(b.c.started_at, b.c.created_at).label("loaded_at"))
+                .select_from(join).where(where)
+                .order_by(func.coalesce(b.c.started_at, b.c.created_at).desc().nullslast(),
+                          t.c.created_at.desc(), t.c.exception_id)
+                .limit(limit).offset(offset)
+            ).all()
             from ..vendors import names_by_source
 
             names = names_by_source(c)
-        items = [db.row_to_dict(r) for r in rows]
-        for it in items:
+        items = []
+        for r in rows:
+            it = db.row_to_dict(r)
+            # row_to_dict may include joined labels; normalize
+            it["filename"] = getattr(r, "filename", None) or it.get("filename")
+            loaded = getattr(r, "loaded_at", None) or it.get("loaded_at")
+            it["loaded_at"] = loaded.isoformat() + "Z" if hasattr(loaded, "isoformat") else loaded
             n = names.get(it.get("source_id")) or {}
             it["vendor_id"], it["vendor_name"], it["feed_name"] = n.get("vendor_id"), n.get("vendor_name"), n.get("feed_name")
+            items.append(it)
         from ..ingestion.pii import mask_value
 
         for it in items:  # list views never carry raw NPI
@@ -147,6 +166,51 @@ class ExceptionManager:
                                                             for k in ("value", "previous", "vendor") if k in pr}}
         return {"total": total, "items": items}
 
+    def loads(self, status: str | None = "open", source_ids: list[str] | None = None, vendor_id: str | None = None,
+              tier: str | None = None) -> dict:
+        """Distinct file loads that have exceptions — options for vendor / file / date filters."""
+        t, b = db.exceptions, db.batches
+        conds = []
+        if status == "open":
+            conds.append(t.c.status.in_(OPEN_STATES))
+        elif status:
+            conds.append(t.c.status == status)
+        if tier:
+            conds.append(t.c.tier == tier)
+        if source_ids is not None:
+            conds.append(t.c.source_id.in_(source_ids or ["-"]))
+        where = and_(*conds) if conds else True
+        load_ts = func.coalesce(b.c.started_at, b.c.created_at)
+        with db.get_engine().connect() as c:
+            from ..vendors import names_by_source
+
+            names = names_by_source(c)
+            if vendor_id:
+                sids = [sid for sid, n in names.items() if n.get("vendor_id") == vendor_id]
+                where = and_(where, t.c.source_id.in_(sids or ["-"]))
+            rows = c.execute(
+                select(t.c.batch_id, t.c.source_id, b.c.filename, load_ts.label("loaded_at"), func.count().label("open_count"))
+                .select_from(t.outerjoin(b, b.c.batch_id == t.c.batch_id))
+                .where(where).group_by(t.c.batch_id, t.c.source_id, b.c.filename, load_ts)
+                .order_by(load_ts.desc().nullslast())
+            ).all()
+        out = []
+        for r in rows:
+            n = names.get(r.source_id) or {}
+            loaded = r.loaded_at
+            iso = loaded.isoformat() + "Z" if hasattr(loaded, "isoformat") else None
+            out.append({
+                "batch_id": r.batch_id,
+                "source_id": r.source_id,
+                "filename": r.filename,
+                "loaded_at": iso,
+                "loaded_on": iso[:10] if iso else None,
+                "vendor_id": n.get("vendor_id"),
+                "vendor_name": n.get("vendor_name"),
+                "feed_name": n.get("feed_name"),
+                "open_count": r.open_count,
+            })
+        return {"loads": out}
     def get(self, exception_id: str, roles: list[str] | None = None) -> dict:
         with db.get_engine().connect() as c:
             row = c.execute(select(db.exceptions).where(db.exceptions.c.exception_id == exception_id)).first()
@@ -246,14 +310,17 @@ class ExceptionManager:
         return {"exception_id": exception_id, "status": "resolved", "loan_boarded": boarded}
 
     def checker_decision(self, exception_id: str, actor: str, roles: list[str], approve: bool, comment: str | None = None) -> dict:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
             if ex["status"] != "pending_checker":
                 raise ExceptionActionError("exception is not awaiting a checker")
             if actor == ex["maker"]:
                 raise ExceptionActionError("maker-checker: checker must be a different user from the maker")
-            if not set(roles) & {"checker", "compliance", "admin"}:
-                raise ExceptionActionError("checker role required")
+            if not set(roles) & {"monitoring_reviewer", "admin"}:
+                raise ExceptionActionError("monitoring reviewer role required")
             if not approve:
                 self._set(c, exception_id, status="open", checker=actor)
                 db.audit(c, actor, "exception.checker_reject", "exception", exception_id, {"comment": comment})
@@ -265,9 +332,12 @@ class ExceptionManager:
         return {"exception_id": exception_id, "status": "resolved", "loan_boarded": boarded}
 
     def reject_loan(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
-            if ex["tier"] == "T5" and "compliance" not in roles:
+            if ex["tier"] == "T5" and "compliance_reviewer" not in roles and "admin" not in roles:
                 raise ExceptionActionError("only Compliance can act on T5 exceptions")
             c.execute(db.exceptions.update().where(and_(db.exceptions.c.staging_id == ex["staging_id"],
                                                         db.exceptions.c.status.in_(OPEN_STATES)))
@@ -285,7 +355,10 @@ class ExceptionManager:
 
     def compliance_clear(self, exception_id: str, actor: str, roles: list[str], value, comment: str) -> dict:
         """Compliance has investigated outside EM (e.g. OFAC false positive) and records the outcome."""
-        if "compliance" not in roles:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
+        if "compliance_reviewer" not in roles and "admin" not in roles:
             raise ExceptionActionError("Compliance role required")
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
