@@ -1,0 +1,124 @@
+import copy
+
+from lbp.multifile.layout import (
+    AGG_OPS,
+    DEFAULT_READINESS,
+    NORMALIZERS,
+    SUPPORTED_MODES,
+    LayoutError,
+    normalize_layout,
+    validate_layout,
+)
+
+
+def layout():
+    return {
+        "files": [
+            {"role": "master", "entity": "loan", "name_pattern": r"loans_(?P<date>\d{8})\.csv", "key": ["loan_id"], "required": True},
+            {"role": "fees", "name_pattern": r"fees_(?P<date>\d{8})\.csv", "required": False},
+        ],
+        "relations": [
+            {"detail": "fees", "to": "master", "on": [{"parent": "loan_id", "detail": "loan_ref"}], "mode": "merge"},
+        ],
+    }
+
+
+def test_constants():
+    assert SUPPORTED_MODES == {"merge", "aggregate"}
+    assert NORMALIZERS == ("trim", "strip_leading_zeros", "upper")
+    assert "concat_distinct" in AGG_OPS and len(AGG_OPS) == 8
+    assert DEFAULT_READINESS["on_timeout"] == "alert_only"
+    assert issubclass(LayoutError, ValueError)
+
+
+def test_valid_minimal_layout_has_no_errors():
+    assert validate_layout(layout(), None) == []
+
+
+def test_exactly_one_master_required():
+    none = layout()
+    none["files"][0]["role"] = "loans"
+    none["relations"][0]["to"] = "loans"
+    assert any("master" in e for e in validate_layout(none, None))
+    two = layout()
+    two["files"][1]["role"] = "master"
+    assert any("master" in e for e in validate_layout(two, None))
+
+
+def test_unsupported_mode_rejected():
+    for mode in ("flatten", "child"):
+        lay = layout()
+        lay["relations"][0]["mode"] = mode
+        assert any("not yet supported" in e for e in validate_layout(lay, None))
+
+
+def agg_layout(*names):
+    lay = layout()
+    lay["relations"][0]["mode"] = "aggregate"
+    lay["relations"][0]["aggregate"] = {"columns": [{"as": n, "op": "sum", "col": "fee_amt"} for n in names]}
+    return lay
+
+
+def test_duplicate_output_column_rejected():
+    assert validate_layout(agg_layout("total", "other"), None) == []
+    assert any("total" in e for e in validate_layout(agg_layout("total", "total"), None))
+    errs = validate_layout(agg_layout("loan_id"), None, columns={"master": ["loan_id", "x"]})
+    assert any("loan_id" in e for e in errs)
+
+
+def test_unknown_normalizer_and_agg_op_rejected():
+    lay = layout()
+    lay["relations"][0]["normalize"] = ["trim", "reverse"]
+    assert any("reverse" in e for e in validate_layout(lay, None))
+    lay = agg_layout("total")
+    lay["relations"][0]["aggregate"]["columns"][0]["op"] = "median"
+    assert any("median" in e for e in validate_layout(lay, None))
+
+
+def test_relation_must_reference_declared_roles():
+    lay = layout()
+    lay["relations"][0]["detail"] = "ghost"
+    assert any("ghost" in e for e in validate_layout(lay, None))
+    lay = layout()
+    lay["relations"][0]["to"] = "nowhere"
+    assert any("nowhere" in e for e in validate_layout(lay, None))
+
+
+def test_key_parts_count_must_match():
+    lay = layout()
+    lay["relations"][0]["on"].append({"parent": "x", "detail": "y"})
+    assert any("key" in e for e in validate_layout(lay, None))
+
+
+def test_readiness_timeout_policy_rules():
+    lay = layout()
+    ready = {"on_timeout": "load_master_only"}
+    assert validate_layout(lay, ready) == []
+    lay["files"][1]["required"] = True
+    assert any("load_master_only" in e for e in validate_layout(lay, ready))
+    assert any("on_timeout" in e for e in validate_layout(lay, {"on_timeout": "bogus"}))
+
+
+def test_normalize_layout_fills_defaults_without_mutating():
+    lay = layout()
+    before = copy.deepcopy(lay)
+    out = normalize_layout(lay)
+    assert lay == before
+    rel = out["relations"][0]
+    assert rel["join"] == "left" and rel["cardinality"] == "many"
+    assert rel["on_orphan_detail"] == "exception" and rel["on_missing_detail"] == "allow"
+    assert rel["on_duplicate_master"] == "reject_all" and rel["min_match_rate"] == 0.0
+    assert rel["normalize"] == ["trim"]
+    rel["normalize"].append("upper")
+    assert DEFAULT_READINESS["require"] == "all_required"
+    assert normalize_layout(lay)["relations"][0]["normalize"] == ["trim"]
+
+
+def test_name_pattern_must_compile_and_named_groups_required_for_pairing():
+    lay = layout()
+    lay["files"][1]["name_pattern"] = "fees_("
+    assert any("regex" in e for e in validate_layout(lay, None))
+    lay = layout()
+    lay["files"][1]["name_pattern"] = r"fees_\d{8}\.csv"
+    assert any("fees" in e and "group" in e for e in validate_layout(lay, {"pairing": "business_date"}))
+    assert validate_layout(lay, {"pairing": "window_minutes", "window_minutes": 30}) == []
