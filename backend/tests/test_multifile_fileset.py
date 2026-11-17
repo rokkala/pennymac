@@ -417,3 +417,94 @@ def test_batch_is_linked_to_its_set_when_inserted(env, feed, monkeypatch):
     a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
     _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
     assert seen == [(a["set_id"], "consumed")]
+
+
+# ------------------------------------------------------------------ Task 10 rulings (Q, strict)
+def test_safe_message_withholds_text_of_other_errors(env, feed, monkeypatch):
+    """Only our own errors keep their text; any other error (a DeliveryError can quote a column value) is reduced
+    to its class name and a fixed phrase in override.error, the audit log and alerts."""
+    from lbp.multifile.fileset import _safe_message
+    from lbp.pipeline.delivery import DeliveryError
+    from lbp.scheduling import service as sched
+
+    assert "fst_1" in _safe_message(FileSetError("file set fst_1 is consumed"))
+    assert "bat_9" in _safe_message(DuplicateFileError("bat_9", T0))
+    leaky = _safe_message(DeliveryError("column ssn value 123-45-6789 is not a sequence"))
+    assert "123-45-6789" not in leaky and leaky.startswith("DeliveryError")
+    assert "123-45-6789" not in _safe_message(ValueError("bad value 123-45-6789"))
+    assert "123-45-6789" not in _safe_message(KeyError("123-45-6789"))
+    real = sched.match_arrival
+
+    def boom(c, source_id, batch_id, fname):
+        raise DeliveryError("first row has value 123-45-6789")
+
+    monkeypatch.setattr(sched, "match_arrival", boom)
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with pytest.raises(DeliveryError):
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    expire_sets(T0 + timedelta(minutes=5))
+    s = _set(a["set_id"])
+    assert s.override["error"]["message"].startswith("DeliveryError") and "123-45-6789" not in str(s.override)
+    assert "123-45-6789" not in str([r.detail for r in _audit("file_set.error")])
+    assert _alerts("file_set_error") and "123-45-6789" not in str(_alerts("file_set_error"))
+    monkeypatch.setattr(sched, "match_arrival", real)
+
+
+def _consumed_meanwhile(monkeypatch):
+    """create_batch_for_set as if another worker queued the set just before this call."""
+    from lbp.multifile import fileset
+
+    real = fileset.create_batch_for_set
+
+    def raced(set_id, actor, **kw):
+        real(set_id, "other-worker", **kw)
+        return real(set_id, actor, **kw)  # the set is consumed now
+
+    monkeypatch.setattr(fileset, "create_batch_for_set", raced)
+
+
+def test_set_already_consumed_is_a_benign_no_op(env, feed, monkeypatch):
+    # attach: the set became ready but another worker queued it first -> the attach reports it, no error recorded
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    _consumed_meanwhile(monkeypatch)
+    b = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    s = _set(a["set_id"])
+    assert b["status"] == "consumed" and b["batch_id"] == s.batch_id and len(_batches(feed)) == 1
+    assert not (s.override or {}).get("error") and not _audit("file_set.error")
+    monkeypatch.undo()
+    # sweep: a ready set without a batch that another worker queues meanwhile -> no error, no alert
+    _fail_arrival_for(monkeypatch, "loans_20261118.csv")
+    m = _attach(env, feed, "loans_20261118.csv", MASTER + "3,300\n", T0)
+    with pytest.raises(RuntimeError):
+        _attach(env, feed, "borrowers_20261118.csv", BORR + "3,Cy\n", T0 + timedelta(minutes=1))
+    monkeypatch.undo()
+    _consumed_meanwhile(monkeypatch)
+    expire_sets(T0 + timedelta(minutes=5))
+    s = _set(m["set_id"])
+    assert s.status == "consumed" and s.batch_id and not (s.override or {}).get("error")
+    assert not _audit("file_set.error") and not _alerts("file_set_error")
+
+
+def test_strict_false_records_a_failed_set_batch(env, feed):
+    """strict=False (unattended arrivals) behaves like create_batch(strict=False): a set whose batch cannot be
+    sequenced is recorded as a failed batch with the reason instead of raising."""
+    from lbp.pipeline.delivery import DeliveryError
+
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with db.get_engine().begin() as c:
+        vid = c.execute(select(db.sources.c.vendor_id).where(db.sources.c.source_id == feed)).scalar()
+        c.execute(update(db.vendors).where(db.vendors.c.vendor_id == vid).values(status="suspended"))
+    with pytest.raises(DeliveryError):  # strict (the API): raised, the set stays ready
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    assert _set(a["set_id"]).status == "ready" and _batches(feed) == []
+    bid = create_batch_for_set(a["set_id"], "s3-intake", strict=False)
+    b = _batches(feed)[0]
+    assert b.batch_id == bid and b.status == "failed" and "suspended" in b.error and b.file_set_id == a["set_id"]
+    assert _set(a["set_id"]).status == "consumed"
+    # attach_file(strict=False) passes it down
+    m = attach_file(feed, "loans_20261118.csv", _file(env, "loans_20261118.csv", MASTER + "3,300\n"), "s3-intake", strict=False,
+                    arrived_at=T0)
+    done = attach_file(feed, "borrowers_20261118.csv", _file(env, "borrowers_20261118.csv", BORR + "3,Cy\n"), "s3-intake",
+                       strict=False, arrived_at=T0)
+    assert done["set_id"] == m["set_id"] and done["batch_id"] and done["status"] == "consumed"
+    assert next(x for x in _batches(feed) if x.batch_id == done["batch_id"]).status == "failed"

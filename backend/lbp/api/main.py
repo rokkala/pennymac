@@ -77,6 +77,7 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/mappings/{mapping_id}/approve"): ONBOARDING_REVIEW,
     ("POST", "/api/upload"): ("monitoring",),
     ("POST", "/api/upload/presign"): ("monitoring",),
+    ("POST", "/api/upload/set"): ("monitoring",),
     ("POST", "/api/batches/{batch_id}/pause"): ("monitoring",),
     ("POST", "/api/batches/{batch_id}/resume"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/override-preflight"): ("onboarding_reviewer", "compliance_reviewer"),
@@ -315,6 +316,12 @@ def _save_upload(f: UploadFile) -> Path:
                 dest.unlink(missing_ok=True)
                 raise HTTPException(413, f"file exceeds the {get_settings().max_upload_mb} MB limit")
             out.write(chunk)
+    _check_upload_content(dest, ext, limit)
+    return dest
+
+
+def _check_upload_content(dest: Path, ext: str, limit: int) -> None:
+    """Content checks on a saved upload (removed when refused): Excel must be a sane workbook, text not binary."""
     head = dest.open("rb").read(8192)
     if ext in (".xlsx", ".xlsm"):
         if head[:2] != b"PK":
@@ -332,7 +339,85 @@ def _save_upload(f: UploadFile) -> Path:
     elif b"\x00" in head or head[:2] in (b"MZ", b"\x7fE"):
         dest.unlink(missing_ok=True)
         raise HTTPException(415, "binary content is not a delimited text file")
-    return dest
+
+
+ZIP_MAX_MEMBERS = 20
+ZIP_TOTAL_FACTOR = 20  # total uncompressed size of an archive: at most this many upload limits (as for workbooks)
+
+
+def _extract_zip(f: UploadFile) -> list[tuple[str, Path]]:
+    """Save an uploaded zip (size-capped) and extract its members to the upload dir under sanitized names.
+    Refused: path traversal, absolute or nested names, folders, links, encrypted or duplicate members, types
+    not allowed for upload, more than ZIP_MAX_MEMBERS members, a member (as declared and as actually
+    decompressed) over the upload limit, a total over ZIP_TOTAL_FACTOR limits. Nothing is left on refusal."""
+    import stat
+    import zipfile
+    import zlib
+
+    mb = get_settings().max_upload_mb
+    limit = mb * 1024 * 1024
+    archive = upload_dir() / f"{uuid.uuid4().hex[:12]}_set.zip"
+    out: list[tuple[str, Path]] = []
+    try:
+        size = 0
+        with archive.open("wb") as w:
+            while chunk := f.file.read(1 << 20):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(413, f"file exceeds the {mb} MB limit")
+                w.write(chunk)
+        try:
+            z = zipfile.ZipFile(archive)
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "not a valid zip archive") from None
+        with z:
+            infos = z.infolist()
+            if not infos:
+                raise HTTPException(400, "the zip archive is empty")
+            if len(infos) > ZIP_MAX_MEMBERS:
+                raise HTTPException(400, f"the zip archive has {len(infos)} members; at most {ZIP_MAX_MEMBERS} are accepted")
+            seen, total = set(), 0
+            for i in infos:
+                n = i.filename
+                if n.startswith(("/", "\\")) or "/" in n or "\\" in n or ":" in n or ".." in n:
+                    raise HTTPException(400, f"zip member '{n}' is not a plain file name (folders, absolute paths and '..' are refused)")
+                if i.is_dir() or stat.S_ISLNK(i.external_attr >> 16) or i.flag_bits & 0x1:
+                    raise HTTPException(400, f"zip member '{n}' is not a regular file (links and encrypted members are refused)")
+                ext = Path(n).suffix.lower()
+                if n.startswith(".") or ext not in ALLOWED_UPLOADS:
+                    raise HTTPException(400, f"zip member '{n}': unsupported file type {ext or '(none)'}; "
+                                             f"allowed: {', '.join(sorted(ALLOWED_UPLOADS))}")
+                if n in seen:
+                    raise HTTPException(400, f"zip member '{n}' appears twice")
+                seen.add(n)
+                if i.file_size > limit:
+                    raise HTTPException(413, f"zip member '{n}' exceeds the {mb} MB limit")
+                total += i.file_size
+            if total > limit * ZIP_TOTAL_FACTOR:
+                raise HTTPException(413, "the zip archive expands beyond the allowed size")
+            for i in infos:
+                safe = Path(i.filename).name.replace("..", "_")
+                dest = upload_dir() / f"{uuid.uuid4().hex[:12]}_{safe}"
+                out.append((i.filename, dest))
+                written = 0
+                try:
+                    with z.open(i) as src, dest.open("wb") as w:
+                        while chunk := src.read(1 << 20):
+                            written += len(chunk)
+                            if written > limit or written > i.file_size:
+                                raise HTTPException(413, f"zip member '{i.filename}' expands beyond its declared size "
+                                                         f"or the {mb} MB limit")
+                            w.write(chunk)
+                except (zipfile.BadZipFile, zlib.error, EOFError):
+                    raise HTTPException(400, f"zip member '{i.filename}' is corrupt") from None
+                _check_upload_content(dest, Path(safe).suffix.lower(), limit)
+    except BaseException:
+        for _, p in out:
+            p.unlink(missing_ok=True)
+        raise
+    finally:
+        archive.unlink(missing_ok=True)
+    return out
 
 
 # ------------------------------------------------------------------ meta
@@ -698,13 +783,54 @@ def approve_mapping(mapping_id: str, body: Decision, user: User = Depends(curren
 
 
 # ------------------------------------------------------------------ upload & batches (Workflow 2)
+def _feed_layout(source_id: str) -> dict | None:
+    """The feed's published multi-file layout (None: a single-file feed)."""
+    from ..config_store import ConfigError
+    from ..multifile.fileset import feed_layout
+
+    try:
+        return feed_layout(source_id)
+    except ConfigError as e:
+        _err(e)
+
+
+def _attach_uploads(source_id: str, items: list[tuple[str, Path, str | None]], user: User, auto_start: bool) -> list[dict]:
+    """Attach saved uploads to the feed's file sets (strict: the API reports errors, it never records them as
+    failed batches). Batches queued before an error are still started; the error is then raised."""
+    from ..multifile import fileset
+    from ..storage import persist_upload
+
+    out: list[dict] = []
+    try:
+        for name, local, role in items:
+            digest = pipeline.file_sha256(local)
+            # uploads/ (not incoming/) in AWS: the API attaches the file itself, the S3 arrival rule must not do it again
+            uri = persist_upload(local, f"{'uploads' if aws_mode() else 'incoming'}/{source_id}/{digest[:12]}")
+            out.append(fileset.attach_file(source_id, name, uri, user.name, role=role or None, strict=True))
+    except pipeline.DuplicateFileError as e:
+        raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
+    except ValueError as e:
+        _err(e)
+    finally:
+        if auto_start:
+            for r in out:
+                if r["batch_id"]:
+                    dispatch(r["batch_id"])
+    return out
+
+
 @app.post("/api/upload")
 def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start: bool = Form(True),
            allow_duplicate: bool = Form(False), reason: str | None = Form(None), load_type: str | None = Form(None),
-           user: User = Depends(current_user)):
+           role: str | None = Form(None), user: User = Depends(current_user)):
+    """One file. A feed with a multi-file layout attaches it to its file set (optional `role`, else routed by
+    name) and returns {set_id, role, status, batch_id}; a single-file feed registers a batch as before."""
     from ..storage import persist_upload
 
+    layout = _feed_layout(source_id)
     local = _save_upload(file)
+    if layout:
+        return _attach_uploads(source_id, [(file.filename or local.name, local, role)], user, auto_start)[0]
     try:
         digest = pipeline.file_sha256(local)
         # uploads/ (not incoming/): the API registers this batch itself, so the S3 arrival rule must not register it twice
@@ -719,9 +845,55 @@ def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start:
     return {"batch_id": bid, "status": "submitted" if auto_start else "queued"}
 
 
+@app.post("/api/upload/set")
+def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), manifest: str | None = Form(None),
+               auto_start: bool = Form(True), user: User = Depends(current_user)):
+    """The files of one multi-file delivery: several `files` parts, or one .zip. An optional `manifest`
+    (JSON {role: filename}) assigns roles; other files are routed by the layout's name patterns. All or
+    nothing: a file that routes nowhere (or any other problem found before attaching) attaches no file.
+    Returns the per-file results [{set_id, role, status, batch_id}] in upload order."""
+    from ..config_store import load
+    from ..multifile.fileset import FileSetError, plan_files
+
+    layout = _feed_layout(source_id)
+    if not layout:
+        raise HTTPException(400, "this feed has no multi-file layout; upload its file with POST /api/upload")
+    roles = None
+    if manifest:
+        try:
+            roles = json.loads(manifest)
+        except ValueError:
+            raise HTTPException(400, "manifest must be JSON: {role: filename}") from None
+        if not isinstance(roles, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in roles.items()):
+            raise HTTPException(400, "manifest must be JSON: {role: filename}")
+    saved: list[tuple[str, Path]] = []
+    try:
+        if any(Path(f.filename or "").suffix.lower() == ".zip" for f in files):
+            if len(files) != 1:
+                raise HTTPException(400, "send one .zip, or several files, not both")
+            saved = _extract_zip(files[0])
+        else:
+            for f in files:
+                name = Path(f.filename or "upload").name
+                if name in {n for n, _ in saved}:
+                    raise HTTPException(400, f"'{name}' appears twice in this upload")
+                saved.append((name, _save_upload(f)))
+        try:
+            plan = plan_files(layout, load(source_id).readiness or {}, [n for n, _ in saved], roles)
+        except FileSetError as e:
+            _err(e)
+    except BaseException:
+        for _, p in saved:
+            p.unlink(missing_ok=True)
+        raise
+    local = dict(saved)
+    return _attach_uploads(source_id, [(n, local[n], role) for n, role in plan], user, auto_start)
+
+
 @app.post("/api/upload/presign")
-def presign(source_id: str, filename: str, user: User = Depends(current_user)):
-    """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline."""
+def presign(source_id: str, filename: str, role: str | None = None, user: User = Depends(current_user)):
+    """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline.
+    `role` (a multi-file feed) is passed to the arrival handler as object metadata."""
     s = get_settings()
     if s.env != "aws" or not s.raw_bucket:
         raise HTTPException(400, "presigned upload is only available in AWS mode; use POST /api/upload locally")
@@ -729,7 +901,8 @@ def presign(source_id: str, filename: str, user: User = Depends(current_user)):
 
     key = f"incoming/{source_id}/{uuid.uuid4().hex[:8]}_{Path(filename).name}"
     url = boto3.client("s3").generate_presigned_url("put_object", Params={"Bucket": s.raw_bucket, "Key": key,
-                                                                         "Metadata": {"source-id": source_id, "submitted-by": user.name}},
+                                                                         "Metadata": {"source-id": source_id, "submitted-by": user.name,
+                                                                                      **({"role": role} if role else {})}},
                                                     ExpiresIn=900)
     return {"url": url, "bucket": s.raw_bucket, "key": key}
 

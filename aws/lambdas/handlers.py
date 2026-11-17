@@ -48,6 +48,10 @@ def on_file_arrival(event, _ctx):
     source_id = parts[1]
     head = s3.head_object(Bucket=bucket, Key=key)
     meta = head.get("Metadata", {})
+    from lbp.multifile.fileset import feed_layout
+
+    if feed_layout(source_id):
+        return _attach_arrival(source_id, bucket, key, meta)
     try:
         # strict=False: a file that cannot be sequenced (or a suspended vendor's file) is recorded as a failed batch, not dropped
         batch_id = create_batch(source_id, f"s3://{bucket}/{key}", Path(key).name, meta.get("submitted-by", "s3-auto-arrival"),
@@ -62,6 +66,35 @@ def on_file_arrival(event, _ctx):
     with db.get_engine().connect() as c:
         status = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == batch_id)).scalar()
     return {"batch_id": batch_id, "execution_arn": None if status == "failed" else dispatch(batch_id)}
+
+
+def _attach_arrival(source_id: str, bucket: str, key: str, meta: dict) -> dict:
+    """A file of a multi-file feed: attach it to its file set (role from the object's `role` metadata, else by
+    name). Unattended (strict=False): a set batch that cannot be sequenced is recorded as failed; a file that
+    cannot be attached at all is alerted, never dropped silently. Messages carry names and ids, never contents."""
+    from sqlalchemy import select
+
+    from lbp.dispatch import dispatch
+    from lbp.multifile.fileset import attach_file, safe_message
+    from lbp.pipeline.batch import DuplicateFileError
+    from lbp.scheduling.alerts import notify
+    from lbp.store import db
+
+    try:
+        r = attach_file(source_id, Path(key).name, f"s3://{bucket}/{key}", meta.get("submitted-by", "s3-auto-arrival"),
+                        role=meta.get("role") or None, strict=False)
+    except DuplicateFileError as e:
+        log.warning("duplicate file set ignored: %s", e)
+        return {"duplicate_of": e.batch_id, "key": key}
+    except ValueError as e:
+        msg = f"{Path(key).name} for feed {source_id} could not be attached to a file set: {safe_message(e)}"
+        notify("file_set_rejected", msg, {"source_id": source_id, "key": key})
+        return {"rejected": msg, "key": key}
+    if not r["batch_id"]:
+        return {**r, "execution_arn": None}
+    with db.get_engine().connect() as c:
+        status = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == r["batch_id"])).scalar()
+    return {**r, "execution_arn": None if status == "failed" else dispatch(r["batch_id"])}
 
 
 # ---------------------------------------------------------------- 2. route

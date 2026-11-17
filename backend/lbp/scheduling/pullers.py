@@ -17,6 +17,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import json
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,10 +78,11 @@ def validate_pull(cfg: dict) -> list[str]:
     return errs
 
 
-def _ok_name(name: str, pattern: str) -> bool:
+def _ok_name(name: str, pattern: str, name_patterns: list[str] | None = None) -> bool:
+    """`name_patterns` (a multi-file feed: one regex per role, from its layout) replace the glob `pattern`."""
     base = Path(name).name
-    return (fnmatch.fnmatch(base, pattern) and Path(base).suffix.lower() in ALLOWED_EXT and not base.startswith(".")
-            and ".." not in base)
+    matched = any(re.fullmatch(p, base) for p in name_patterns) if name_patterns else fnmatch.fnmatch(base, pattern)
+    return matched and Path(base).suffix.lower() in ALLOWED_EXT and not base.startswith(".") and ".." not in base
 
 
 def _sha256(p: Path) -> str:
@@ -98,6 +100,9 @@ class Puller:
             raise PullError("; ".join(problems))
         self.cfg = cfg
         self.limit = get_settings().max_upload_mb * 1024 * 1024
+
+    def ok(self, name: str) -> bool:
+        return _ok_name(name, self.cfg["pattern"], self.cfg.get("name_patterns"))
 
     def list(self) -> list[RemoteFile]:
         raise NotImplementedError
@@ -118,7 +123,7 @@ class LocalPuller(Puller):
         if not d.is_dir():
             raise PullError(f"pull directory does not exist: {self.cfg.get('path')}")
         return [RemoteFile(p.name, p.stat().st_size, str(int(p.stat().st_mtime))) for p in sorted(d.iterdir())
-                if p.is_file() and _ok_name(p.name, self.cfg["pattern"])]
+                if p.is_file() and self.ok(p.name)]
 
     def fetch(self, f, dest_dir):
         import shutil
@@ -151,7 +156,7 @@ class S3Puller(Puller):
             resp = self.s3.list_objects_v2(**kw)
             for o in resp.get("Contents", []):
                 rel = o["Key"][len(prefix):].lstrip("/")
-                if "/" not in rel and _ok_name(rel, self.cfg["pattern"]):
+                if "/" not in rel and self.ok(rel):
                     out.append(RemoteFile(o["Key"], int(o["Size"]), o["LastModified"].isoformat()))
             if not resp.get("IsTruncated"):
                 return out
@@ -195,7 +200,7 @@ class SftpPuller(Puller):
 
     def list(self):
         return [RemoteFile(a.filename, int(a.st_size or 0), str(int(a.st_mtime or 0))) for a in self.sftp.listdir_attr(self.cfg["path"])
-                if _ok_name(a.filename, self.cfg["pattern"])]
+                if self.ok(a.filename)]
 
     def fetch(self, f, dest_dir):
         dest = dest_dir / Path(f.name).name

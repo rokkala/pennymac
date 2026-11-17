@@ -47,6 +47,10 @@ class FileSetError(ValueError):
     pass
 
 
+class SetNotReadyError(FileSetError):
+    """The set is no longer ready (another worker queued or discarded it meanwhile): benign for intake and sweep."""
+
+
 class DuplicateFileSetError(DuplicateFileError):
     """The same files (by role and sha256) as a set whose batch is live."""
 
@@ -86,6 +90,45 @@ def pairing_key(readiness: dict, captured: dict[str, str], arrived_at: datetime)
     return key
 
 
+def _captures(layout: dict, role: str, filename: str) -> dict[str, str]:
+    f = next((x for x in (layout or {}).get("files") or [] if x.get("role") == role), None)
+    if f is None:
+        raise FileSetError(f"role {role!r} is not declared in the feed layout")
+    m = re.fullmatch(f.get("name_pattern") or "", Path(str(filename)).name)
+    return {k: v for k, v in m.groupdict().items() if v is not None} if m else {}
+
+
+def plan_files(layout: dict, readiness: dict, names: list[str], manifest: dict[str, str] | None = None,
+               now: datetime | None = None) -> list[tuple[str, str]]:
+    """(filename, role) for the files of one upload, all or nothing: a manifest ({role: filename}) assigns roles
+    explicitly, any other file is routed by name_pattern. A file that routes nowhere, a manifest entry naming an
+    undeclared role or a file not in the upload, two files for one role, or a file whose pairing value cannot be
+    derived fails the whole upload before anything is attached."""
+    manifest = manifest or {}
+    by_name: dict[str, str] = {}
+    for role, fname in manifest.items():
+        _captures(layout, role, fname)  # the role must be declared
+        if fname not in names:
+            raise FileSetError(f"the manifest names '{fname}', which is not in this upload")
+        if fname in by_name:
+            raise FileSetError(f"the manifest assigns '{fname}' to more than one role")
+        by_name[fname] = role
+    out, seen = [], set()
+    for n in names:
+        role = by_name.get(n)
+        if role is None:
+            routed = route_file(layout, n)
+            if routed is None:
+                raise FileSetError(f"'{Path(str(n)).name}' does not match any file in the feed layout")
+            role = routed[0]
+        if role in seen:
+            raise FileSetError(f"more than one file for role {role!r} in one upload")
+        seen.add(role)
+        pairing_key(readiness or {}, _captures(layout, role, n), _naive_utc(now))
+        out.append((n, role))
+    return out
+
+
 def _naive_utc(t: datetime | None) -> datetime:
     """Timestamps are stored naive UTC (db.now()); an aware value is converted, a naive one taken as UTC."""
     if t is None:
@@ -108,6 +151,20 @@ def _required_roles(layout: dict, readiness: dict) -> list[str]:
 
 def _missing(layout: dict, readiness: dict, present: set[str]) -> list[str]:
     return [r for r in _required_roles(layout, readiness) if r not in present]
+
+
+def feed_layout(source_id: str) -> dict | None:
+    """The published layout of a feed, or None for a single-file feed. A feed without a published configuration
+    counts as single-file only when it has no approved layout either; otherwise the ConfigError is raised."""
+    from ..config_store import ConfigError, load
+
+    try:
+        return load(source_id).layout or None
+    except ConfigError:
+        with db.get_engine().connect() as c:
+            if c.execute(select(db.sources.c.layout).where(db.sources.c.source_id == source_id)).scalar():
+                raise
+        return None
 
 
 def _config(source_id: str):
@@ -152,8 +209,9 @@ def _evaluate(c, s, cfg, now: datetime) -> str:
 
 # ------------------------------------------------------------------ intake
 def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role: str | None = None,
-                arrived_at: datetime | None = None) -> dict:
-    """Attach one arriving file to its set; queue the set's batch when the set becomes ready."""
+                arrived_at: datetime | None = None, strict: bool = True) -> dict:
+    """Attach one arriving file to its set; queue the set's batch when the set becomes ready. strict=False
+    (unattended arrivals) records a batch that cannot be sequenced as failed, like create_batch(strict=False)."""
     from ..ingestion.parser import estimate_rows
     from ..pipeline.batch import file_sha256
     from ..storage import local_path
@@ -161,11 +219,7 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
     cfg = _config(source_id)
     layout, readiness = cfg.layout, cfg.readiness or {}
     if role is not None:
-        f = next((x for x in layout.get("files") or [] if x.get("role") == role), None)
-        if f is None:
-            raise FileSetError(f"role {role!r} is not declared in the feed layout")
-        m = re.fullmatch(f.get("name_pattern") or "", Path(str(filename)).name)
-        captured = {k: v for k, v in m.groupdict().items() if v is not None} if m else {}
+        captured = _captures(layout, role, filename)
     else:
         routed = route_file(layout, filename)
         if routed is None:
@@ -209,8 +263,13 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
 
     batch_id = None
     if status == "ready":
-        batch_id = create_batch_for_set(set_id, actor)
-        status = "consumed"
+        try:
+            batch_id = create_batch_for_set(set_id, actor, strict=strict)
+            status = "consumed"
+        except SetNotReadyError:  # queued (or discarded) by another worker meanwhile: report what it is now
+            with db.get_engine().connect() as c:
+                now_set = c.execute(select(fs.c.status, fs.c.batch_id).where(fs.c.set_id == set_id)).first()
+            status, batch_id = now_set.status, now_set.batch_id
     return {"set_id": set_id, "role": role, "status": status, "batch_id": batch_id}
 
 
@@ -226,14 +285,19 @@ def evaluate_set(set_id: str, now: datetime | None = None) -> str:
         return _evaluate(c, s, cfg, _naive_utc(now))
 
 
-def _safe_message(e: Exception) -> str:
-    """Error text safe to store and alert on: our own errors carry identifiers only; anything else (database,
-    I/O) is reduced to its class name, since its text can include SQL parameters or data values."""
-    from sqlalchemy.exc import SQLAlchemyError
+SAFE_TEXT_ERRORS = (FileSetError, DuplicateFileError)
 
-    if isinstance(e, ValueError) and not isinstance(e, SQLAlchemyError):
+
+def _safe_message(e: Exception) -> str:
+    """Error text safe to store and alert on. Only our own errors (FileSetError, DuplicateFileError), which
+    carry identifiers only, keep their text; any other error (a DeliveryError can quote a column value, a
+    database error its parameters) is reduced to its class name and a fixed phrase."""
+    if isinstance(e, SAFE_TEXT_ERRORS):
         return f"{e.__class__.__name__}: {(str(e).splitlines() or [''])[0]}"[:300]
-    return e.__class__.__name__
+    return f"{e.__class__.__name__}: details withheld (may contain data values)"
+
+
+safe_message = _safe_message  # for intake callers (scheduler, API, S3 arrival)
 
 
 def _merge_override(set_id: str, patch: dict) -> dict:
@@ -331,6 +395,8 @@ def expire_sets(now: datetime | None = None) -> list[str]:
             create_batch_for_set(set_id, "scheduler")
         except DuplicateFileError:
             continue  # recorded on the set (discarded, duplicate_of) by create_batch_for_set
+        except SetNotReadyError:
+            continue  # queued or discarded by another worker since we listed it: nothing to do
         except Exception as e:  # noqa: BLE001
             if _record_error(set_id, "batch", e, now):
                 try:
@@ -343,11 +409,13 @@ def expire_sets(now: datetime | None = None) -> list[str]:
 
 
 # ------------------------------------------------------------------ batch
-def create_batch_for_set(set_id: str, actor: str) -> str:
+def create_batch_for_set(set_id: str, actor: str, strict: bool = True) -> str:
     """Queue the batch of a ready set, registered on the master file (so the sequencing gate and delivery
     matching see one file). One transaction: the set moves ready -> consumed, the batch is inserted already
     linked to the set, and the members get the batch id; any failure rolls all of it back (set stays ready).
-    A set identical (members_sha) to one whose batch is live is marked discarded and DuplicateFileSetError raised."""
+    A set identical (members_sha) to one whose batch is live is marked discarded and DuplicateFileSetError raised.
+    A set that is no longer ready raises SetNotReadyError. strict=False: as create_batch(strict=False), a batch
+    that cannot be sequenced is recorded as failed with the reason instead of raising."""
     from ..pipeline.batch import _register_batch
     from ..storage import local_path
 
@@ -363,7 +431,7 @@ def create_batch_for_set(set_id: str, actor: str) -> str:
         _lock_source(c, s0.source_id)
         s = c.execute(select(fs).where(fs.c.set_id == set_id).with_for_update()).first()
         if s.status not in ("ready", "overridden") or s.batch_id is not None:
-            raise FileSetError(f"file set {set_id} is {s.status}; only a ready set without a batch can be queued")
+            raise SetNotReadyError(f"file set {set_id} is {s.status}; only a ready set without a batch can be queued")
         members = {r.role: r for r in c.execute(select(bf).where(bf.c.set_id == set_id))}
         master = members.get("master")
         if master is None:
@@ -381,12 +449,12 @@ def create_batch_for_set(set_id: str, actor: str) -> str:
         else:
             if c.execute(fs.update().where(fs.c.set_id == set_id, fs.c.status == s.status, fs.c.batch_id.is_(None))
                          .values(status="consumed", members_sha=msha)).rowcount != 1:
-                raise FileSetError(f"file set {set_id} is already being queued")
+                raise SetNotReadyError(f"file set {set_id} is already being queued")
             master_dup = c.execute(select(bt.c.batch_id).where(bt.c.source_id == s.source_id, bt.c.file_sha256 == master.file_sha256,
                                                                bt.c.status.not_in(("failed", "discarded")))).first()
             # master_dup with a new members_sha: a correction set whose master file is unchanged (Ruling A)
             bid = _register_batch(c, s.source_id, master.file_path, master.filename, actor, local, master.file_sha256,
-                                  bool(master_dup), CORRECTION_REASON if master_dup else None, None, True, file_set_id=set_id)
+                                  bool(master_dup), CORRECTION_REASON if master_dup else None, None, strict, file_set_id=set_id)
             c.execute(bf.update().where(bf.c.set_id == set_id).values(batch_id=bid))
             c.execute(fs.update().where(fs.c.set_id == set_id).values(batch_id=bid))
             db.audit(c, actor, "file_set.batch", "file_set", set_id, {"batch_id": bid, "roles": sorted(members), "members_sha": msha})
