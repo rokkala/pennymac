@@ -16,7 +16,8 @@ changed file on resume is an error (StageError), never a silent re-join.
 Absent optional roles (a set queued with load_master_only or an accepted partial set): the role joins
 against an empty header-only CSV, so masters follow `on_missing_detail`. Its header is the layout file's
 declared `columns` when given, else the columns the relation references (its `on` detail keys, aggregate
-`col`s, `where` variables and `order_by` columns). A required role is absent only when a recorded
+`col`s, `where` variables and `order_by` columns), plus the role's `role.col` columns the mapping reads (so
+the drift pre-flight never sees them as missing). A required role is absent only when a recorded
 `accept_partial` override on the set names it among its missing roles; otherwise that is a StageError.
 
 Pre-flight per role: every role's header must hold its declared `columns` and the columns the relation
@@ -100,12 +101,28 @@ def _needed_columns(lay: dict) -> dict[str, list[str]]:
     return need
 
 
-def _empty_columns(lay: dict, role: str) -> list[str]:
+def _mapped_columns(cfg, role: str) -> list[str]:
+    """Columns of `role` that the mapping reads (`role.col` sources of fields that are not rejected)."""
+    out = []
+    for f in getattr(cfg, "fields", None) or []:
+        if f.get("status") == "rejected":
+            continue
+        for src in f.get("sources") or ([f["source"]] if f.get("source") else []):
+            r, sep, col = str(src).partition(".")
+            if sep and r == role and col:
+                out.append(col)
+    return out
+
+
+def _empty_columns(lay: dict, role: str, cfg=None) -> list[str]:
+    """Header of the empty file an absent role joins against: its declared `columns`, else the columns its
+    relation references; plus the role's columns the mapping reads, so an accepted absent role never shows
+    them as missing to the drift pre-flight (Ruling V)."""
     declared = list(_files_by_role(lay).get(role, {}).get("columns") or [])
-    if declared:
-        return declared
-    rel = next((r for r in lay.get("relations") or [] if r.get("detail") == role), {})
-    return _relation_columns(rel)
+    if not declared:
+        rel = next((r for r in lay.get("relations") or [] if r.get("detail") == role), {})
+        declared = _relation_columns(rel)
+    return list(dict.fromkeys(declared + _mapped_columns(cfg, role)))
 
 
 def _parse_overrides(lay: dict, cfg) -> dict[str, dict]:
@@ -444,7 +461,7 @@ def _join(batch_id: str, b, cfg, lay: dict, inputs: dict[str, Path], overrides: 
     empties = []
     try:
         for role in absent:
-            empties.append(_write_empty(d / f"{batch_id}.{role}.empty.csv", _empty_columns(lay, role)))
+            empties.append(_write_empty(d / f"{batch_id}.{role}.empty.csv", _empty_columns(lay, role, cfg)))
             inputs[role] = empties[-1]
             overrides[role] = dict(_EMPTY_PARSE_OPTIONS)
         with db.get_engine().begin() as c:  # rows left by an attempt that crashed before recording its file

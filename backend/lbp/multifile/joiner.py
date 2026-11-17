@@ -33,6 +33,7 @@ import csv
 import json
 import logging
 import os
+import re
 import sqlite3
 import tempfile
 from collections.abc import Callable, Iterable, Iterator
@@ -102,10 +103,18 @@ def _blank(v: str | None) -> bool:
     return v is None or v.strip() == ""
 
 
+_DECIMAL_COMMA = re.compile(r",\d{1,2}$")
+
+
 def _dec(v: str) -> Decimal | None:
-    """A finite Decimal from a numeric string ($ and thousands separators allowed), else None."""
+    """A finite Decimal from a numeric string ($ and thousands separators allowed), else None. A decimal comma
+    ("1,5", "12,50", "1.234,5": a comma followed by 1-2 final digits, or any comma after the dot) is not numeric,
+    so it is skipped (JOIN07) instead of read as 15; "1,234" and "1,234.50" keep their thousands separators."""
+    t = v.strip()
+    if _DECIMAL_COMMA.search(t) or ("." in t and "," in t[t.index("."):]):
+        return None
     try:
-        d = Decimal(v.strip().replace("$", "").replace(",", ""))
+        d = Decimal(t.replace("$", "").replace(",", ""))
     except InvalidOperation:
         return None
     if not d.is_finite() or abs(d.as_tuple().exponent) > MAX_EXPONENT:

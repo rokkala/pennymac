@@ -130,3 +130,19 @@ def test_join07_not_repeated_for_duplicate_master_keys(tmp_path: Path, policy: s
     assert res.exception_counts.get("JOIN07", 0) == n_join07
     assert res.exception_counts["JOIN03"] == 3 - rows_out
     assert res.rows_out == rows_out
+
+
+def test_decimal_commas_are_not_numeric_but_thousands_separators_are(tmp_path: Path):
+    """Minor (final review): '1,5' is a decimal comma, not 15; it is skipped with JOIN07 instead of summed wrong."""
+    from decimal import Decimal
+
+    from lbp.multifile.joiner import _dec
+
+    assert _dec("1,5") is None and _dec("12,50") is None and _dec(" 1,05 ") is None and _dec("1.234,5") is None
+    assert _dec("1,234.50") == Decimal("1234.50") and _dec("1,234") == Decimal("1234") and _dec("$1,234,567") == Decimal("1234567")
+    m, d = tmp_path / "m.csv", tmp_path / "d.csv"
+    m.write_text("id\n1\n", encoding="utf-8")
+    d.write_text('ref,amt\n1,"1,5"\n1,"1,000"\n', encoding="utf-8")
+    res = join_files(layout([{"as": "t", "op": "sum", "col": "amt"}]), {"master": m, "items": d}, {}, tmp_path / "o.csv", tmp_path)
+    assert read_csv(tmp_path / "o.csv") == [["id", "t"], ["1", "1000"]]
+    assert res.exception_counts == {"JOIN07": 1}

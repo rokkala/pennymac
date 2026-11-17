@@ -635,3 +635,28 @@ def test_aggregated_detail_pii_is_masked_in_staged_raw_rows(env):
     r0 = staged[0].raw
     assert r0["borrower_ssns"].endswith("1000") and r0["names"].startswith("Z") and r0["memo"].endswith("@example.com")
     assert r0["details.Carrier"] == "Carrier0"  # not PII: kept as is
+
+
+def test_accept_partial_absent_merge_role_with_mapped_columns_needs_no_second_override(env):
+    """Minor (Ruling V, note m): an absent merge role's empty file carries the role's mapped `role.col` source
+    columns, so the drift pre-flight does not see them as missing and the accepted set loads without a second
+    (pre-flight) override."""
+    from lbp.multifile.fileset import attach_file, override_set
+    from lbp.pipeline.batch import run_batch
+
+    lay = _layout()
+    lay["files"][1].pop("columns")  # nothing declared: the empty header must still hold details.Carrier / details.CoSSN
+    master, ids = _master(env)
+    sid = _onboard(master)
+    _configure(sid, lay)
+    attach_file(sid, f"payments_{DATE}.csv", _payments(env, ids), "s3-intake")
+    out = attach_file(sid, f"loans_{DATE}.csv", master, "s3-intake")
+    assert out["status"] == "waiting"
+    acc = override_set(out["set_id"], "accept_partial", "sme1", ["onboarding_reviewer"], "vendor sent no details file today")
+    bid = acc["batch_id"]
+    run_batch(bid)
+    b = _batch(bid)
+    assert b.status == "completed", (b.status, b.error, (b.preflight or {}).get("summary"))
+    assert b.join_summary["absent_roles"] == ["details"] and not (b.preflight or {}).get("override")
+    recs = {s.loan_number: s.record for s in _staging(bid)}
+    assert recs[ids[0]]["hazard_insurance_carrier"] in (None, "") and recs[ids[0]]["coborrower_ssn"] in (None, "")

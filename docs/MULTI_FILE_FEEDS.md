@@ -77,7 +77,8 @@ readiness:
 | `on_missing_detail` | `allow` | `exception`: a master without a detail is excluded with JOIN02. |
 | `on_duplicate_master` | `reject_all` | `first` / `last` keep one row; every dropped row is a JOIN03. |
 | `min_match_rate` | `0.0` | See note (d) in section 7. |
-| `readiness.require` | `all_required` | |
+| `relations[].to` | | Must be `master` in Phase 1 (a detail of a detail is a later phase). |
+| `readiness.require` | `all_required` | `master_only` is accepted only when every detail is non-required. |
 | `readiness.pairing` | `business_date` | `sequence`, `business_date` and `filename_token` all compare the captured value for equality. |
 | `readiness.wait_timeout_minutes` | `240` | |
 | `readiness.on_timeout` | `alert_only` | `load_master_only` is accepted only when every detail is non-required. |
@@ -157,6 +158,13 @@ then change its source (`POST /api/mappings/{id}/fields/{target}` with `action: 
 Join exceptions are in the Exception Manager with category `join`, the role chip and the code. They never
 stop the join; the batch reports them in `reconciliation.join.exceptions`.
 
+A join exception has no staged loan behind it (the row never reached staging), so its only action is
+**Acknowledge and close…** with a mandatory reason (`POST /api/exceptions/{id}/acknowledge`, Monitoring or
+Compliance; audited `exception.join_acknowledged`). It closes that one exception as `resolved`; nothing is
+loaded or rejected and nothing is added to precedent memory. Value resolve, bulk resolve, reject-loan,
+compliance clear and AI suggest are refused for join exceptions. To load the excluded masters, fix the files
+and send the set again.
+
 | Code | Meaning | What to do |
 |---|---|---|
 | **JOIN01** orphan detail | A detail row whose key matches no master row (only when `on_orphan_detail: exception`). Recorded on the detail role and its row number. The master rows still load. | Check the key columns and `normalize` (case, zero padding, spaces). If the vendor routinely sends extra rows, set `on_orphan_detail: drop`. If whole loans are missing from the master, ask the vendor for a corrected master. |
@@ -165,7 +173,7 @@ stop the join; the batch reports them in `reconciliation.join.exceptions`.
 | **JOIN04** cardinality violation | More than one detail row for a master under `merge` (or `cardinality: one`). The master is excluded rather than picking one silently. | If 1:N is legitimate, change the relation to `aggregate`. Otherwise the vendor must remove the duplicates. |
 | **JOIN05** key unparseable | An empty or null key part, on either side. The row is rejected (a master row is excluded). | Fix the source rows; a blank key never matches by design. |
 | **JOIN06** inner join dropped the master | `join: inner` and the master has no detail. Always recorded. | Expected under `inner`; use `left` if those masters should load. |
-| **JOIN07** aggregate value not numeric | A `sum` / `min` / `max` source value is not a number. The value is skipped; the master still joins. | Fix the detail file or add a `where` filter. The value itself is not in the message. |
+| **JOIN07** aggregate value not numeric | A `sum` / `min` / `max` source value is not a number. `$` and thousands separators (`1,234.50`) are accepted; a decimal comma (`1,5`, `12,50`, `1.234,5`) is not numeric. The value is skipped; the master still joins. | Fix the detail file or add a `where` filter. The value itself is not in the message. |
 
 A batch **blocked** before any load has one of two reasons: a role's file is missing declared or referenced
 columns (pre-flight per role, the role is named), or a relation's match rate is below `min_match_rate`. Both
@@ -201,8 +209,23 @@ file is kept, so the resumed batch loads exactly what was checked.
 
 **Timeouts and alerts.** The scheduler tick sweeps sets past `wait_timeout_minutes` once each: it raises
 `delivery_late` (`alert_only`) or `delivery_missed` (`fail`, `load_master_only`), naming the missing roles,
-then applies `on_timeout`. It also re-queues any ready set whose batch could not be queued earlier; a
-persistent failure is recorded on the set and alerted once (`file_set_error`).
+then applies `on_timeout`. A handled timeout is recorded in the set's `override.timeout` and its `expires_at` is
+cleared, so the sweep never selects that set again: under `alert_only` the set stays `waiting` (no further
+alerts or per-tick work) and a late file still completes it. The sweep also re-queues any ready set whose
+batch could not be queued earlier, unattended (like S3 and scheduled arrivals): a set whose batch cannot be
+sequenced, or whose vendor is suspended, becomes a **failed batch** with the reason and the set ends
+`consumed`. Any other persistent failure keeps the set `ready` and is retried each tick, but is recorded on
+the set, audited (`file_set.error`) only when its message changes, and alerted once (`file_set_error`).
+
+**Load type.** File-set batches load as `full` in Phase 1. A layout cannot be proposed for a feed whose
+delivery profile is `snapshot` or `incremental`, and a set batch with such a load type is refused (an
+unattended arrival records it as a failed batch). `POST /api/upload` to a layout feed refuses
+`allow_duplicate`, `reason` and `load_type` (HTTP 400) instead of ignoring them.
+
+**Publishing.** Approving a layout publishes a new signed bundle. If the publish fails, the approval is kept
+and the decision returns HTTP 502 saying so; republish with `POST /api/sources/{id}/publish`. Until then the
+feed refuses files (uploads 400, S3 arrivals alerted, pulls recorded as errors): a feed with an approved
+layout is never treated as a single-file feed.
 
 **Counts.** A batch's `reconciliation.join` holds master rows read, rows excluded by the join, joined rows,
 and per role: rows read, matched, orphaned, rejected. The primary count stays the master ("40 loans").
@@ -230,7 +253,13 @@ masters with 10,000,000 detail rows; on an Apple Silicon laptop it took 72.5 s w
   on a preview sample are not reliable.
 - **(e)** JOIN02, JOIN03, JOIN04 and JOIN06 exceptions are recorded with role `master` and the master's row
   number.
-- **(f)** Join keys in exceptions are fingerprinted; raw rows are masked.
+- **(f)** The join key of an exception (`loan_number`, and `key` in the preview) is a keyed fingerprint:
+  `tok_` + 12 hex characters of HMAC-SHA256 under a key derived from the server's config-signing secret, so it
+  cannot be recomputed from a guessed key without that secret. It is deterministic per deployment (equal keys
+  give equal tokens). Raw rows in exceptions and in staged `raw` are masked by PII type (profile, mapping,
+  column names, and for detail or aggregate columns of unknown type, values that look like an SSN, email or
+  phone); a key column that is not detected as PII stays readable in the raw row, and a partially masked
+  PII key keeps its last four characters.
 - **(g)** The joined file is reused on resume even if the layout has changed since.
 - **(h)** S3 redelivery of the last file of an already loaded set opens a new waiting set that later times out
   and alerts.
@@ -240,13 +269,16 @@ masters with 10,000,000 detail rows; on an Apple Silicon laptop it took 72.5 s w
   the stored joined file.
 - **(k)** The client form's role-name rule is stricter than the server: lowercase letters, digits and
   underscore, starting with a letter.
-- **(l)** Phase 1 limits: modes `merge` and `aggregate` only (flatten, child records, Spark parity and
-  relation trees come in later phases). PostgreSQL was not exercised in this work (SQLite only), and the new
+- **(l)** Phase 1 limits: modes `merge` and `aggregate` only, every relation joins the master, and file-set
+  batches load as `full` (flatten, child records, Spark parity, relation trees and snapshot/incremental sets
+  come in later phases). PostgreSQL was not exercised in this work (SQLite only), and the new
   migration 0007 should be run against PostgreSQL before production. The old dev DB needs
   `python -m lbp.cli migrate`.
 - **(m)** A relation whose detail role is absent (accepted as missing by an `accept_partial` override, or
   released by a `load_master_only` timeout; listed in `join_summary.absent_roles`) is exempt from the
-  `min_match_rate` gate. The exemption never applies to a relation whose detail file is present.
+  `min_match_rate` gate. The exemption never applies to a relation whose detail file is present. The empty
+  file an absent role joins against also carries the role's columns the mapping reads (`role.col` sources), so
+  the drift pre-flight does not report them as missing and no second override is needed.
 - **(n)** The mapping service validates new fields against the sampled master columns only; see "Mapping
   joined columns in Phase 1" in section 3.
 

@@ -55,6 +55,15 @@ def test_preview_reports_match_rate_and_masked_rows(env):
     assert out["blocked"] is None
     for ex in out["exceptions"]:
         assert set(ex) == {"code", "role", "row_number", "message", "raw", "key"}
+    # the orphan (ref 99, z@z.io): its raw values masked and its key fingerprinted, nowhere in the response
+    from lbp.multifile.stage import fingerprint
+
+    orphan = next(e for e in out["exceptions"] if e["code"] == "JOIN01")
+    assert orphan["role"] == "notes" and orphan["key"] == fingerprint("99") and orphan["key"].startswith("tok_")
+    assert "z@z.io" not in blob and orphan["raw"]["email"] == "z***@z.io"  # the orphan's PII value is masked
+    assert orphan["key"] != "99" and "99" not in orphan["message"]  # the key is a fingerprint, never the value
+    # a non-PII key column stays readable in the masked raw row (to debug normalisation); a PII one is masked
+    assert orphan["raw"]["ref"] == "99" and orphan["raw"]["tag"] == "orphan"
 
 
 def test_preview_blocked_by_min_match_rate(env):

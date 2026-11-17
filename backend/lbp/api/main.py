@@ -833,6 +833,11 @@ def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start:
     from ..storage import persist_upload
 
     layout = _feed_layout(source_id)
+    if layout:
+        given = [n for n, v in (("allow_duplicate", allow_duplicate), ("reason", reason), ("load_type", load_type)) if v]
+        if given:  # refused, never silently dropped
+            raise HTTPException(400, f"{', '.join(given)} cannot be used for a multi-file feed: its file sets always load as full "
+                                     "and a set identical to a live one is refused as a duplicate")
     local = _save_upload(file)
     if layout:
         return _attach_uploads(source_id, [(file.filename or local.name, local, role)], user, auto_start)[0]

@@ -190,10 +190,13 @@ def scheduler_tick(_event, _ctx):
     # batches the tick queued itself (file sets made ready by a timeout or retried by the sweep) start here, like
     # the local scheduler thread does; pulled files in AWS land in the raw zone and are started by on_file_arrival
     for bid in res.get("batches", []):
-        with db.get_engine().connect() as c:
-            status = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == bid)).scalar()
-        if status != "failed":
-            dispatch(bid)
+        try:  # one batch failing to start never skips the others (it stays queued)
+            with db.get_engine().connect() as c:
+                status = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == bid)).scalar()
+            if status != "failed":
+                dispatch(bid)
+        except Exception as e:  # noqa: BLE001 - logged by batch id and error class only (no text that may carry data)
+            log.warning("scheduler tick: could not start batch %s (%s)", bid, e.__class__.__name__)
     out = {k: (len(v) if isinstance(v, list) else v) for k, v in res.items()}
     log.info("scheduler tick: %s", json.dumps(out, default=str))
     return out

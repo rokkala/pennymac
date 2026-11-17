@@ -591,3 +591,39 @@ def test_s3_arrival_for_unpublished_layout_is_alerted(unpublished, env, monkeypa
         out = h.on_file_arrival({"detail": {"bucket": {"name": "lbp-raw"}, "object": {"key": key}}}, None)
         assert out.get("rejected") and "ConfigError" in out["rejected"]  # alerted, never a single-file batch
     assert _rows(db.batches, source_id=unpublished) == []
+
+
+@pytest.mark.parametrize("extra", [{"allow_duplicate": "true"}, {"reason": "resend"}, {"load_type": "snapshot"}])
+def test_upload_to_layout_feed_refuses_single_file_options(client, feed, env, extra):
+    """Minor: allow_duplicate / reason / load_type do not apply to a file set; they are refused, not dropped."""
+    r = client.post("/api/upload", data={"source_id": feed, "auto_start": "false", **extra},
+                    files={"file": ("loans_20261117.csv", MASTER.encode())}, headers=OPS)
+    assert r.status_code == 400 and next(iter(extra)) in r.text
+    assert _rows(db.file_sets) == [] and _rows(db.batches) == []
+
+
+def test_scheduler_tick_lambda_isolates_each_dispatch(env, monkeypatch, caplog):
+    """Minor: one batch failing to start does not skip the others; the log names the batch and the error class
+    only (never the error text)."""
+    import logging
+
+    from lbp import dispatch as dispatch_mod
+    from lbp.scheduling import service as sched
+    from tests.test_lambdas import _load
+
+    h = _load(monkeypatch)
+    monkeypatch.setattr(sched, "tick", lambda: {"batches": ["bat_one", "bat_two", "bat_three"]})
+    started = []
+
+    def fake(bid):
+        if bid == "bat_one":
+            raise RuntimeError("sfn refused input with 123-45-6789")
+        started.append(bid)
+        return "arn"
+
+    monkeypatch.setattr(dispatch_mod, "dispatch", fake)
+    with caplog.at_level(logging.WARNING):
+        out = h.scheduler_tick({}, None)
+    assert started == ["bat_two", "bat_three"] and out["batches"] == 3
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert "bat_one" in logged and "RuntimeError" in logged and "123-45-6789" not in logged
