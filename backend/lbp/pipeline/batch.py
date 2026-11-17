@@ -14,6 +14,7 @@ worker, orchestrated by Step Functions (see aws/).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import threading
@@ -343,6 +344,46 @@ def _safe_error(e: Exception) -> str:
     return f"{e.__class__.__name__}: {msg}"[:1000]
 
 
+def _join_stage(batch_id: str, cfg) -> dict:
+    """Multi-file batches only (the caller holds the lease): materialize the joined file. A block sets the batch
+    `blocked` (resumable through override_preflight); a failure sets it `failed` and re-raises. The error text
+    keeps only our own messages (roles, columns, counts); any other error is reduced to its class name."""
+    from ..multifile import stage
+    from ..multifile.layout import LayoutError
+
+    eng = db.get_engine()
+    stop = threading.Event()
+
+    def beat():  # a long join must not look like a dead worker to recover_stale
+        while not stop.wait(60):
+            with contextlib.suppress(Exception), eng.begin() as c:
+                c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status == "running")
+                          .values(heartbeat_at=db.now()))
+
+    hb = threading.Thread(target=beat, daemon=True, name=f"join-heartbeat-{batch_id}")
+    hb.start()
+    try:
+        res = stage.materialize_join(batch_id, cfg)
+    except Exception as e:
+        msg = (f"join: {(str(e).splitlines() or [''])[0]}"[:1000] if isinstance(e, stage.StageError | LayoutError)
+               else f"join: {e.__class__.__name__} (details withheld: may contain data values)")
+        log.error("batch %s join stage failed: %s", batch_id, e.__class__.__name__)
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="failed", error=msg, worker_id=None))
+            db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": msg[:500], "stage": "join"})
+        raise
+    finally:
+        stop.set()
+        hb.join(timeout=5)
+    if res["status"] == "blocked":
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="blocked", error=res["message"],
+                                                                                          worker_id=None))
+        return res
+    return {**res, "parse_options": dict(stage.JOINED_PARSE_OPTIONS),
+            "pii_cols": stage.joined_pii_cols(cfg, res["summary"].get("columns") or [])}
+
+
 def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int | None = None) -> dict:
     s = get_settings()
     workers = workers or s.workers
@@ -384,15 +425,25 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         if g and g["decision"] != "go":
             return {"batch_id": batch_id, "status": "waiting" if g["decision"] == "wait" else "out_of_order", "sequence": g}
         raise BatchBusyError(f"batch {batch_id} is already being processed")
+    from ..storage import local_path
+
+    src_path, src_opts, pf_extra, pf_keep, join = b.file_path, cfg.parse_options, {}, {}, None
+    if b.file_set_id:  # multi-file set: join once, then read the joined file in place of the master
+        join = _join_stage(batch_id, cfg)
+        if join["status"] == "blocked":
+            return {"batch_id": batch_id, "status": "blocked", "join": {k: join[k] for k in ("stage", "message")}}
+        with eng.connect() as c:
+            b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        src_path, src_opts, pf_extra = join["joined_path"], join["parse_options"], {"joined_columns": join["extra_columns"]}
+        pf_keep = {k: v for k, v in (b.preflight or {}).items() if k == "join_overrides"}  # survives the drift re-check
     # ---- schema-drift pre-flight (first run, or the mapping changed since the last check)
     pf = b.preflight or {}
     if (b.checkpoint or 0) == 0 and not pf.get("override") and (pf.get("mapping_id") != cfg.mapping_id or pf.get("decision") == "block"):
-        from ..storage import local_path
         from .preflight import check_file
 
-        pf = {**check_file(local_path(b.file_path), cfg.parse_options, cfg.profile, cfg.fields, sparse=(b.load_type == "incremental"),
-                           delivery=cfg.delivery), "mapping_id": cfg.mapping_id, "mapping_version": cfg.mapping_version,
-              "config_version": cfg.version, "checked_at": db.now().isoformat()}
+        pf = {**check_file(local_path(src_path), src_opts, cfg.profile, cfg.fields, sparse=(b.load_type == "incremental"),
+                           delivery=cfg.delivery, **pf_extra), "mapping_id": cfg.mapping_id, "mapping_version": cfg.mapping_version,
+              "config_version": cfg.version, "checked_at": db.now().isoformat(), **pf_keep}
         with eng.begin() as c:
             c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(preflight=pf))
             db.audit(c, "pipeline", f"batch.preflight_{pf['decision']}", "batch", batch_id, {"summary": pf["summary"]})
@@ -407,7 +458,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
     fields = cfg.fields
     runtime_set = cfg.runtime_set
     fields_key = f"{cfg.mapping_id}:{cfg.mapping_version}|{cfg.rules_key}"
-    pii_cols = cfg.pii_cols
+    pii_cols = join["pii_cols"] if join else cfg.pii_cols
     triage = Triage()
     triage.runtime_set = runtime_set
     checkpoint = b.checkpoint or 0
@@ -416,7 +467,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
                 "loaded": b.loaded or 0}
     t_start = time.monotonic()
     rows_this_run = 0
-    opts = ParseOptions(**(cfg.parse_options or {}))
+    opts = ParseOptions(**(src_opts or {}))
     incremental = (b.load_type or "full") != "full"
     change_acc = dict(b.change_summary or {}) if incremental else None
     incr_base, key_mapper = incremental_context(b, cfg) if incremental else (None, None)
@@ -424,9 +475,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(
             sequence_detail={**(b.sequence_detail or {}), "config": {"version": cfg.version, "sha256": cfg.sha256[:16]}}))
     try:
-        from ..storage import local_path
-
-        _, it = iter_rows(local_path(b.file_path), opts)
+        _, it = iter_rows(local_path(src_path), opts)
         # skip already-checkpointed rows
         for _ in range(checkpoint):
             next(it, None)
@@ -490,6 +539,10 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
                 c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="paused", worker_id=None))
             else:
                 rec = reconcile(c, batch_id, counters["processed"])
+                if join:
+                    from ..multifile import stage
+
+                    rec = stage.join_reconciliation(rec, join["summary"])
                 c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(
                     status="completed", total_rows=counters["processed"], finished_at=db.now(), reconciliation=rec, worker_id=None,
                     **({"change_summary": dict(change_acc)} if change_acc is not None else {})))
