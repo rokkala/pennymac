@@ -9,6 +9,7 @@ import {
 } from "../exceptionGroups.js";
 import { SCREEN, exceptionDeskSub } from "../screenCopy.js";
 import { useApi, useAction, Panel, Status, Conf, Tier, TIER_NAMES, Tabs, Loading, ago, human, fmt, Modal, useDialog, PageHeader, EmptyState } from "../ui.jsx";
+import { joinCodeText } from "../layoutModel.js";
 
 const TIER_RULE = {
   T1: "Low-risk formatting or code fix at ≥ 0.95 confidence. Applied automatically, audited, 5% sampled for QA, reversible within the rollback window.",
@@ -148,6 +149,7 @@ function ExceptionModal({ id, persona, onChanged, sameCount, onClose, nav }) {
           <dt>Status</dt><dd><Status s={ex.status} />{ex.qa_sample && <span className="pill accent" style={{ marginLeft: 6 }}>QA sample</span>}</dd>
           <dt>Field</dt><dd><span className="mono">{ex.field}</span> · {ex.risk} risk · {human(ex.category)}</dd>
           <dt>Message</dt><dd>{ex.message}</dd>
+          {ex.role && <><dt>From file</dt><dd><span className="chip">{ex.role}</span>{joinCodeText(ex.rule_id) && <span className="muted" style={{ marginLeft: 8 }}>{joinCodeText(ex.rule_id)}</span>}</dd></>}
           <dt>Current value</dt><dd className="mono">{show(shownOriginal)}</dd>
           <dt>Blocks boarding</dt><dd>{ex.blocking ? "Yes" : "No (warning)"}</dd>
           {ex.maker && <><dt>Maker</dt><dd>{ex.maker}{ex.resolved_value != null && <> → <span className="mono">{ex.resolved_value}</span></>}</dd></>}
@@ -554,7 +556,7 @@ export default function Exceptions({ persona, go, vendor }) {
                             {!(vendor || filterVendor) && (
                               <td style={{ fontSize: ".82rem" }}>{e.vendor_name || "—"}{e.feed_name && e.feed_name !== e.vendor_name && <div className="faint" style={{ fontSize: ".72rem" }}>{e.feed_name}</div>}</td>
                             )}
-                            <td><span className="mono">{e.rule_id}</span></td>
+                            <td><span className="mono">{e.rule_id}</span>{e.role && <span className="chip" style={{ marginLeft: 6 }} title={joinCodeText(e.rule_id) || undefined}>{e.role} file</span>}</td>
                             <td className="mono">{e.field}</td>
                             <td className="mono">{show(e.original_value_masked ?? e.original_value)}</td>
                             <td>{e.proposal && e.tier !== "T5" ? <span className="row" style={{ gap: 6, flexWrap: "nowrap" }}><span className="mono">{show(e.proposal.value)}</span><Conf v={e.proposal.confidence} /></span> : <span className="faint">—</span>}</td>
