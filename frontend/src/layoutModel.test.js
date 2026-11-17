@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   emptyLayout, emptyReadiness, addDetail, validateLayoutForm, groupColumnsByRole, setStatusLabel, missingRoles,
-  matchRateBadge, previewTrust, joinCodeText,
+  matchRateBadge, previewTrust, joinCodeText, filesToSend, ensureColumnIds, stripClientIds,
 } from "./layoutModel.js";
 
 const valid = () => {
@@ -61,10 +61,25 @@ describe("validateLayoutForm", () => {
     assert.ok(e.some((x) => /key/.test(x)));
     assert.ok(e.some((x) => /name pattern/.test(x) && /details/.test(x)));
   });
-  it("rejects a name pattern that is not a regex", () => {
+  it("leaves regex syntax to the server: Python-only syntax passes", () => {
     const l = valid();
-    l.files[1].name_pattern = "([";
-    assert.ok(validateLayoutForm(l, emptyReadiness()).some((e) => /not a valid pattern/.test(e)));
+    l.files[0].name_pattern = "(?i)^loans_(?P<date>\\d{8})\\.csv$";
+    l.files[1].name_pattern = "^details_(?P<date>\\d{8})\\.csv$";
+    assert.deepEqual(validateLayoutForm(l, emptyReadiness()), []);
+    l.files[1].name_pattern = "(?i)details_(?P<d>\\d+)";
+    assert.deepEqual(validateLayoutForm(l, emptyReadiness()), []);
+  });
+  it("checks role names", () => {
+    for (const bad of ["Details", "1a", "a.b", "layout", "readiness", "manifest", "files", "a-b"]) {
+      const l = valid();
+      l.files[1].role = bad;
+      l.relations[0].detail = bad;
+      assert.ok(validateLayoutForm(l, emptyReadiness()).some((e) => /role name/.test(e)), bad);
+    }
+    const l = valid();
+    l.files[1].role = "tax_2";
+    l.relations[0].detail = "tax_2";
+    assert.deepEqual(validateLayoutForm(l, emptyReadiness()), []);
   });
   it("merge needs cardinality one", () => {
     const l = valid();
@@ -173,5 +188,28 @@ describe("joinCodeText", () => {
   it("explains every JOIN code in plain words", () => {
     for (let i = 1; i <= 7; i++) assert.ok(joinCodeText(`JOIN0${i}`).length > 10);
     assert.equal(joinCodeText("X"), "");
+  });
+});
+
+describe("filesToSend", () => {
+  it("keeps only files of roles the layout still has", () => {
+    const l = addDetail(emptyLayout(), "details");
+    const m = { name: "m" }, d = { name: "d" }, gone = { name: "g" };
+    assert.deepEqual(filesToSend(l, { master: m, details: d, removed: gone }), { master: m, details: d });
+    assert.deepEqual(filesToSend(l, { master: m, details: null }), { master: m });
+  });
+});
+
+describe("client column ids", () => {
+  it("adds stable ids to aggregate columns and strips them again", () => {
+    const l = valid();
+    Object.assign(l.relations[0], { mode: "aggregate", aggregate: { columns: [{ as: "a", op: "sum", col: "x" }, { as: "b", op: "count" }] } });
+    const withIds = ensureColumnIds(l);
+    const ids = withIds.relations[0].aggregate.columns.map((c) => c._id);
+    assert.equal(new Set(ids).size, 2);
+    assert.ok(ids.every(Boolean));
+    assert.deepEqual(ensureColumnIds(withIds).relations[0].aggregate.columns.map((c) => c._id), ids);
+    assert.deepEqual(stripClientIds(withIds), l);
+    assert.equal(l.relations[0].aggregate.columns[0]._id, undefined);
   });
 });

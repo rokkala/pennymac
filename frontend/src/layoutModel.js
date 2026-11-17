@@ -24,6 +24,7 @@ export const newRelation = (detail) => ({
 export function addDetail(layout, role) {
   const name = String(role || "").trim();
   if (!name) throw new Error("A file role needs a name");
+  if (name !== "master" && !roleNameOk(name)) throw new Error("Use lowercase letters, digits and underscores, starting with a letter (not layout, readiness, manifest or files)");
   if (name === "master") throw new Error("master is the main file; add a different role");
   if ((layout.files || []).some((f) => f.role === name)) throw new Error(`There is already a file called ${name}`);
   const out = clone(layout);
@@ -40,8 +41,8 @@ export function removeDetail(layout, role) {
   return out;
 }
 
-const jsPattern = (p) => String(p || "").replace(/\(\?P</g, "(?<").replace(/\(\?P=/g, "\\k<");
-const patternError = (p) => { try { new RegExp(jsPattern(p)); return "ok"; } catch { return null; } };
+const RESERVED_ROLES = ["layout", "readiness", "manifest", "files", "source_id", "auto_start"];
+export const roleNameOk = (r) => /^[a-z][a-z0-9_]*$/.test(String(r || "")) && !RESERVED_ROLES.includes(r);
 const hasNamedGroup = (p) => /\(\?P?<(?![=!])[A-Za-z_]/.test(String(p || ""));
 
 /** Problems found on the form before it is sent. `columns` (optional): {role: [column names]} when known. */
@@ -56,8 +57,8 @@ export function validateLayoutForm(layout, readiness, columns) {
   for (const r of [...new Set(roles.filter((x, i) => roles.indexOf(x) !== i))]) errs.push(`The file ${r || "(no name)"} is listed more than once.`);
   for (const f of files) {
     if (!f.role) { errs.push("Every file needs a role name."); continue; }
+    if (f.role !== "master" && !roleNameOk(f.role)) errs.push(`The role name ${f.role} is not allowed: use lowercase letters, digits and underscores, starting with a letter (not layout, readiness, manifest or files).`);
     if (!String(f.name_pattern || "").trim()) errs.push(`The ${f.role} file needs a file name pattern.`);
-    else if (!patternError(f.name_pattern)) errs.push(`The ${f.role} file name pattern is not a valid pattern.`);
   }
   if (masters.length === 1) {
     const k = masters[0].key;
@@ -108,7 +109,7 @@ export function validateLayoutForm(layout, readiness, columns) {
     if (!(Number(ready.window_minutes) > 0)) errs.push("Readiness: the pairing window must be a positive number of minutes.");
   } else if (NAMED_GROUP_PAIRINGS.includes(ready.pairing)) {
     for (const f of files) {
-      if (f.name_pattern && patternError(f.name_pattern) && !hasNamedGroup(f.name_pattern)) errs.push(`The ${f.role} file name pattern needs a named group such as (?P<date>\\d+) to pair files.`);
+      if (f.name_pattern && !hasNamedGroup(f.name_pattern)) errs.push(`The ${f.role} file name pattern needs a named group such as (?P<date>\\d+) to pair files.`);
     }
   }
   return errs;
@@ -181,3 +182,24 @@ const JOIN_TEXT = {
   JOIN07: "A summary value was not a number and was skipped; the row still joins.",
 };
 export const joinCodeText = (code) => JOIN_TEXT[code] || "";
+
+/** {role: File} limited to the roles the layout has now (a removed role's sample must not be sent). */
+export function filesToSend(layout, files) {
+  const out = {};
+  for (const f of layout?.files || []) if (f.role && files?.[f.role]) out[f.role] = files[f.role];
+  return out;
+}
+
+let idSeq = 0;
+/** Copy of the layout with a client-only `_id` on every aggregate column (stable React keys). Never persisted: see stripClientIds. */
+export function ensureColumnIds(layout) {
+  const out = clone(layout);
+  for (const r of out.relations || []) for (const c of r.aggregate?.columns || []) if (!c._id) c._id = `col${++idSeq}`;
+  return out;
+}
+
+export function stripClientIds(layout) {
+  const out = clone(layout);
+  for (const r of out.relations || []) for (const c of r.aggregate?.columns || []) delete c._id;
+  return out;
+}

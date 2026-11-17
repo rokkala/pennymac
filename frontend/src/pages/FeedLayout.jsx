@@ -1,9 +1,9 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { proposeLayout, decideLayout, previewJoin } from "../api.js";
 import { canCap } from "../roles.js";
 import { useApi, useAction, useDialog, Panel, Loading, ActionBar, fmt, human } from "../ui.jsx";
 import {
-  emptyLayout, emptyReadiness, addDetail, removeDetail, validateLayoutForm, matchRateBadge, previewTrust, joinCodeText, AGG_OPS, PAIRINGS,
+  emptyLayout, emptyReadiness, addDetail, removeDetail, validateLayoutForm, matchRateBadge, previewTrust, joinCodeText, AGG_OPS, PAIRINGS, filesToSend, ensureColumnIds, stripClientIds,
 } from "../layoutModel.js";
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
@@ -83,7 +83,7 @@ function AggColumns({ cols, onChange, disabled }) {
     <div className="stack" style={{ gap: 8 }}>
       <span className="eyebrow">Summary columns (one value per main-file row)</span>
       {cols.map((c, i) => (
-        <div key={i} className="callout stack" style={{ gap: 6 }}>
+        <div key={c._id || i} className="callout stack" style={{ gap: 6 }}>
           <div className="row" style={{ gap: 6, flexWrap: "wrap" }}>
             <input aria-label="Output column name" className="input mono" style={{ width: 150 }} value={c.as || ""} onChange={(e) => set(i, { as: e.target.value })} placeholder="total_fees" />
             <span>=</span>
@@ -189,16 +189,20 @@ function PreviewPanel({ sourceId, layout, ready, canEdit }) {
   const [res, setRes] = useState(null);
   const [busy, setBusy] = useState(false);
   const act = useAction();
-  const all = roles.length > 0 && roles.every((r) => files[r]);
+  const toSend = filesToSend(layout, files);
+  const all = roles.length > 0 && roles.every((r) => toSend[r]);
+  const sig = JSON.stringify([stripClientIds(layout), ready]);
+  useEffect(() => { setRes(null); }, [sig]);
+  useEffect(() => { setFiles((f) => { const keep = Object.fromEntries(Object.entries(f).filter(([r]) => roles.includes(r))); return Object.keys(keep).length === Object.keys(f).length ? f : keep; }); }, [roles.join("|")]);
   const minRate = Math.max(0, ...layout.relations.map((r) => Number(r.min_match_rate) || 0));
   const run = async () => {
     setBusy(true);
-    const r = await act(() => previewJoin(sourceId, layout, ready, files));
+    const r = await act(() => previewJoin(sourceId, stripClientIds(layout), ready, toSend));
     setBusy(false);
     if (r) setRes(r);
   };
   const trust = previewTrust(res);
-  const [kind, badgeText] = res && !res.errors?.length ? BADGE[matchRateBadge(res.master_match_rate, minRate)] : ["", ""];
+  const [kind, badgeText] = res && !res.errors?.length && res.master_match_rate != null ? BADGE[matchRateBadge(res.master_match_rate, minRate)] : ["", ""];
   return (
     <Panel title="Try it on sample files" sub="Pick one small file per role. Nothing is stored or loaded; this only shows how the rows would join.">
       <div className="stack">
@@ -210,9 +214,9 @@ function PreviewPanel({ sourceId, layout, ready, canEdit }) {
         {res?.errors?.length > 0 && <div className="callout t5"><b>The preview could not run</b><ul style={{ margin: "6px 0 0 18px" }}>{res.errors.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
         {res && !res.errors?.length && <>
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-            <span className={`pill ${trust.reliable ? kind : ""}`} title="Share of main-file rows that found their detail rows">{trust.reliable ? badgeText : "Not a verdict"} · {fmt((res.master_match_rate || 0) * 100, 1)}% of main rows matched</span>
+            <span className={`pill ${trust.reliable ? kind : ""}`} title="Share of main-file rows that found their detail rows">{res.master_match_rate == null ? "No match rate" : `${trust.reliable ? badgeText : "Not a verdict"} · ${fmt(res.master_match_rate * 100, 1)}% of main rows matched`}</span>
             {Object.entries(res.detail_match_rate || {}).map(([r, v]) => <span key={r} className="chip">{r}: {fmt(v * 100, 1)}% of its rows matched</span>)}
-            {trust.reliable && res.blocked && <span className="pill fail">This file would be stopped before loading</span>}
+            {trust.reliable && res.blocked && <span className="pill fail" title={String(res.blocked)}>This file would be stopped before loading{typeof res.blocked === "string" ? `: ${res.blocked}` : ""}</span>}
             <span className="faint" style={{ fontSize: ".78rem" }}>{fmt(res.rows_read)} rows read</span>
           </div>
           {!trust.reliable && <div className="callout t4" style={{ fontSize: ".86rem" }}>{trust.note}</div>}
@@ -242,7 +246,7 @@ function PreviewPanel({ sourceId, layout, ready, canEdit }) {
 function Editor({ sourceId, data, persona, reload }) {
   const baseLayout = data.draft || data.layout || emptyLayout();
   const baseReady = data.draft ? data.readiness_draft || emptyReadiness() : data.readiness || emptyReadiness();
-  const [layout, setLayout] = useState(() => clone(baseLayout));
+  const [layout, setLayout] = useState(() => ensureColumnIds(baseLayout));
   const [ready, setReady] = useState(() => ({ ...emptyReadiness(), ...clone(baseReady) }));
   const [newRole, setNewRole] = useState("");
   const [errs, setErrs] = useState([]);
@@ -252,17 +256,17 @@ function Editor({ sourceId, data, persona, reload }) {
   const pending = !!data.draft;
   const canEdit = canCap(persona, "editDelivery");
   const canDecide = canCap(persona, "approveDelivery") && persona.id !== data.proposed_by;
-  const dirty = changed(layout, baseLayout) || changed(ready, { ...emptyReadiness(), ...baseReady });
+  const dirty = changed(stripClientIds(layout), baseLayout) || changed(ready, { ...emptyReadiness(), ...baseReady });
   const problems = useMemo(() => validateLayoutForm(layout, ready), [layout, ready]);
   const setFile = (role, f) => setLayout((l) => ({ ...l, files: l.files.map((x) => (x.role === role ? f : x)) }));
-  const setRel = (detail, r) => setLayout((l) => ({ ...l, relations: l.relations.map((x) => (x.detail === detail ? r : x)) }));
+  const setRel = (detail, r) => setLayout((l) => ensureColumnIds({ ...l, relations: l.relations.map((x) => (x.detail === detail ? r : x)) }));
   const add = () => { try { setLayout(addDetail(layout, newRole)); setNewRole(""); } catch (e) { setErrs([e.message]); } };
   const propose = async () => {
     const e = validateLayoutForm(layout, ready);
     setErrs(e);
     if (e.length) return;
     setBusy(true);
-    const r = await act(() => proposeLayout(sourceId, layout, ready), "Proposed. A different SME must approve it before files use it.");
+    const r = await act(() => proposeLayout(sourceId, stripClientIds(layout), ready), "Proposed. A different SME must approve it before files use it.");
     setBusy(false);
     if (r) reload();
   };

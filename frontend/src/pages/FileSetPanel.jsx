@@ -52,7 +52,7 @@ function SourceSets({ sourceId, name, sets, canOverride, onChanged }) {
               {!(s.members || []).length && <span className="faint">no files yet</span>}</span></td>
             <td className="faint">{ago(s.opened_at)}</td>
             <td className="r">{canOverride && OVERRIDE_OK(s) && <span className="row" style={{ gap: 4, justifyContent: "flex-end", flexWrap: "nowrap" }}>
-              {(s.members || []).length > 0 && s.status !== "overridden" && <button type="button" className="btn sm" onClick={() => override(s, "accept_partial")}>Accept partial…</button>}
+              {(s.members || []).length > 0 && ["waiting", "expired"].includes(s.status) && <button type="button" className="btn sm" onClick={() => override(s, "accept_partial")}>Accept partial…</button>}
               <button type="button" className="btn sm" onClick={() => override(s, "discard")}>Discard…</button></span>}</td>
           </tr>
         );

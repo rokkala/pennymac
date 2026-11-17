@@ -4,6 +4,7 @@ import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog, ActionBar, PageHeader } from "../ui.jsx";
 import DeliveryProfile from "./DeliveryProfile.jsx";
 import FeedLayout from "./FeedLayout.jsx";
+import { FeedConfigChip } from "./FeedConfig.jsx";
 import { groupColumnsByRole } from "../layoutModel.js";
 
 /** <option>s for a source column picker. Feeds with a multi-file layout group `role.column` names under their file; others stay flat. */
@@ -12,7 +13,6 @@ function ColumnOptions({ columns, grouped }) {
   return groupColumnsByRole(columns).map((g) => (
     <optgroup key={g.role} label={g.role === "master" ? "Main file" : `${g.role} file`}>{g.columns.map((c) => <option key={c} value={c}>{c}</option>)}</optgroup>));
 }
-import { FeedConfigChip } from "./FeedConfig.jsx";
 import { VendorList, VendorWorkspace } from "./Vendors.jsx";
 import { Segments } from "../charts.jsx";
 
