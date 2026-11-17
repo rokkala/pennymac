@@ -6,6 +6,7 @@
     evaluate_set     `waiting` -> `ready` when the readiness requirement is met
     expire_sets      sets past `wait_timeout_minutes`: alert naming the missing role(s), then apply `on_timeout`
     create_batch_for_set   one batch on the master file (one delivery, one sequence number), members linked
+    override_set     reviewer overrides (accept_partial | discard | repair) with a mandatory reason, audited
 
 Set statuses: waiting | ready | expired | overridden | consumed | discarded. Only `waiting` sets accept
 files, so a file for a role of a set that is already ready/consumed opens a new set (a correction), which
@@ -30,6 +31,7 @@ import logging
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import select
 
@@ -469,3 +471,152 @@ def create_batch_for_set(set_id: str, actor: str, strict: bool = True) -> str:
     if dup:
         raise DuplicateFileSetError(dup.batch_id, dup.created_at)
     return bid
+
+
+# ------------------------------------------------------------------ overrides
+OVERRIDE_ROLES = {"onboarding_reviewer", "compliance_reviewer", "admin"}  # the sequencing-override roles
+OVERRIDE_ACTIONS = ("accept_partial", "discard", "repair")
+_OVERRIDABLE = ("waiting", "expired", "ready", "overridden")  # and no batch yet
+
+
+def _override_record(s, action: str, actor: str, reason: str, now: datetime, **extra) -> dict:
+    """The override JSON of the set with this override appended under "overrides" (existing keys kept)."""
+    rec = {"action": action, "actor": actor, "reason": reason, "ts": now.isoformat(), **extra}
+    cur = dict(s.override or {})
+    cur["overrides"] = [*cur.get("overrides", []), rec]
+    return cur
+
+
+def _open_for_override(c, set_id: str, allowed: tuple[str, ...]):
+    """Lock the feed, then the set; reject a set that already has a batch or is not in `allowed`."""
+    fs = db.file_sets
+    s0 = c.execute(select(fs.c.source_id).where(fs.c.set_id == set_id)).first()
+    if s0 is None:
+        raise FileSetError("file set not found")
+    _lock_source(c, s0.source_id)
+    s = c.execute(select(fs).where(fs.c.set_id == set_id).with_for_update()).first()
+    if s.batch_id is not None or s.status == "consumed":
+        raise FileSetError(f"file set {set_id} is {s.status}: its batch {s.batch_id} is already queued, so it can no longer be overridden")
+    if s.status not in allowed:
+        raise FileSetError(f"file set {set_id} is {s.status}; this override applies to a set that is {' or '.join(allowed)}")
+    return s
+
+
+def override_set(set_id: str, action: Literal["accept_partial", "discard", "repair"], actor: str, roles: list[str], reason: str,
+                 target_pairing_key: str | None = None, member_role: str | None = None) -> dict:
+    """Reviewer override of a set that has no batch yet (any override after its batch was queued is rejected).
+    The role gate is the sequencing-override one (onboarding_reviewer, compliance_reviewer, admin) and the reason
+    is mandatory. Every override is merged into file_sets.override ("overrides" list, nothing else touched) and
+    audited as `fileset.override` (roles, filenames and hashes only, never contents).
+
+    accept_partial  waiting/expired set: queue a batch on the roles present (strict); details that are missing then
+                    follow `on_missing_detail`. A missing required role is allowed (the point of the override) and
+                    recorded; the master must be present.
+    discard         the set is marked discarded.
+    repair          move one member (`member_role`, optional when the set holds one file) to the waiting set with
+                    `target_pairing_key` (opened when absent); the source becomes discarded when emptied, the target
+                    is re-evaluated and queued when it becomes ready."""
+    from ..security import expand_roles
+
+    if not set(expand_roles(roles)) & OVERRIDE_ROLES:
+        raise FileSetError("SME or Compliance role required to override a file set")
+    if not (reason or "").strip():
+        raise FileSetError("a reason is required")
+    if action not in OVERRIDE_ACTIONS:
+        raise FileSetError(f"unknown override action '{action}'; use one of {', '.join(OVERRIDE_ACTIONS)}")
+    reason = reason.strip()
+    now = db.now()
+    if action == "repair":
+        return _repair(set_id, actor, reason, now, target_pairing_key, member_role)
+    return _accept_or_discard(set_id, action, actor, reason, now)
+
+
+def _accept_or_discard(set_id: str, action: str, actor: str, reason: str, now: datetime) -> dict:
+    fs = db.file_sets
+    with db.get_engine().begin() as c:
+        s = _open_for_override(c, set_id, ("waiting", "expired", "overridden") if action == "accept_partial" else _OVERRIDABLE)
+        present = _present(c, set_id)
+        detail = {"action": action, "reason": reason, "roles": sorted(present), "previous_status": s.status}
+        vals: dict = {}
+        if action == "accept_partial":
+            if "master" not in present:
+                raise FileSetError(f"file set {set_id} has no master file, so it cannot be accepted")
+            cfg = _config(s.source_id)
+            detail["missing_roles"] = _missing(cfg.layout, cfg.readiness or {}, set(present))
+            vals.update(status="overridden", ready_at=now, members_sha=_members_sha(present))
+        else:
+            vals.update(status="discarded")
+        rec = _override_record(s, action, actor, reason, now, **({"missing_roles": detail["missing_roles"]} if action == "accept_partial" else {}))
+        c.execute(fs.update().where(fs.c.set_id == set_id).values(override=rec, **vals))
+        db.audit(c, actor, "fileset.override", "file_set", set_id, detail)
+    if action == "discard":
+        return {"set_id": set_id, "status": "discarded"}
+    try:
+        batch_id = create_batch_for_set(set_id, actor, strict=True)
+    except DuplicateFileError:
+        raise  # create_batch_for_set discarded the set and recorded duplicate_of
+    except Exception:
+        with db.get_engine().begin() as c:  # nothing was queued: put the set back as it was
+            cur = c.execute(select(fs).where(fs.c.set_id == set_id).with_for_update()).first()
+            if cur.status == "overridden" and cur.batch_id is None:
+                fixed = {**(cur.override or {})}
+                fixed["overrides"] = (fixed.get("overrides") or [])[:-1]
+                c.execute(fs.update().where(fs.c.set_id == set_id).values(status=detail["previous_status"], override=fixed))
+                db.audit(c, actor, "fileset.override_failed", "file_set", set_id, {"action": action})
+        raise
+    return {"set_id": set_id, "status": "consumed", "batch_id": batch_id, "missing_roles": detail["missing_roles"]}
+
+
+def _repair(set_id: str, actor: str, reason: str, now: datetime, target_key: str | None, member_role: str | None) -> dict:
+    fs, bf = db.file_sets, db.batch_files
+    if not target_key:
+        raise FileSetError("target_pairing_key is required to repair a file set")
+    with db.get_engine().begin() as c:
+        s = _open_for_override(c, set_id, _OVERRIDABLE)
+        cfg = _config(s.source_id)
+        readiness = cfg.readiness or {}
+        present = _present(c, set_id)
+        role = member_role or (next(iter(present)) if len(present) == 1 else None)
+        if role is None or role not in present:
+            raise FileSetError(f"file set {set_id} holds roles {', '.join(sorted(present)) or 'none'}; name one with member_role")
+        if target_key == s.pairing_key:
+            raise FileSetError("the target pairing key is the set's own")
+        t = c.execute(select(fs).where(fs.c.source_id == s.source_id, fs.c.status == "waiting", fs.c.pairing_key == target_key)
+                      .order_by(fs.c.opened_at).with_for_update()).first()
+        if t is None:
+            tid = db.new_id("fst")
+            c.execute(fs.insert().values(set_id=tid, source_id=s.source_id, pairing_key=target_key, status="waiting", opened_at=now,
+                                         expires_at=now + timedelta(minutes=int(readiness.get("wait_timeout_minutes") or 0))))
+            db.audit(c, actor, "file_set.open", "file_set", tid, {"source_id": s.source_id, "pairing_key": target_key})
+            t = c.execute(select(fs).where(fs.c.set_id == tid)).first()
+        if role in _present(c, t.set_id):
+            raise FileSetError(f"the target file set already holds a {role} file")
+        m = c.execute(select(bf).where(bf.c.set_id == set_id, bf.c.role == role)).first()
+        c.execute(bf.update().where(bf.c.id == m.id).values(set_id=t.set_id))
+        left = _present(c, set_id)
+        src_vals: dict = {"override": _override_record(s, "repair", actor, reason, now, role=role, file=m.filename, to_set=t.set_id,
+                                                       to_pairing_key=target_key)}
+        if not left:
+            src_vals["status"] = "discarded"
+        else:
+            src_vals["members_sha"] = _members_sha(left)
+            if s.status in ("ready", "overridden") and _missing(cfg.layout, readiness, set(left)):
+                src_vals.update(status="waiting", ready_at=None)
+        c.execute(fs.update().where(fs.c.set_id == set_id).values(**src_vals))
+        db.audit(c, actor, "fileset.override", "file_set", set_id,
+                 {"action": "repair", "reason": reason, "role": role, "file": m.filename, "sha256": m.file_sha256,
+                  "from_pairing_key": s.pairing_key, "to_set": t.set_id, "to_pairing_key": target_key,
+                  "source_status": src_vals.get("status", s.status)})
+        t = c.execute(select(fs).where(fs.c.set_id == t.set_id).with_for_update()).first()
+        status = _evaluate(c, t, cfg, now)
+        target_id = t.set_id
+    batch_id = None
+    if status == "ready":
+        try:
+            batch_id = create_batch_for_set(target_id, actor, strict=True)
+            status = "consumed"
+        except SetNotReadyError:
+            with db.get_engine().connect() as c:
+                cur = c.execute(select(fs.c.status, fs.c.batch_id).where(fs.c.set_id == target_id)).first()
+            status, batch_id = cur.status, cur.batch_id
+    return {"set_id": set_id, "role": role, "target_set_id": target_id, "target_status": status, "batch_id": batch_id}

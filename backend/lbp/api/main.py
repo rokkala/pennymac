@@ -125,6 +125,7 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/discard"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/file-sets/{set_id}/override"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/snapshot-reviews"): ONBOARDING_REVIEW,
     ("POST", "/api/schedules"): ("monitoring", "onboarding"),
     ("PUT", "/api/schedules/{schedule_id}"): ("monitoring", "onboarding"),
@@ -1224,6 +1225,57 @@ def batch_discard(batch_id: str, body: ReasonIn, user: User = Depends(current_us
     for b in released:
         dispatch(b)
     return {"batch_id": batch_id, "status": "discarded", "released": released}
+
+
+@app.get("/api/file-sets")
+def list_file_sets(source_id: str | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=500)):
+    """File sets of multi-file feeds with their members (role, filename, row count; never contents or paths)."""
+    from sqlalchemy import select
+
+    fs, bf = db.file_sets, db.batch_files
+    q = select(fs).order_by(fs.c.opened_at.desc()).limit(limit)
+    if source_id:
+        q = q.where(fs.c.source_id == source_id)
+    if status:
+        q = q.where(fs.c.status.in_([x.strip() for x in status.split(",") if x.strip()]))
+    with db.get_engine().connect() as c:
+        sets = c.execute(q).all()
+        members: dict[str, list] = {}
+        if sets:
+            for m in c.execute(select(bf).where(bf.c.set_id.in_([s.set_id for s in sets])).order_by(bf.c.id)):
+                members.setdefault(m.set_id, []).append({"role": m.role, "filename": m.filename, "row_count": m.row_count,
+                                                         "sha256": m.file_sha256, "received_at": m.received_at})
+    out = []
+    for s in sets:
+        ov = s.override or {}
+        out.append({"set_id": s.set_id, "source_id": s.source_id, "pairing_key": s.pairing_key, "status": s.status,
+                    "opened_at": s.opened_at, "ready_at": s.ready_at, "expires_at": s.expires_at, "batch_id": s.batch_id,
+                    "members": members.get(s.set_id, []),
+                    "override": {"timeout": ov.get("timeout"), "duplicate_of": ov.get("duplicate_of"),
+                                 "error": (ov.get("error") or {}).get("message"), "overrides": ov.get("overrides") or []}})
+    return out
+
+
+class FileSetOverrideIn(BaseModel):
+    action: str
+    reason: str = ""
+    target_pairing_key: str | None = None
+    member_role: str | None = None
+
+
+@app.post("/api/file-sets/{set_id}/override")
+def file_set_override(set_id: str, body: FileSetOverrideIn, user: User = Depends(current_user)):
+    from ..multifile import fileset
+
+    try:
+        out = fileset.override_set(set_id, body.action, user.name, user.roles, body.reason, body.target_pairing_key, body.member_role)
+    except pipeline.DuplicateFileError as e:
+        raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
+    except ValueError as e:
+        _err(e)
+    if out.get("batch_id") and out.get("status", out.get("target_status")) == "consumed":
+        dispatch(out["batch_id"])
+    return out
 
 
 @app.post("/api/batches/{batch_id}/snapshot-reviews")
