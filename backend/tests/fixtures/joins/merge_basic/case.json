@@ -1,0 +1,19 @@
+{
+  "description": "1:1 merge; keys differ by leading zeros, case and whitespace; one master has no detail (on_missing_detail: allow) so its detail columns are empty; output follows master order, not detail order.",
+  "layout": {
+    "files": [
+      {"role": "master", "entity": "loan", "name_pattern": "loans_(?P<date>\\d{8})\\.csv", "key": ["loan_id"], "required": true},
+      {"role": "details", "name_pattern": "details_(?P<date>\\d{8})\\.csv", "required": true}
+    ],
+    "relations": [
+      {"detail": "details", "to": "master", "on": [{"parent": "loan_id", "detail": "loan_ref"}],
+       "normalize": ["trim", "strip_leading_zeros", "upper"], "cardinality": "one", "mode": "merge",
+       "on_missing_detail": "allow"}
+    ]
+  },
+  "files": {"master": "master.csv", "details": "details.csv"},
+  "parse_options": {},
+  "expected_rows": "expected.csv",
+  "expected_exceptions": [],
+  "expected_blocked": null
+}

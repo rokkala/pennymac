@@ -1,0 +1,4 @@
+loan_id,name,status
+00123,Alice,active
+ab45,Bob,active
+789,Carol,closed
