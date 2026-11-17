@@ -71,3 +71,6 @@ def decide_layout(source_id: str, actor: str, roles: list[str], approve: bool, c
 
         publish(source_id, actor, "layout approved")
     return {"source_id": source_id, "approved": approve}
+
+
+from .preview import preview_join  # noqa: E402,F401  (read-only: preview never writes the DB, audits or publishes)

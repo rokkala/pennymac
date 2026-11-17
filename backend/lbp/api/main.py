@@ -121,6 +121,7 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
     ("PUT", "/api/sources/{source_id}/layout"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/layout/preview"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/layout/decide"): ONBOARDING_REVIEW,
     ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
@@ -1122,6 +1123,67 @@ def put_layout(source_id: str, body: LayoutIn, user: User = Depends(current_user
         return propose_layout(source_id, body.layout, body.readiness, user.name, user.roles)
     except LayoutServiceError as e:
         _err(e)
+
+
+@app.post("/api/sources/{source_id}/layout/preview")
+async def preview_layout(source_id: str, request: Request):
+    """Dry-run join of sample files (multipart: one part per layout role, named by the role) with the `layout` and
+    `readiness` JSON form fields (omitted: the feed's live layout). Read-only: nothing is stored or audited, and
+    the uploads are deleted. Invalid layouts and join errors come back as 200 with `errors`."""
+    from types import SimpleNamespace
+
+    from starlette.concurrency import run_in_threadpool
+
+    from .. import config_store
+    from ..multifile import stage
+    from ..multifile.preview import preview_join
+
+    with db.get_engine().connect() as c:
+        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise HTTPException(404, "source not found")
+    form = await request.form()
+
+    def _json(name: str, default):
+        raw = form.get(name)
+        if raw in (None, ""):
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{name} must be JSON") from None
+
+    layout = _json("layout", src.layout)
+    if not layout:
+        raise HTTPException(400, "send a layout, or configure one for this feed first")
+    readiness = _json("readiness", src.readiness if "layout" not in form else {})
+    parts = [(k, v) for k, v in form.multi_items() if hasattr(v, "filename") and hasattr(v, "file")]
+    roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
+        if isinstance(layout, dict) else set()
+    if len(parts) > len(roles):
+        raise HTTPException(400, f"this preview has {len(parts)} files; the layout has {len(roles)} roles")
+    names = [k for k, _ in parts]
+    if len(set(names)) != len(names) or any(k not in roles for k in names):
+        raise HTTPException(400, f"send one file per layout role, as a part named by the role ({sorted(roles)})")
+    saved: list[Path] = []
+    samples: dict[str, tuple[bytes, str]] = {}
+    try:
+        for role, f in parts:
+            p = _save_upload(f)
+            saved.append(p)
+            samples[role] = (p.read_bytes(), f.filename or p.name)
+    finally:
+        for p in saved:
+            p.unlink(missing_ok=True)
+    try:
+        cfg = config_store.load(source_id)
+    except config_store.ConfigError:
+        cfg = SimpleNamespace(profile=src.profile or {}, fields=[], parse_options=src.parse_options or {})
+    try:
+        opts = stage._parse_overrides(layout, cfg)
+    except (AttributeError, TypeError):  # a malformed layout: preview_join reports it as errors
+        opts = {}
+    return await run_in_threadpool(preview_join, layout, readiness, samples, opts, 10, cfg)
 
 
 @app.post("/api/sources/{source_id}/layout/decide")
