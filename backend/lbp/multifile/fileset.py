@@ -113,7 +113,7 @@ def plan_files(layout: dict, readiness: dict, names: list[str], manifest: dict[s
         if fname in by_name:
             raise FileSetError(f"the manifest assigns '{fname}' to more than one role")
         by_name[fname] = role
-    out, seen = [], set()
+    out, seen, keys = [], set(), set()
     for n in names:
         role = by_name.get(n)
         if role is None:
@@ -124,9 +124,12 @@ def plan_files(layout: dict, readiness: dict, names: list[str], manifest: dict[s
         if role in seen:
             raise FileSetError(f"more than one file for role {role!r} in one upload")
         seen.add(role)
-        pairing_key(readiness or {}, _captures(layout, role, n), _naive_utc(now))
+        keys.add(pairing_key(readiness or {}, _captures(layout, role, n), _naive_utc(now)))
         out.append((n, role))
-    return out
+    if len(keys) > 1:
+        raise FileSetError(f"the files of one upload must share one pairing value; found {len(keys)}: {', '.join(sorted(keys))}")
+    # the master last: with require master_only it would make the set ready before its details are attached
+    return sorted(out, key=lambda x: x[1] == "master")
 
 
 def _naive_utc(t: datetime | None) -> datetime:
@@ -154,17 +157,16 @@ def _missing(layout: dict, readiness: dict, present: set[str]) -> list[str]:
 
 
 def feed_layout(source_id: str) -> dict | None:
-    """The published layout of a feed, or None for a single-file feed. A feed without a published configuration
-    counts as single-file only when it has no approved layout either; otherwise the ConfigError is raised."""
-    from ..config_store import ConfigError, load
+    """The published layout of a feed, or None for a single-file feed. The feed row's approved `layout` is read
+    first: a feed without one is single-file and its configuration bundle is never read (so a missing or corrupt
+    bundle behaves exactly as before). A feed with one loads its published bundle; its ConfigError is raised."""
+    from ..config_store import load
 
-    try:
-        return load(source_id).layout or None
-    except ConfigError:
-        with db.get_engine().connect() as c:
-            if c.execute(select(db.sources.c.layout).where(db.sources.c.source_id == source_id)).scalar():
-                raise
+    with db.get_engine().connect() as c:
+        approved = c.execute(select(db.sources.c.layout).where(db.sources.c.source_id == source_id)).scalar()
+    if not approved:
         return None
+    return load(source_id).layout or None
 
 
 def _config(source_id: str):
@@ -364,12 +366,17 @@ def _expire_one(set_id: str, source_id: str, now: datetime):
 
 
 def expire_sets(now: datetime | None = None) -> list[str]:
+    """See sweep_sets; returns the set_ids whose timeout was handled in this call."""
+    return sweep_sets(now)["handled"]
+
+
+def sweep_sets(now: datetime | None = None) -> dict:
     """Handle waiting sets whose wait_timeout has passed (each once): alert naming the missing role(s), then
     on_timeout: alert_only keeps the set waiting; fail marks it expired; load_master_only queues a batch on
     the files present when every missing role is non-required and the master is present (else expired).
     Then retry every ready set that has no batch (a crash or failure after it became ready). Each set is
-    handled in isolation: an error is recorded on that set and the sweep goes on. Returns the set_ids whose
-    timeout was handled in this call."""
+    handled in isolation: an error is recorded on that set and the sweep goes on. Returns {"handled": set_ids
+    whose timeout was handled in this call, "batches": batch ids queued by it (the caller starts them)}."""
     from ..scheduling import alerts
 
     now = _naive_utc(now)
@@ -378,6 +385,7 @@ def expire_sets(now: datetime | None = None) -> list[str]:
         due = c.execute(select(fs.c.set_id, fs.c.source_id).where(fs.c.status == "waiting", fs.c.expires_at.is_not(None),
                                                                    fs.c.expires_at <= now).order_by(fs.c.expires_at)).all()
     handled: list[str] = []
+    queued: list[str] = []
     for set_id, source_id in due:
         try:
             note = _expire_one(set_id, source_id, now)
@@ -392,7 +400,7 @@ def expire_sets(now: datetime | None = None) -> list[str]:
                             .order_by(fs.c.ready_at)).all()
     for set_id, source_id in pending:
         try:
-            create_batch_for_set(set_id, "scheduler")
+            queued.append(create_batch_for_set(set_id, "scheduler"))
         except DuplicateFileError:
             continue  # recorded on the set (discarded, duplicate_of) by create_batch_for_set
         except SetNotReadyError:
@@ -405,7 +413,7 @@ def expire_sets(now: datetime | None = None) -> list[str]:
                                                     f"queued: {_safe_message(e)}", {"set_id": set_id, "source_id": source_id})
                 except Exception:  # noqa: BLE001
                     log.exception("could not alert on file set %s", set_id)
-    return handled
+    return {"handled": handled, "batches": queued}
 
 
 # ------------------------------------------------------------------ batch

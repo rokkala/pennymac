@@ -281,7 +281,7 @@ def test_tick_expires_waiting_sets(feed, env, monkeypatch):
         calls.append(now)
         raise RuntimeError("loan 1234567890 broke")
 
-    monkeypatch.setattr(fileset, "expire_sets", boom)
+    monkeypatch.setattr(fileset, "sweep_sets", boom)
     with __import__("unittest.mock").mock.patch.object(svc.log, "warning") as warn:
         out = svc.tick(now=t0 + timedelta(minutes=300))
     assert calls and "materialized" in out and "skipped" not in out
@@ -402,3 +402,143 @@ def test_s3_arrival_attaches_role(feed, legacy, env, monkeypatch, tmp_path):
         leg = drop(legacy, "CORR_20261117.csv", sample.read_text())
         assert set(leg) == {"batch_id", "execution_arn"} and leg["execution_arn"]
         assert _rows(db.batches, batch_id=leg["batch_id"])[0].file_set_id is None
+
+
+# ------------------------------------------------------------------ review fixes (round 1)
+OPTIONAL = {**LAYOUT, "files": [LAYOUT["files"][0], {**LAYOUT["files"][1], "required": False}]}
+
+
+def test_master_only_upload_set_attaches_master_last(client, feed, env):
+    """master_only: the master as the FIRST member must not make the set ready before its detail is attached."""
+    _configure(feed, OPTIONAL, {**READY, "require": "master_only"})
+    z = _zip({"loans_20261117.csv": MASTER, "borrowers_20261117.csv": BORR})
+    r = client.post("/api/upload/set", data={"source_id": feed, "auto_start": "false"},
+                    files=[("files", ("delivery.zip", z, "application/zip"))], headers=OPS)
+    assert r.status_code == 200, r.text
+    res = r.json()
+    assert len({x["set_id"] for x in res}) == 1 and [x["role"] for x in res] == ["borrowers", "master"]
+    assert res[-1]["status"] == "consumed" and res[-1]["batch_id"]
+    assert {m.role for m in _rows(db.batch_files, set_id=res[0]["set_id"])} == {"master", "borrowers"}
+    assert len(_rows(db.file_sets)) == 1
+
+
+def test_master_only_pull_attaches_master_last(feed, env):
+    from lbp.scheduling import service as svc
+
+    _configure(feed, OPTIONAL, {**READY, "require": "master_only"})
+    drop = env / "data" / "dropzone" / "mf"
+    drop.mkdir(parents=True)
+    (drop / "borrowers_20261117.csv").write_text(BORR)
+    (drop / "loans_20261117.csv").write_text(MASTER)  # LocalPuller lists by name: borrowers, loans; also try the reverse
+    (drop / "aaa_loans_20261118.csv").write_text(MASTER)  # matches no role
+    sch = svc.create_schedule(feed, "Daily", {"cron": "0 6 * * *", "timezone": "UTC", "calendar": "none",
+                                              "pull": {"protocol": "local", "path": "mf", "pattern": "*.csv"}}, "ops1", ["ops"])
+    svc.decide(sch["schedule_id"], "sme1", ["sme"], True)
+    from lbp.scheduling import pullers
+
+    real = pullers.LocalPuller.list
+    pullers.LocalPuller.list = lambda self: sorted(real(self), key=lambda f: not f.name.startswith("loans"))  # master first
+    try:
+        out = svc.pull_now(sch["schedule_id"], "ops1", ["ops"])
+    finally:
+        pullers.LocalPuller.list = real
+    assert sorted(out["fetched"]) == ["borrowers_20261117.csv", "loans_20261117.csv"] and len(out["batches"]) == 1
+    sets = _rows(db.file_sets)
+    assert len(sets) == 1 and sets[0].status == "consumed"
+    assert {m.role for m in _rows(db.batch_files, set_id=sets[0].set_id)} == {"master", "borrowers"}
+
+
+def test_tick_dispatches_batches_queued_by_the_sweep(feed, env):
+    from lbp.multifile import fileset
+    from lbp.scheduling import service as svc
+
+    _configure(feed, OPTIONAL, {**READY, "on_timeout": "load_master_only"})
+    p = env / "loans_20261117.csv"
+    p.write_text(MASTER)
+    t0 = datetime(2026, 11, 17, 8, 0)
+    a = fileset.attach_file(feed, p.name, p, "ops1", arrived_at=t0)
+    out = svc.tick(now=t0 + timedelta(minutes=241))
+    s = _rows(db.file_sets, set_id=a["set_id"])[0]
+    assert s.status == "consumed" and s.batch_id
+    assert out["batches"] == [s.batch_id] and out["file_sets_expired"] == [a["set_id"]]
+    assert fileset.expire_sets(t0 + timedelta(minutes=300)) == []  # existing return contract: handled set ids
+
+
+def test_scheduler_tick_lambda_dispatches_sweep_batches(feed, env, monkeypatch):
+    from moto import mock_aws
+
+    from lbp.multifile import fileset
+    from tests.test_lambdas import _aws, _executions, _load
+
+    _configure(feed, OPTIONAL, {**READY, "on_timeout": "load_master_only"})
+    with mock_aws():
+        h = _load(monkeypatch)
+        sfn, arn = _aws(monkeypatch)
+        p = env / "loans_20261117.csv"
+        p.write_text(MASTER)
+        fileset.attach_file(feed, p.name, p, "ops1", arrived_at=datetime(2026, 1, 1, 8, 0))  # long expired
+        out = h.scheduler_tick({}, None)
+        assert out["batches"] == 1
+        assert len(_executions(sfn, arn)) == 1
+
+
+def test_legacy_feed_ignores_a_corrupt_config_bundle(client, legacy, env, monkeypatch):
+    _no_set_code(monkeypatch)
+    cur = env / "data" / "config" / "feeds" / legacy / "current.json"
+    cur.parent.mkdir(parents=True, exist_ok=True)
+    cur.write_text("{not json")
+    sample = env / "samples" / "correspondent_sample.csv"
+    with open(sample, "rb") as f:
+        r = client.post("/api/upload", data={"source_id": legacy, "auto_start": "false"},
+                        files={"file": ("CORR_20261117.csv", f)}, headers=OPS)
+    assert r.status_code == 200, r.text
+    assert set(r.json()) == {"batch_id", "status"}
+
+
+def test_s3_arrival_config_error_is_alerted(feed, env, monkeypatch, tmp_path):
+    import boto3
+    from moto import mock_aws
+
+    from lbp import config_store
+    from tests.test_lambdas import _aws, _load
+
+    with mock_aws():
+        h = _load(monkeypatch)
+        _aws(monkeypatch)
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="lbp-raw")
+
+        def bad(_sid):
+            raise config_store.ConfigError("feed configuration failed signature verification")
+
+        monkeypatch.setattr(config_store, "load", bad)
+        p = tmp_path / "loans_20261117.csv"
+        p.write_text(MASTER)
+        key = f"incoming/{feed}/loans_20261117.csv"
+        s3.upload_file(str(p), "lbp-raw", key)
+        out = h.on_file_arrival({"detail": {"bucket": {"name": "lbp-raw"}, "object": {"key": key}}}, None)
+        assert out.get("rejected") and out["key"] == key
+        assert [r for r in _rows(db.audit_log) if r.action == "alert.file_set_rejected"]
+
+
+def test_upload_set_refuses_bad_requests_before_attaching(client, feed, env):
+    def post(files, headers=OPS):
+        return client.post("/api/upload/set", data={"source_id": feed, "auto_start": "false"}, files=files, headers=headers)
+
+    before = _upload_dir_files(env)
+    # unsupported compression method -> 400
+    raw = bytearray(_zip({"loans_20261117.csv": MASTER}))
+    for sig, off in ((b"PK\x03\x04", 8), (b"PK\x01\x02", 10)):
+        i = raw.find(sig)
+        raw[i + off:i + off + 2] = (99).to_bytes(2, "little")
+    r = post([("files", ("d.zip", bytes(raw), "application/zip"))])
+    assert r.status_code == 400, r.text
+    # all files of one request share one pairing key
+    r = post([("files", ("d.zip", _zip({"loans_20261117.csv": MASTER, "borrowers_20261118.csv": BORR}), "application/zip"))])
+    assert r.status_code == 400 and "pairing" in r.text
+    # more parts than the layout has roles: refused before any part is saved
+    r = post([("files", (f"loans_2026111{i}.csv", MASTER)) for i in range(3)])
+    assert r.status_code == 400 and "at most 2" in r.text
+    # a non-monitoring role is refused
+    assert post([("files", ("loans_20261117.csv", MASTER))], {"X-User": "ana", "X-Roles": "analyst"}).status_code == 403
+    assert _rows(db.file_sets) == [] and _upload_dir_files(env) == before

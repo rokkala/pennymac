@@ -410,6 +410,8 @@ def _extract_zip(f: UploadFile) -> list[tuple[str, Path]]:
                             w.write(chunk)
                 except (zipfile.BadZipFile, zlib.error, EOFError):
                     raise HTTPException(400, f"zip member '{i.filename}' is corrupt") from None
+                except NotImplementedError:
+                    raise HTTPException(400, f"zip member '{i.filename}' uses an unsupported compression method") from None
                 _check_upload_content(dest, Path(safe).suffix.lower(), limit)
     except BaseException:
         for _, p in out:
@@ -851,7 +853,7 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
     """The files of one multi-file delivery: several `files` parts, or one .zip. An optional `manifest`
     (JSON {role: filename}) assigns roles; other files are routed by the layout's name patterns. All or
     nothing: a file that routes nowhere (or any other problem found before attaching) attaches no file.
-    Returns the per-file results [{set_id, role, status, batch_id}] in upload order."""
+    Returns the per-file results [{set_id, role, status, batch_id}], the master last."""
     from ..config_store import load
     from ..multifile.fileset import FileSetError, plan_files
 
@@ -873,6 +875,9 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
                 raise HTTPException(400, "send one .zip, or several files, not both")
             saved = _extract_zip(files[0])
         else:
+            cap = min(len([f for f in layout.get("files") or [] if f.get("role")]), ZIP_MAX_MEMBERS)
+            if len(files) > cap:  # refused before any part is saved
+                raise HTTPException(400, f"this upload has {len(files)} files; the feed layout accepts at most {cap}")
             for f in files:
                 name = Path(f.filename or "upload").name
                 if name in {n for n, _ in saved}:
@@ -887,6 +892,8 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
             p.unlink(missing_ok=True)
         raise
     local = dict(saved)
+    # Not transactional across files: an error while attaching (e.g. a 409 on the last file) leaves the files
+    # attached before it in their sets; routing, manifest and pairing problems are all refused above, before any.
     return _attach_uploads(source_id, [(n, local[n], role) for n, role in plan], user, auto_start)
 
 
