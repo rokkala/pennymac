@@ -43,6 +43,21 @@ describe("validateLayoutForm", () => {
   it("accepts a complete layout", () => {
     assert.deepEqual(validateLayoutForm(valid(), emptyReadiness()), []);
   });
+  it("needs every relation to join the master (relation trees are a later phase)", () => {
+    const l = addDetail(valid(), "items");
+    l.files[2].name_pattern = "^items_(?P<date>\\d{8})\\.csv$";
+    l.relations[1].on = [{ parent: "id", detail: "x" }];
+    assert.deepEqual(validateLayoutForm(l, emptyReadiness()), []);
+    l.relations[1].to = "details";
+    assert.ok(validateLayoutForm(l, emptyReadiness()).some((e) => /items to details/.test(e) && /master/.test(e) && /later phase/.test(e)));
+  });
+  it("refuses master-only readiness while a detail file is required", () => {
+    const l = valid();
+    const ready = { ...emptyReadiness(), require: "master_only" };
+    assert.ok(validateLayoutForm(l, ready).some((e) => /master/.test(e) && /details/.test(e) && /required/.test(e)));
+    l.files[1].required = false;
+    assert.deepEqual(validateLayoutForm(l, ready), []);
+  });
   it("rejects zero masters", () => {
     const l = valid();
     l.files = l.files.filter((f) => f.role !== "master");

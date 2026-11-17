@@ -41,6 +41,12 @@ def propose_layout(source_id: str, layout: dict, readiness: dict, actor: str, ro
         if not src:
             raise LayoutServiceError("unknown source")
         errs = validate_layout(layout, readiness, known_columns(src.profile))
+        from ..pipeline.delivery import profile_of
+
+        lt = profile_of(src.delivery)["load_type"]
+        if lt != "full":
+            errs.append(f"this feed's delivery profile load type is {lt}; multi-file layouts support full loads only in this "
+                        "phase (snapshot and incremental are refused)")
         if errs:
             raise LayoutServiceError("; ".join(errs))
         clean = normalize_layout(layout)

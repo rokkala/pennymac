@@ -196,3 +196,25 @@ def test_cardinality_default_depends_on_mode():
     lay["relations"][0]["mode"] = "merge"
     lay["relations"][0]["cardinality"] = "many"
     assert normalize_layout(lay)["relations"][0]["cardinality"] == "many"  # explicit never overridden
+
+
+def test_relations_must_join_the_master_in_phase_1():
+    """I6: the engine joins every detail to the master; a relation tree (detail -> detail) is a later phase."""
+    lay = layout()
+    lay["files"].append({"role": "items", "name_pattern": r"items_(?P<date>\d{8})\.csv"})
+    lay["relations"].append({"detail": "items", "to": "fees", "on": [{"parent": "loan_ref", "detail": "fee_ref"}], "mode": "merge"})
+    errs = validate_layout(lay, None)
+    assert any("items->fees" in e and "master" in e and "later phase" in e for e in errs)
+    lay["relations"][1]["to"] = "master"
+    lay["relations"][1]["on"] = [{"parent": "loan_id", "detail": "fee_ref"}]
+    assert validate_layout(lay, None) == []
+
+
+def test_master_only_forbids_required_details():
+    """I6: with require master_only a set is released on the master alone; a required detail could then never
+    join, so the combination is refused."""
+    lay = layout()
+    assert validate_layout(lay, {"require": "master_only"}) == []
+    lay["files"][1]["required"] = True
+    errs = validate_layout(lay, {"require": "master_only"})
+    assert any("master_only" in e and "fees" in e for e in errs)

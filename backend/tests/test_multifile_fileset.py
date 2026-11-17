@@ -611,3 +611,29 @@ def test_attach_does_not_return_a_batch_it_did_not_queue(env, feed, monkeypatch)
 def _audit_all():
     with db.get_engine().connect() as c:
         return c.execute(select(db.audit_log)).all()
+
+
+@pytest.mark.parametrize("load_type", ["snapshot", "incremental"])
+def test_set_batches_refuse_snapshot_and_incremental(env, feed, load_type):
+    """I5 (Phase 1): a file-set batch loads as full only; join-excluded masters would look absent from a
+    snapshot. Strict (API) raises; unattended (strict=False) records a failed batch with the reason."""
+    from lbp.pipeline.delivery import DeliveryError
+
+    with db.get_engine().begin() as c:
+        c.execute(update(db.sources).where(db.sources.c.source_id == feed).values(delivery={"load_type": load_type}))
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with pytest.raises(DeliveryError, match="full"):
+        attach_file(feed, "borrowers_20261117.csv", _file(env, "borrowers_20261117.csv", BORR), "api", arrived_at=T0)
+    assert _set(a["set_id"]).status == "ready" and _batches(feed) == []
+    bid = create_batch_for_set(a["set_id"], "s3-intake", strict=False)
+    b = _batches(feed)[0]
+    assert b.batch_id == bid and b.status == "failed" and "full" in b.error
+    # defence in depth: running (resuming) such a batch never reaches the snapshot/incremental paths
+    from lbp.pipeline.batch import run_batch
+
+    with pytest.raises(ValueError, match="full"):
+        run_batch(bid)
+    b = _batches(feed)[0]
+    assert b.status == "failed" and b.processed in (0, None)
+    with db.get_engine().connect() as c:
+        assert c.execute(select(db.loans_staging).where(db.loans_staging.c.batch_id == bid)).all() == []

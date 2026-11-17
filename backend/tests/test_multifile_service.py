@@ -127,3 +127,14 @@ def test_decide_endpoint_reports_publish_failure(client, onboarded, monkeypatch)
     monkeypatch.setattr(config_store, "publish", boom)
     r = client.post(f"/api/sources/{sid}/layout/decide", json={"approve": True}, headers=sme)
     assert r.status_code == 502 and "republish" in r.json()["detail"] and "approved" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("load_type", ["snapshot", "incremental"])
+def test_propose_refused_when_delivery_load_type_is_not_full(onboarded, load_type):
+    """I5: Phase 1 multi-file feeds load as full; a feed delivered as snapshot/incremental cannot get a layout."""
+    sid = onboarded["pcg_retail"]["source_id"]
+    with db.get_engine().begin() as c:
+        c.execute(db.sources.update().where(db.sources.c.source_id == sid).values(delivery={"load_type": load_type}))
+    with pytest.raises(LayoutServiceError, match=f"{load_type}.*full"):
+        propose_layout(sid, LAYOUT, READY, "ana", ANA)
+    assert _src(sid).layout_draft is None

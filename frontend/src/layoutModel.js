@@ -72,6 +72,7 @@ export function validateLayoutForm(layout, readiness, columns) {
     if (!roles.includes(r.detail)) errs.push(`${tag}: the detail file ${r.detail || "(none)"} is not in the file list.`);
     if (!roles.includes(r.to)) errs.push(`${tag}: the parent file ${r.to || "(none)"} is not in the file list.`);
     if (r.detail === "master") errs.push(`${tag}: the master cannot be a detail file.`);
+    else if (roles.includes(r.to) && r.to !== "master") errs.push(`${tag}: every detail file must join the master in this phase; a detail of a detail is a later phase.`);
     if (seenDetail.has(r.detail)) errs.push(`${tag}: ${r.detail} has more than one relation.`);
     seenDetail.add(r.detail);
     const on = Array.isArray(r.on) ? r.on : [];
@@ -98,6 +99,10 @@ export function validateLayoutForm(layout, readiness, columns) {
     }
   }
   if (!["all_required", "master_only"].includes(ready.require)) errs.push("Readiness: choose all required files or the master only.");
+  else if (ready.require === "master_only") {
+    const req = files.filter((f) => f.role !== "master" && f.required).map((f) => f.role);
+    if (req.length) errs.push(`Readiness: a delivery cannot be ready on the master alone while detail files are required (${req.join(", ")}).`);
+  }
   if (!PAIRINGS.includes(ready.pairing)) errs.push("Readiness: choose how the files of one delivery are paired.");
   if (!(Number(ready.wait_timeout_minutes) >= 0)) errs.push("Readiness: the wait time must be 0 or more minutes.");
   if (!["fail", "load_master_only", "alert_only"].includes(ready.on_timeout)) errs.push("Readiness: choose what happens when the wait runs out.");

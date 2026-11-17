@@ -211,6 +211,10 @@ def create_batch(source_id: str, file_path: Path, filename: str, actor: str, all
         return _register_batch(c, source_id, file_path, filename, actor, local, digest, allow_duplicate, reason, load_type, strict)
 
 
+SET_LOAD_TYPE_ERROR = ("multi-file (file-set) batches load as full in this phase; snapshot and incremental load types "
+                       "are not supported for feeds with a layout")
+
+
 def _register_batch(c, source_id: str, file_path, filename: str, actor: str, local: Path, digest: str, allow_duplicate: bool,
                     reason: str | None, load_type: str | None, strict: bool, file_set_id: str | None = None) -> str:
     """create_batch's body on an open connection (the caller owns the transaction). `file_set_id` links the
@@ -238,6 +242,8 @@ def _register_batch(c, source_id: str, file_path, filename: str, actor: str, loc
             raise DeliveryError(f"vendor {vstatus.name} is {vstatus.status}; its files are recorded but not processed")
         if lt not in LOAD_TYPES:
             raise DeliveryError(f"load_type must be one of {', '.join(LOAD_TYPES)}")
+        if file_set_id and lt != "full":  # join-excluded masters would look absent from a snapshot (Phase 1)
+            raise DeliveryError(SET_LOAD_TYPE_ERROR)
         if lt == "incremental" and prof["action"].get("mode") == "filename" and not file_action(prof, filename):
             raise DeliveryError(f"'{filename}' does not match any add/update/close filename pattern for this vendor")
         if lt != "full":
@@ -417,6 +423,11 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
             c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="failed", error=f"configuration: {e}"))
             db.audit(c, "pipeline", "batch.config_rejected", "batch", batch_id, {"error": str(e)})
         raise
+    if b.file_set_id and (b.load_type or "full") != "full":  # refused at registration; never run (Phase 1)
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="failed", error=SET_LOAD_TYPE_ERROR))
+            db.audit(c, "pipeline", "batch.load_type_rejected", "batch", batch_id, {"load_type": b.load_type})
+        raise ValueError(SET_LOAD_TYPE_ERROR)
     if cfg.mapping_id != b.mapping_id:
         # resuming a drift-blocked batch (or one queued before a new version) runs on the newest published mapping
         with eng.begin() as c:

@@ -147,6 +147,9 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
             errs.append(f"{tag}: parent role {parent!r} is not declared in files")
         if detail == "master":
             errs.append(f"{tag}: the master cannot be a detail")
+        elif parent in by_role and parent != "master":
+            errs.append(f"{tag}: every relation must join the master in this phase (to: master); relation trees "
+                        "(a detail of a detail) are a later phase")
         if detail in details_seen:
             errs.append(f"{tag}: detail role {detail!r} has more than one relation")
         details_seen.add(detail)
@@ -203,6 +206,11 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
 
     if ready["require"] not in ("all_required", "master_only"):
         errs.append("readiness.require must be all_required or master_only")
+    elif ready["require"] == "master_only":
+        req = [f.get("role") for f in files if f.get("role") != "master" and f.get("required")]
+        if req:
+            errs.append(f"readiness.require master_only is invalid while detail files are required: {req} "
+                        "(a set released on the master alone could never load them)")
     if ready["pairing"] not in PAIRINGS:
         errs.append(f"readiness.pairing must be one of {PAIRINGS}")
     try:
