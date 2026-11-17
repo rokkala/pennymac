@@ -16,7 +16,7 @@ import json
 import random
 from datetime import timedelta
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 
 from ..ai import get_llm
 from ..ingestion.pii import TARGET_PII_TYPES, mask_record
@@ -31,6 +31,15 @@ OPEN_STATES = ("open", "pending_review", "pending_checker", "escalated")
 
 class ExceptionActionError(ValueError):
     pass
+
+
+JOIN_CATEGORY = "join"
+JOIN_ONLY_ACK = ("join exceptions have no staged loan: they cannot be resolved with a value or rejected as a loan; "
+                 "acknowledge (close) them with a reason, or fix the files and resend the set")
+
+
+def _is_join(ex) -> bool:
+    return (ex.get("category") if isinstance(ex, dict) else getattr(ex, "category", None)) == JOIN_CATEGORY
 
 
 def _str(v):
@@ -217,10 +226,12 @@ class ExceptionManager:
             if not row:
                 raise ExceptionActionError("exception not found")
             ex = db.row_to_dict(row)
-            st = c.execute(select(db.loans_staging).where(db.loans_staging.c.id == ex["staging_id"])).first()
-            siblings = c.execute(select(db.exceptions.c.exception_id, db.exceptions.c.rule_id, db.exceptions.c.field,
-                                        db.exceptions.c.status, db.exceptions.c.tier)
-                                 .where(db.exceptions.c.staging_id == ex["staging_id"])).all()
+            st, siblings = None, []
+            if ex["staging_id"] is not None:  # NULL (join exceptions) must never mean "every unstaged exception"
+                st = c.execute(select(db.loans_staging).where(db.loans_staging.c.id == ex["staging_id"])).first()
+                siblings = c.execute(select(db.exceptions.c.exception_id, db.exceptions.c.rule_id, db.exceptions.c.field,
+                                            db.exceptions.c.status, db.exceptions.c.tier)
+                                     .where(db.exceptions.c.staging_id == ex["staging_id"])).all()
             audit = c.execute(select(db.audit_log).where(db.audit_log.c.entity_id == exception_id).order_by(db.audit_log.c.ts)).all()
         record = (st.record if st else {}) or {}
         can_see_pii = bool(set(roles or []) & {"compliance", "admin"})
@@ -286,6 +297,8 @@ class ExceptionManager:
                 comment: str | None = None) -> dict:
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
+            if _is_join(ex):
+                raise ExceptionActionError(JOIN_ONLY_ACK)
             if ex["status"] not in ("open", "pending_review"):
                 raise ExceptionActionError(f"cannot resolve an exception in status {ex['status']}")
             if ex["tier"] == "T5":
@@ -337,14 +350,37 @@ class ExceptionManager:
         roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
+            if _is_join(ex):
+                raise ExceptionActionError(JOIN_ONLY_ACK)
             if ex["tier"] == "T5" and "compliance_reviewer" not in roles and "admin" not in roles:
                 raise ExceptionActionError("only Compliance can act on T5 exceptions")
-            c.execute(db.exceptions.update().where(and_(db.exceptions.c.staging_id == ex["staging_id"],
-                                                        db.exceptions.c.status.in_(OPEN_STATES)))
+            if ex["staging_id"] is None:  # no staged loan: scope to this exception only, never `staging_id IS NULL`
+                scope = db.exceptions.c.exception_id == exception_id
+            else:
+                scope = db.exceptions.c.staging_id == ex["staging_id"]
+            c.execute(db.exceptions.update().where(and_(scope, db.exceptions.c.status.in_(OPEN_STATES)))
                       .values(status="rejected", maker=actor, resolved_at=db.now()))
-            c.execute(db.loans_staging.update().where(db.loans_staging.c.id == ex["staging_id"]).values(status="REJECTED", updated_at=db.now()))
+            if ex["staging_id"] is not None:
+                c.execute(db.loans_staging.update().where(db.loans_staging.c.id == ex["staging_id"]).values(status="REJECTED", updated_at=db.now()))
             db.audit(c, actor, "loan.reject", "exception", exception_id, {"reason": reason, "loan_number": ex["loan_number"]})
         return {"exception_id": exception_id, "status": "rejected"}
+
+    def acknowledge(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
+        """Close one join exception with a mandatory reason (the action set of category `join`: no value resolve,
+        no reject-loan, nothing written to precedent memory). Only this exception changes; audited."""
+        reason = (reason or "").strip()
+        with db.get_engine().begin() as c:
+            ex = self._load(c, exception_id)
+            if not _is_join(ex):
+                raise ExceptionActionError("acknowledge applies to join exceptions only")
+            if ex["status"] not in OPEN_STATES:
+                raise ExceptionActionError(f"cannot acknowledge an exception in status {ex['status']}")
+            if not reason:
+                raise ExceptionActionError("a reason is required to acknowledge a join exception")
+            self._set(c, exception_id, status="resolved", maker=actor, resolved_at=db.now())
+            db.audit(c, actor, "exception.join_acknowledged", "exception", exception_id,
+                     {"reason": reason, "rule_id": ex["rule_id"], "batch_id": ex["batch_id"], "role": ex.get("role")})
+        return {"exception_id": exception_id, "status": "resolved"}
 
     def escalate(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
         with db.get_engine().begin() as c:
@@ -362,6 +398,8 @@ class ExceptionManager:
             raise ExceptionActionError("Compliance role required")
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
+            if _is_join(ex):
+                raise ExceptionActionError(JOIN_ONLY_ACK)
             if ex["tier"] != "T5":
                 raise ExceptionActionError("only T5 exceptions use compliance clearance")
             if not comment:
@@ -375,7 +413,8 @@ class ExceptionManager:
     def bulk_resolve(self, actor: str, roles: list[str], rule_id: str, original_value, value=None, use_proposal: bool = False,
                      batch_id: str | None = None, limit: int = 5000) -> dict:
         t = db.exceptions
-        conds = [t.c.rule_id == rule_id, t.c.status.in_(("open", "pending_review")), t.c.tier.in_(("T2", "T3"))]
+        conds = [t.c.rule_id == rule_id, t.c.status.in_(("open", "pending_review")), t.c.tier.in_(("T2", "T3")),
+                 or_(t.c.category.is_(None), t.c.category != JOIN_CATEGORY)]
         conds.append(t.c.original_value.is_(None) if original_value is None else t.c.original_value == _str(original_value))
         if batch_id:
             conds.append(t.c.batch_id == batch_id)
@@ -422,6 +461,8 @@ class ExceptionManager:
     def ai_suggest(self, exception_id: str) -> dict:
         """On-demand LLM suggestion with masked context; stored as proposal, never auto-applied."""
         ex = self.get(exception_id)
+        if _is_join(ex):
+            raise ExceptionActionError(JOIN_ONLY_ACK)
         if ex["tier"] in ("T5",):
             raise ExceptionActionError("no AI suggestions for blocked loans")
         llm = get_llm()
@@ -443,6 +484,8 @@ class ExceptionManager:
 
     # ------------------------------------------------------------------ internals
     def _remember(self, c, ex, value, actor):
+        if _is_join(ex):  # masked raw rows, not field values: never precedent memory
+            return
         self.index.add(c, ex["rule_id"], ex["field"], ex["source_id"], ex["original_value"], _str(value), {"tier": ex["tier"]}, actor)
 
     def _finalize_loan(self, c, staging_id: int, actor: str) -> bool:
@@ -454,6 +497,8 @@ class ExceptionManager:
         from ..rules.executor import RuleExecutor
         from ..rules.registry import RuleRegistry
 
+        if staging_id is None:  # nothing staged (e.g. join exceptions): never `staging_id IS NULL`
+            return False
         st = c.execute(select(db.loans_staging).where(db.loans_staging.c.id == staging_id)).first()
         if not st or st.boarded:
             return False

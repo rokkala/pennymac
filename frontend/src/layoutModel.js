@@ -183,6 +183,11 @@ const JOIN_TEXT = {
 };
 export const joinCodeText = (code) => JOIN_TEXT[code] || "";
 
+/** Join exceptions have no staged loan: their only action is acknowledge (close) with a reason, never a value
+ * resolve, bulk resolve, escalate or reject-loan (the server refuses those too). */
+export const isJoinException = (ex) => ex?.category === "join";
+export const canAcknowledgeJoin = (ex) => isJoinException(ex) && ["open", "pending_review", "pending_checker", "escalated"].includes(ex?.status);
+
 /** {role: File} limited to the roles the layout has now (a removed role's sample must not be sent). */
 export function filesToSend(layout, files) {
   const out = {};

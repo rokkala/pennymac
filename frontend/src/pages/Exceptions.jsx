@@ -9,7 +9,7 @@ import {
 } from "../exceptionGroups.js";
 import { SCREEN, exceptionDeskSub } from "../screenCopy.js";
 import { useApi, useAction, Panel, Status, Conf, Tier, TIER_NAMES, Tabs, Loading, ago, human, fmt, Modal, useDialog, PageHeader, EmptyState } from "../ui.jsx";
-import { joinCodeText } from "../layoutModel.js";
+import { joinCodeText, isJoinException, canAcknowledgeJoin } from "../layoutModel.js";
 
 const TIER_RULE = {
   T1: "Low-risk formatting or code fix at ≥ 0.95 confidence. Applied automatically, audited, 5% sampled for QA, reversible within the rollback window.",
@@ -140,6 +140,7 @@ function ExceptionModal({ id, persona, onChanged, sameCount, onClose, nav }) {
   const shownOriginal = ex.loan_record?.[ex.field] !== undefined && ex.original_value && /\*/.test(String(ex.loan_record[ex.field])) ? ex.loan_record[ex.field] : ex.original_value;
   const p = ex.proposal;
   const openish = ["open", "pending_review"].includes(ex.status);
+  const isJoin = isJoinException(ex);
   return (
     <Modal title={<span className="row" style={{ gap: 8 }}><Tier t={ex.tier} />{ex.rule_name}</span>} size="lg" onClose={onClose} nav={nav}
       sub={`${ex.rule_id} v${ex.rule_version ?? 1} · ${ex.loan_number}${ex.vendor_name ? ` · ${ex.vendor_name}` : ""} · ${TIER_NAMES[ex.tier]}`}>
@@ -170,7 +171,14 @@ function ExceptionModal({ id, persona, onChanged, sameCount, onClose, nav }) {
 
         {ex.sse_compare && <SseCompare c={ex.sse_compare} />}
         {/* actions by tier and state */}
-        {openish && ["T2", "T3"].includes(ex.tier) && !CHANGE_RULES.includes(ex.rule_id) && (
+        {isJoin && canAcknowledgeJoin(ex) && (
+          canRaise ? <div className="stack">
+            <span className="faint" style={{ fontSize: ".84rem" }}>A join exception has no staged loan to correct or reject. Fix the files and resend the set, or close this row with a reason.</span>
+            <div className="row"><button className="btn" onClick={() => askReason({ title: "Acknowledge and close…", path: "acknowledge", preset: "Explained by the vendor; no resend needed", msg: "Join exception closed", danger: false,
+              help: "Closes this one join exception. The reason is kept in its audit trail. Nothing is loaded or rejected." })}>Acknowledge and close…</button></div>
+          </div> : <span className="faint" style={{ fontSize: ".82rem" }}>Monitoring can close join exceptions</span>
+        )}
+        {openish && !isJoin && ["T2", "T3"].includes(ex.tier) && !CHANGE_RULES.includes(ex.rule_id) && (
           canRaise ? <div className="stack">
             {p && !p.hint_only && <button className="btn primary" onClick={() => run("resolve", { use_proposal: true }, "Fix accepted. Loan re-validated.")}>Confirm fix</button>}
             <label className="stack" style={{ gap: 4 }} htmlFor="fix-val"><span className="eyebrow">Corrected value</span>
@@ -185,7 +193,7 @@ function ExceptionModal({ id, persona, onChanged, sameCount, onClose, nav }) {
               <button className="btn sm" onClick={() => askReason({ title: "Escalate…", path: "escalate", preset: "Needs further judgement", msg: "Escalated", danger: false, help: "Moves the exception up with your note." })}>Escalate…</button></div>
           </div> : <span className="faint" style={{ fontSize: ".82rem" }}>{canCheck ? "Monitoring raises this; it appears here after submit for acceptance" : "Monitoring can resolve this tier"}</span>
         )}
-        {openish && ex.tier === "T4" && ["DUP01", "DUP02"].includes(ex.rule_id) && (
+        {openish && !isJoin && ex.tier === "T4" && ["DUP01", "DUP02"].includes(ex.rule_id) && (
           <div className="stack">
             <span className="faint" style={{ fontSize: ".84rem" }}>Dual control: Monitoring raises an update; a different Monitoring · Reviewer must accept before the boarded loan is overwritten.</span>
             {canRaise ? <div className="row"><button className="btn primary" onClick={() => run("resolve", { value: ex.loan_number, comment: "Approved as update of boarded loan" }, "Submitted for acceptance. A Monitoring · Reviewer must accept it.")}>Submit for acceptance</button>
@@ -193,7 +201,7 @@ function ExceptionModal({ id, persona, onChanged, sameCount, onClose, nav }) {
               : <span className="faint" style={{ fontSize: ".82rem" }}>{canCheck ? "Waiting for Monitoring to submit — then Accept appears under Waiting for you" : "Monitoring raises this for acceptance"}</span>}
           </div>
         )}
-        {openish && ex.tier === "T4" && !["DUP01", "DUP02", ...CHANGE_RULES].includes(ex.rule_id) && (
+        {openish && !isJoin && ex.tier === "T4" && !["DUP01", "DUP02", ...CHANGE_RULES].includes(ex.rule_id) && (
           <div className="stack">
             {canRaise ? <>
               <label className="stack" style={{ gap: 4 }} htmlFor="mk-val"><span className="eyebrow">Corrected value (verify against source documents)</span>

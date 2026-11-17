@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   emptyLayout, emptyReadiness, addDetail, validateLayoutForm, groupColumnsByRole, setStatusLabel, missingRoles,
-  matchRateBadge, previewTrust, joinCodeText, filesToSend, ensureColumnIds, stripClientIds,
+  matchRateBadge, previewTrust, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
 } from "./layoutModel.js";
 
 const valid = () => {
@@ -188,6 +188,18 @@ describe("joinCodeText", () => {
   it("explains every JOIN code in plain words", () => {
     for (let i = 1; i <= 7; i++) assert.ok(joinCodeText(`JOIN0${i}`).length > 10);
     assert.equal(joinCodeText("X"), "");
+  });
+});
+
+describe("join exception actions", () => {
+  it("offers only acknowledge for open join exceptions", () => {
+    assert.equal(isJoinException({ category: "join" }), true);
+    assert.equal(isJoinException({ category: "format" }), false);
+    assert.equal(isJoinException(null), false);
+    assert.equal(canAcknowledgeJoin({ category: "join", status: "open" }), true);
+    assert.equal(canAcknowledgeJoin({ category: "join", status: "escalated" }), true);
+    assert.equal(canAcknowledgeJoin({ category: "join", status: "resolved" }), false);
+    assert.equal(canAcknowledgeJoin({ category: "format", status: "open" }), false);
   });
 });
 

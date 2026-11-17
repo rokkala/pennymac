@@ -86,6 +86,7 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/exceptions/{exception_id}/resolve"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/checker"): MONITORING_REVIEW,
     ("POST", "/api/exceptions/{exception_id}/reject"): WORK_EXCEPTIONS,
+    ("POST", "/api/exceptions/{exception_id}/acknowledge"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/escalate"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/compliance-clear"): COMPLIANCE_REVIEW,
     ("POST", "/api/exceptions/{exception_id}/rollback"): ("monitoring", "monitoring_reviewer"),
@@ -1593,6 +1594,15 @@ class Reason(BaseModel):
 def reject(exception_id: str, body: Reason, user: User = Depends(current_user)):
     try:
         return exceptions_mgr.reject_loan(exception_id, user.name, user.roles, body.reason)
+    except ExceptionActionError as e:
+        _err(e)
+
+
+@app.post("/api/exceptions/{exception_id}/acknowledge")
+def acknowledge(exception_id: str, body: Reason, user: User = Depends(current_user)):
+    """Close a join exception with a reason (join exceptions have no staged loan to resolve or reject)."""
+    try:
+        return exceptions_mgr.acknowledge(exception_id, user.name, user.roles, body.reason)
     except ExceptionActionError as e:
         _err(e)
 
