@@ -193,63 +193,72 @@ def create_batch(source_id: str, file_path: Path, filename: str, actor: str, all
     """Register an arriving file. With strict=False (unattended S3/scheduler arrivals) a file that cannot be
     sequenced is still recorded, as a failed batch with the reason, so nothing disappears silently."""
     from ..storage import local_path
-    from .delivery import LOAD_TYPES, DeliveryError, display_sequence, extract_sequence, file_action, profile_of
 
     local = local_path(file_path)
     digest = file_sha256(local)
     with db.get_engine().begin() as c:
-        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
-        if not src:
-            raise ValueError("unknown source")
-        if not src.active_mapping_id:
-            raise ValueError("source has no approved mapping; complete onboarding first")
-        prior = c.execute(select(db.batches.c.batch_id, db.batches.c.created_at).where(
-            db.batches.c.source_id == source_id, db.batches.c.file_sha256 == digest,
-            db.batches.c.status.not_in(("failed", "discarded")))).first()
-        if prior and not allow_duplicate:
-            raise DuplicateFileError(prior.batch_id, prior.created_at)
-        if prior and not reason:
-            raise ValueError("a reason is required to re-submit an identical file")
-        prof = profile_of(src.delivery)
-        lt = load_type or prof["load_type"]
-        problem, seq = None, None
-        vstatus = c.execute(select(db.vendors.c.status, db.vendors.c.name).where(db.vendors.c.vendor_id == src.vendor_id)).first()
-        try:
-            if vstatus and vstatus.status in ("suspended", "offboarded"):
-                raise DeliveryError(f"vendor {vstatus.name} is {vstatus.status}; its files are recorded but not processed")
-            if lt not in LOAD_TYPES:
-                raise DeliveryError(f"load_type must be one of {', '.join(LOAD_TYPES)}")
-            if lt == "incremental" and prof["action"].get("mode") == "filename" and not file_action(prof, filename):
-                raise DeliveryError(f"'{filename}' does not match any add/update/close filename pattern for this vendor")
-            if lt != "full":
-                first = None
-                if prof["sequence"].get("source") == "column":
-                    _, rows = read_sample(local, 1, ParseOptions(**(src.parse_options or {})))
-                    first = rows[0] if rows else None
-                seq = extract_sequence(prof, filename, first)
-                if seq is not None:
-                    clash = c.execute(select(db.batches.c.batch_id).where(
-                        db.batches.c.source_id == source_id, db.batches.c.sequence == seq, db.batches.c.load_type != "full",
-                        db.batches.c.status.not_in(("failed", "discarded", "completed")))).first()
-                    if clash:
-                        raise DeliveryError(f"a file with sequence {display_sequence(seq)} is already pending as batch {clash.batch_id}; "
-                                            "discard it first if this file replaces it")
-        except DeliveryError as e:
-            if strict:
-                raise
-            problem = str(e)
-        bid = db.new_id("bat")
-        c.execute(db.batches.insert().values(batch_id=bid, source_id=source_id, mapping_id=src.active_mapping_id, filename=filename,
-                                             file_path=str(file_path), status="failed" if problem else "queued", submitted_by=actor,
-                                             micro_batches=[], file_sha256=digest, total_rows=estimate_rows(local),
-                                             load_type=lt if lt in LOAD_TYPES else "full", sequence=seq, error=problem))
-        from ..scheduling.service import match_arrival
+        return _register_batch(c, source_id, file_path, filename, actor, local, digest, allow_duplicate, reason, load_type, strict)
 
-        delivery_id = match_arrival(c, source_id, bid, filename)
-        db.audit(c, actor, "batch.create", "batch", bid, {"file": filename, "source_id": source_id, "sha256": digest, "load_type": lt,
-                                                           "sequence": display_sequence(seq), "delivery_id": delivery_id,
-                                                           **({"rejected": problem} if problem else {}),
-                                                           **({"duplicate_of": prior.batch_id, "reason": reason} if prior else {})})
+
+def _register_batch(c, source_id: str, file_path, filename: str, actor: str, local: Path, digest: str, allow_duplicate: bool,
+                    reason: str | None, load_type: str | None, strict: bool, file_set_id: str | None = None) -> str:
+    """create_batch's body on an open connection (the caller owns the transaction). `file_set_id` links the
+    batch to its multi-file set in the same insert, so a queued set batch is never visible unlinked."""
+    from .delivery import LOAD_TYPES, DeliveryError, display_sequence, extract_sequence, file_action, profile_of
+
+    src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise ValueError("unknown source")
+    if not src.active_mapping_id:
+        raise ValueError("source has no approved mapping; complete onboarding first")
+    prior = c.execute(select(db.batches.c.batch_id, db.batches.c.created_at).where(
+        db.batches.c.source_id == source_id, db.batches.c.file_sha256 == digest,
+        db.batches.c.status.not_in(("failed", "discarded")))).first()
+    if prior and not allow_duplicate:
+        raise DuplicateFileError(prior.batch_id, prior.created_at)
+    if prior and not reason:
+        raise ValueError("a reason is required to re-submit an identical file")
+    prof = profile_of(src.delivery)
+    lt = load_type or prof["load_type"]
+    problem, seq = None, None
+    vstatus = c.execute(select(db.vendors.c.status, db.vendors.c.name).where(db.vendors.c.vendor_id == src.vendor_id)).first()
+    try:
+        if vstatus and vstatus.status in ("suspended", "offboarded"):
+            raise DeliveryError(f"vendor {vstatus.name} is {vstatus.status}; its files are recorded but not processed")
+        if lt not in LOAD_TYPES:
+            raise DeliveryError(f"load_type must be one of {', '.join(LOAD_TYPES)}")
+        if lt == "incremental" and prof["action"].get("mode") == "filename" and not file_action(prof, filename):
+            raise DeliveryError(f"'{filename}' does not match any add/update/close filename pattern for this vendor")
+        if lt != "full":
+            first = None
+            if prof["sequence"].get("source") == "column":
+                _, rows = read_sample(local, 1, ParseOptions(**(src.parse_options or {})))
+                first = rows[0] if rows else None
+            seq = extract_sequence(prof, filename, first)
+            if seq is not None:
+                clash = c.execute(select(db.batches.c.batch_id).where(
+                    db.batches.c.source_id == source_id, db.batches.c.sequence == seq, db.batches.c.load_type != "full",
+                    db.batches.c.status.not_in(("failed", "discarded", "completed")))).first()
+                if clash:
+                    raise DeliveryError(f"a file with sequence {display_sequence(seq)} is already pending as batch {clash.batch_id}; "
+                                        "discard it first if this file replaces it")
+    except DeliveryError as e:
+        if strict:
+            raise
+        problem = str(e)
+    bid = db.new_id("bat")
+    c.execute(db.batches.insert().values(batch_id=bid, source_id=source_id, mapping_id=src.active_mapping_id, filename=filename,
+                                         file_path=str(file_path), status="failed" if problem else "queued", submitted_by=actor,
+                                         micro_batches=[], file_sha256=digest, total_rows=estimate_rows(local),
+                                         load_type=lt if lt in LOAD_TYPES else "full", sequence=seq, error=problem,
+                                         **({"file_set_id": file_set_id} if file_set_id else {})))
+    from ..scheduling.service import match_arrival
+
+    delivery_id = match_arrival(c, source_id, bid, filename)
+    db.audit(c, actor, "batch.create", "batch", bid, {"file": filename, "source_id": source_id, "sha256": digest, "load_type": lt,
+                                                       "sequence": display_sequence(seq), "delivery_id": delivery_id,
+                                                       **({"rejected": problem} if problem else {}),
+                                                       **({"duplicate_of": prior.batch_id, "reason": reason} if prior else {})})
     return bid
 
 

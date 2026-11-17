@@ -1,5 +1,5 @@
 """File-set intake and readiness (Task 9): routing, pairing, readiness, timeouts, duplicates."""
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select, update
@@ -191,14 +191,125 @@ def test_duplicate_member_set_rejected(env, feed):
     assert ei.value.batch_id == first["batch_id"]
     assert len(_batches(feed)) == 1
     s = _set(m2["set_id"])
-    assert s.status == "ready" and s.batch_id is None and s.members_sha == _set(first["set_id"]).members_sha
-    with pytest.raises(DuplicateFileError):
+    assert s.status == "discarded" and s.batch_id is None and s.members_sha == _set(first["set_id"]).members_sha
+    assert s.override["duplicate_of"] == first["batch_id"]
+    with pytest.raises(FileSetError):  # a discarded set is never queued
         create_batch_for_set(m2["set_id"], "ops1")
-    # a set whose earlier batch failed may be submitted again
+    # once the earlier batch failed, the same files may be submitted again
     with db.get_engine().begin() as c:
         c.execute(update(db.batches).where(db.batches.c.batch_id == first["batch_id"]).values(status="failed"))
-    assert create_batch_for_set(m2["set_id"], "ops1")
-    assert _set(m2["set_id"]).status == "consumed"
+    _attach(env, feed, "loans_20261117.csv", MASTER, T0 + timedelta(minutes=40))
+    again = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=41))
+    assert again["status"] == "consumed" and again["batch_id"]
+
+
+def test_duplicate_discard_merges_existing_override(env, feed):
+    _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    first = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    m2 = _attach(env, feed, "loans_20261117.csv", MASTER, T0 + timedelta(minutes=30))
+    with db.get_engine().begin() as c:
+        c.execute(update(db.file_sets).where(db.file_sets.c.set_id == m2["set_id"]).values(override={"note": "kept"}))
+    with pytest.raises(DuplicateFileError):
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=31))
+    assert _set(m2["set_id"]).override == {"note": "kept", "duplicate_of": first["batch_id"]}
+
+
+def _fail_arrival_for(monkeypatch, filename):
+    """Make delivery matching (called inside batch registration, after the batch row insert) raise for one file."""
+    from lbp.scheduling import service as sched
+
+    real = sched.match_arrival
+
+    def boom(c, source_id, batch_id, fname):
+        if fname == filename:
+            raise RuntimeError("simulated failure")
+        return real(c, source_id, batch_id, fname)
+
+    monkeypatch.setattr(sched, "match_arrival", boom)
+
+
+def test_batch_failure_leaves_set_ready_and_no_batch_row(env, feed, monkeypatch):
+    _fail_arrival_for(monkeypatch, "loans_20261117.csv")
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with pytest.raises(RuntimeError):
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    s = _set(a["set_id"])
+    assert s.status == "ready" and s.batch_id is None
+    assert _batches(feed) == []
+    assert {m.batch_id for m in _members(a["set_id"])} == {None}
+
+
+def test_ready_set_without_batch_is_retried_by_sweep(env, feed, monkeypatch):
+    _fail_arrival_for(monkeypatch, "loans_20261117.csv")
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with pytest.raises(RuntimeError):
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    # a persistent failure is recorded on the set and alerted once
+    expire_sets(T0 + timedelta(minutes=5))
+    expire_sets(T0 + timedelta(minutes=6))
+    s = _set(a["set_id"])
+    assert s.status == "ready" and s.batch_id is None
+    assert s.override["error"]["stage"] == "batch" and "RuntimeError" in s.override["error"]["message"]
+    assert len([d for d in _alerts("file_set_error") if d["set_id"] == a["set_id"]]) == 1
+    monkeypatch.undo()
+    expire_sets(T0 + timedelta(minutes=7))
+    s = _set(a["set_id"])
+    assert s.status == "consumed" and s.batch_id
+    assert [b.file_set_id for b in _batches(feed)] == [a["set_id"]]
+
+
+def test_one_set_failing_does_not_stop_the_others(env, feed, monkeypatch):
+    from lbp.scheduling import alerts
+
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    b = _attach(env, feed, "loans_20261118.csv", MASTER + "3,300\n", T0)
+    real = alerts.notify
+
+    def notify(kind, message, detail=None):
+        if (detail or {}).get("set_id") == a["set_id"]:
+            raise RuntimeError("sns down")
+        return real(kind, message, detail)
+
+    monkeypatch.setattr(alerts, "notify", notify)
+    handled = expire_sets(T0 + timedelta(minutes=241))
+    assert b["set_id"] in handled
+    assert any(d["set_id"] == b["set_id"] for d in _alerts("delivery_late"))
+    err = _set(a["set_id"]).override["error"]
+    assert err["stage"] == "timeout" and "RuntimeError" in err["message"]
+    assert [r for r in _audit("file_set.error") if r.entity_id == a["set_id"]]
+    # batch sweep: one ready set failing does not stop another
+    _fail_arrival_for(monkeypatch, "loans_20261117.csv")
+    with pytest.raises(RuntimeError):
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=250))
+    with db.get_engine().begin() as c:  # leave set b ready without a batch, as a crash after attach would
+        c.execute(update(db.file_sets).where(db.file_sets.c.set_id == b["set_id"]).values(status="ready"))
+        c.execute(db.batch_files.insert().values(set_id=b["set_id"], role="borrowers", filename="borrowers_20261118.csv",
+                                                 file_path=str(_file(env, "borrowers_20261118.csv", BORR + "3,Cy\n")),
+                                                 file_sha256="0" * 64))
+    expire_sets(T0 + timedelta(minutes=251))
+    assert _set(a["set_id"]).status == "ready"
+    assert _set(b["set_id"]).status == "consumed"
+
+
+def test_pairing_compares_values_not_group_names(env, feed):
+    lay = {**LAYOUT, "files": [{**LAYOUT["files"][0], "name_pattern": r"loans_(?P<date>\d{8})\.csv"},
+                               {**LAYOUT["files"][1], "name_pattern": r"borrowers_(?P<d>\d{8})\.csv"}]}
+    _configure(feed, lay, READY)
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    b = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    assert b["set_id"] == a["set_id"] and b["status"] == "consumed"
+    assert pairing_key(READY, {"date": "1"}, T0) == pairing_key(READY, {"d": "1"}, T0)
+    with pytest.raises(FileSetError, match="too long"):
+        pairing_key(READY, {"date": "9" * 200}, T0)
+
+
+def test_aware_arrival_time_is_stored_as_naive_utc(env, feed):
+    from datetime import timezone
+
+    eastern = timezone(timedelta(hours=-5))
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, datetime(2026, 11, 17, 3, 0, tzinfo=eastern))
+    assert _set(a["set_id"]).opened_at == T0
+    assert expire_sets(datetime(2026, 11, 17, 12, 1, tzinfo=UTC)) == [a["set_id"]]
 
 
 def _alerts(kind):
@@ -288,3 +399,21 @@ def test_concurrent_arrivals_create_one_set_and_one_batch(env, feed):
         assert len({r["set_id"] for r in out}) == 1
         assert sum(1 for r in out if r["batch_id"]) == 1
     assert len(_batches(feed)) == 6
+
+
+def test_batch_is_linked_to_its_set_when_inserted(env, feed, monkeypatch):
+    """No window where a queued batch exists without its set link (a worker would run it as a plain file)."""
+    from lbp.scheduling import service as sched
+
+    real, seen = sched.match_arrival, []
+
+    def spy(c, source_id, batch_id, fname):
+        b = c.execute(select(db.batches.c.file_set_id).where(db.batches.c.batch_id == batch_id)).first()
+        s = c.execute(select(db.file_sets.c.status).where(db.file_sets.c.set_id == b.file_set_id)).first() if b.file_set_id else None
+        seen.append((b.file_set_id, s.status if s else None))
+        return real(c, source_id, batch_id, fname)
+
+    monkeypatch.setattr(sched, "match_arrival", spy)
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    assert seen == [(a["set_id"], "consumed")]
