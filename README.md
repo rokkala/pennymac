@@ -79,6 +79,7 @@ Use the "Signed in as" switcher in the web app to act as different roles. Most g
 | AWS services table (slide 13) | `aws/terraform/*.tf` |
 | Vendors own feeds (vendor → feed → mapping versions); every page can be scoped to one vendor; vendor-level integrity (a vendor's file changes only its loans, snapshots cover the whole vendor portfolio, suspension stops processing) | `lbp/vendors.py`, Vendors & Mapping page, vendor selector in the side bar |
 | Incremental and snapshot files from many vendors, per-vendor ordering, delivery scheduler | `pipeline/delivery.py`, `incremental.py`, `changes.py`, `sequencing.py`, `scheduling/` (see [docs/INCREMENTAL_AND_SCHEDULING.md](docs/INCREMENTAL_AND_SCHEDULING.md)) |
+| Multi-file feeds: a master file plus detail files delivered as one file set, joined (merge / aggregate) and loaded as one batch | `multifile/` (see [docs/MULTI_FILE_FEEDS.md](docs/MULTI_FILE_FEEDS.md)) |
 
 ## Security and operations
 
