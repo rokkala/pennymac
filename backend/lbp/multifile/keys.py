@@ -7,11 +7,16 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from lbp.multifile.layout import NORMALIZERS
+
 KEY_SEP = "\x1f"
 
 
 def normalize_part(v: str | None, ops: Sequence[str]) -> str | None:
     """Apply `ops` in the order given; None when the input is null or the result is empty."""
+    unknown = [op for op in ops if op not in NORMALIZERS]
+    if unknown:
+        raise ValueError(f"unknown normalizer: {unknown!r}; use {NORMALIZERS}")
     if v is None:
         return None
     s = str(v)
@@ -23,8 +28,6 @@ def normalize_part(v: str | None, ops: Sequence[str]) -> str | None:
                 s = s.lstrip("0") or "0"
         elif op == "upper":
             s = s.upper()
-        else:
-            raise ValueError(f"unknown normalizer: {op!r}")
     # A blank value never matches, even when no trim op is declared.
     if not s.strip():
         return None
