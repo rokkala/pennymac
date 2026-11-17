@@ -32,7 +32,7 @@ from sqlalchemy import func, select, text
 from .. import samples
 from ..analytics import service as analytics
 from ..config import get_settings
-from ..dispatch import aws_mode, dispatch, start_glue
+from ..dispatch import aws_mode, dispatch, dispatchable, start_glue
 from ..exceptions.manager import ExceptionActionError, ExceptionManager
 from ..exceptions.policy import DEFAULT_POLICY, TIER_LABELS, PolicyError, get_policy, set_policy
 from ..ingestion.parser import read_sample
@@ -218,7 +218,7 @@ def _start_local_scheduler():
     def loop():
         while not stop.wait(60):
             try:
-                for bid in sched.tick().get("batches", []):
+                for bid in dispatchable(sched.tick().get("batches", [])):
                     dispatch(bid)
             except Exception:  # noqa: BLE001 - keep ticking
                 log.exception("scheduler tick failed")
@@ -1477,7 +1477,7 @@ def schedules_pull(schedule_id: str, user: User = Depends(current_user)):
             db.audit(c, user.name, "schedule.pull_submitted", "schedule", schedule_id, {"glue_run_id": run_id})
         return {"schedule_id": schedule_id, "submitted": True, "glue_run_id": run_id, "fetched": [], "batches": []}
     out = _sched_call(sched.pull_now, schedule_id, user.name, user.roles)
-    for bid in out.get("batches", []):
+    for bid in dispatchable(out.get("batches", [])):
         dispatch(bid)
     return out
 
@@ -1514,7 +1514,7 @@ def scheduler_tick(user: User = Depends(current_user)):
     from ..scheduling import service as sched
 
     out = sched.tick()
-    for bid in out.get("batches", []):
+    for bid in dispatchable(out.get("batches", [])):
         dispatch(bid)
     return out
 
