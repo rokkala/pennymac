@@ -23,6 +23,8 @@ include = ["lbp*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: long-running scale tests; deselected by default, run with -m slow"]
+addopts = "-m 'not slow'"
 
 [tool.ruff]
 line-length = 140
