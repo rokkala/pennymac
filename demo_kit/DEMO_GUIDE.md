@@ -39,6 +39,7 @@ Run `start_demo.sh` within a few hours of the demo. Delivery due times, "late" f
 | Vendor | Feeds | What is already there |
 |---|---|---|
 | **PennyMac Retail (PCG)** | Daily retail tape (CSV, full tapes) | Day 1 and day 2 boarded. Today's file `pcg_retail_2026-11-02.csv` is **blocked by schema drift** (NoteRate renamed, MaturityDate format changed). Today's delivery shows **late**. |
+| | Escrow items feed (two files) | A **master/detail** feed: a loan file plus an escrow items file, joined into one loan row each. Yesterday's pair is loaded (a few orphan escrow items raised JOIN01). Today's loan file is **waiting for its escrow_items file** (see `.demo_data/demo_uploads/3_multi_file/`). |
 | **Atlas Capital Partners** | Bulk acquisition tape (Excel) | One tape boarded, and a monthly schedule. |
 | **Cornerstone Servicing** | Boarding tapes (pipe TXT); Intraday change files | Two tapes boarded, plus a 120-loan **re-send** held as DUP02. Change files #41 and #42 applied. **#44 is waiting** because #43 never arrived. #41 produces a CHG01 protected rate change, CHG02 unknown loans, ACT01 an unknown action code and CHG06 a loan owned by another vendor. A CHG05 conflict appeared after a rate change was approved. |
 | **Summit Home Lending** | Loan tape (CSV); Weekly portfolio snapshot (SFTP pull) | "Owner-Occ" occupancy values were fixed through a value translation in **mapping v2**; the **Replay preview** shows the held loans now boarding. The weekly snapshot raised **12 CHG04 close reviews**. |
@@ -72,7 +73,8 @@ Across the platform:
 8. **Re-send protection (Maria, 1 min).** Upload `sub_servicing_RESEND.txt` to Cornerstone / Boarding tapes. All 60 rows go to **DUP02** dual control with an SSE vs incoming comparison. Nothing is overwritten.
 9. **Snapshot truncation guard (Maria, 1 min).** Upload `correspondent_snapshot_<date>.csv` (from `2_upload_live`) to Summit / Weekly portfolio snapshot. Half the portfolio is missing, so it is flagged **truncated**, no close reviews are raised, and an alert fires.
 10. **Replay (Maria, 1 min).** Open `correspondent_2026-11-02.csv` and click "Preview replay…". The held "Owner-Occ" loans now board on mapping v2.
-11. **Deliveries and governance (Ana, 2 min).**
+11. **Two-file feed (Maria, 2 min).** In the Import Monitor, PCG / Escrow items feed shows a file set **waiting for escrow_items file**. Upload `escrow_items_<today>.csv` from `demo_uploads/3_multi_file/`: the set completes, one batch runs, and the batch shows per-file counts (rows read, matched, orphaned). Details in `docs/MULTI_FILE_FEEDS.md`.
+12. **Deliveries and governance (Ana, 2 min).**
     - Vendor Deliveries: PCG is late. Use "Waive…" (asks for a reason) or "Pull now…".
     - Rule Engine: open R015 to see the canary, and lifecycle transitions that ask for a comment.
     - Policy & Audit: "Change thresholds…" (two people), "Kill switch…" for T1, "Verify chain" for the audit log.
