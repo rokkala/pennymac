@@ -165,10 +165,16 @@ def build(source_id: str) -> dict:
         "rules": rs, "rules_key": rules_key(rs),
     }
     if src.layout:  # multi-file feed; a layout-less bundle stays byte-identical (same content hash)
-        from .multifile.layout import DEFAULT_READINESS, normalize_layout
+        from .multifile.layout import DEFAULT_READINESS, normalize_layout, validate_layout
 
+        errs = validate_layout(src.layout, src.readiness)
+        if errs:  # never sign an invalid layout; messages carry no data values
+            raise ConfigError("feed layout is invalid: " + "; ".join(errs))
+        # Intentional: the bundle freezes the EFFECTIVE policy (defaults filled in), so a later change to
+        # DEFAULT_READINESS or relation defaults changes the content hash and republishes on the next publish.
         body["layout"] = normalize_layout(src.layout)
-        body["readiness"] = {**DEFAULT_READINESS, **(src.readiness or {})}
+        stored = src.readiness if isinstance(src.readiness, dict) else {}
+        body["readiness"] = {**DEFAULT_READINESS, **{k: v for k, v in stored.items() if v is not None}}
         body["mappings"] = {"loan": body["mapping"]}
     return body
 
