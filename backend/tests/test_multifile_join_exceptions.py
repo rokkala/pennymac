@@ -104,3 +104,29 @@ def test_acknowledge_api(client):
     assert r.status_code == 200 and r.json()["status"] == "resolved"
     assert client.post("/api/exceptions/ex1/acknowledge", json={"reason": ""}, headers=ops).status_code == 400
     assert _statuses() == {"ex0": "resolved", "ex1": "open"}
+
+
+# ------------------------------------------------------------------ I7: keyed join-key fingerprint
+def test_join_key_fingerprint_is_keyed_not_a_plain_hash(env, monkeypatch):
+    import hashlib
+    import hmac
+
+    from lbp import config_store
+    from lbp.ingestion.pii import mask_value
+    from lbp.multifile import stage
+
+    key = "123456789"
+    fp = stage.fingerprint(key)
+    assert fp.startswith("tok_") and len(fp) == len(mask_value(key, "KEY", mode="hash")) == 16
+    assert fp != mask_value(key, "KEY", mode="hash")  # not the unsalted sha256 token (brute-forceable for SSN keys)
+    assert fp != "tok_" + hashlib.sha256(key.encode()).hexdigest()[:12]
+    assert stage.fingerprint(key) == fp and stage.fingerprint("123456780") != fp and stage.fingerprint("") is None
+    dk = config_store.derived_key(stage.FINGERPRINT_LABEL)
+    assert dk != config_store._key()  # domain-separated, never the signing key itself
+    assert fp == "tok_" + hmac.new(dk, key.encode(), hashlib.sha256).hexdigest()[:12]
+    monkeypatch.setattr(config_store, "_key", lambda: b"another-secret")
+    config_store._DERIVED.clear()
+    assert stage.fingerprint(key) != fp  # depends on the server secret
+    config_store._DERIVED.clear()
+    # mask_value elsewhere is unchanged
+    assert mask_value(key, "KEY", mode="hash") == "tok_" + hashlib.sha256(key.encode()).hexdigest()[:12]

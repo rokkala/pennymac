@@ -570,3 +570,68 @@ def test_replay_of_a_file_set_batch_reads_the_joined_file(env):
         c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(joined_path=None))
     with pytest.raises(Exception, match="joined file"):
         replay_batch(bid, "sme1", dry_run=True)
+
+
+# ------------------------------------------------------------------ final review I4: joined PII in staged raw rows
+def test_joined_pii_cols_falls_back_to_source_column_names():
+    """The reviewer's reproduction: aggregate outputs take the PII type of their SOURCE column (name detection)
+    or of their `as` name; detail columns and aggregates with no known type are value-checked (DETECT)."""
+    from types import SimpleNamespace
+
+    from lbp.ingestion.pii import DETECT_PII
+    from lbp.multifile import stage
+
+    lay = {"files": [{"role": "master", "name_pattern": "m.csv", "key": ["loan_id"]}, {"role": "borrowers", "name_pattern": "b.csv"}],
+           "relations": [{"detail": "borrowers", "to": "master", "on": [{"parent": "loan_id", "detail": "loan_ref"}], "mode": "aggregate",
+                          "aggregate": {"columns": [{"as": "borrower_ssns", "op": "concat_distinct", "col": "ssn"},
+                                                    {"as": "names", "op": "first", "col": "borrower_name"},
+                                                    {"as": "contact_email", "op": "first", "col": "c1"},
+                                                    {"as": "memo", "op": "first", "col": "note"},
+                                                    {"as": "n", "op": "count"}]}}]}
+    cfg = SimpleNamespace(layout=lay, profile={"columns": []}, fields=[], pii_cols={})
+    got = stage.joined_pii_cols(cfg, ["loan_id", "borrower_ssns", "names", "contact_email", "memo", "n", "borrowers.tax_id_no",
+                                      "borrowers.note"])
+    assert got == {"borrower_ssns": "SSN", "names": "NAME", "contact_email": "EMAIL", "memo": DETECT_PII, "n": DETECT_PII,
+                   "borrowers.tax_id_no": "SSN", "borrowers.note": DETECT_PII}
+
+
+def test_mask_raw_value_checks_detect_columns_and_leaves_legacy_types_alone():
+    from lbp.ingestion.pii import DETECT_PII
+    from lbp.pipeline.batch import _mask_raw
+
+    raw = {"memo": "ann@example.com", "n": "3", "ids": "123-45-6789|987-65-4321", "plain": "Carrier0", "ssn": "123-45-6789"}
+    out = _mask_raw(raw, {"memo": DETECT_PII, "n": DETECT_PII, "ids": DETECT_PII, "plain": DETECT_PII, "ssn": "SSN"})
+    assert out["memo"] != "ann@example.com" and out["memo"].endswith("@example.com")
+    assert out["n"] == "3" and out["plain"] == "Carrier0" and out["ssn"] == "***-**-6789"
+    assert "123-45-6789" not in out["ids"] and "987-65" not in out["ids"]
+
+
+def test_aggregated_detail_pii_is_masked_in_staged_raw_rows(env):
+    from lbp.multifile.fileset import attach_file
+    from lbp.pipeline.batch import run_batch
+
+    lay = _layout(payments_required=False)
+    lay["files"].append({"role": "borrowers", "name_pattern": r"borrowers_(?P<date>\d{8})\.csv", "required": True})
+    lay["relations"].append({"detail": "borrowers", "to": "master", "on": [{"parent": "LoanID", "detail": "LoanRef"}],
+                             "mode": "aggregate", "on_orphan_detail": "drop",
+                             "aggregate": {"columns": [{"op": "concat_distinct", "col": "ssn", "as": "borrower_ssns"},
+                                                       {"op": "first", "col": "borrower_name", "as": "names"},
+                                                       {"op": "first", "col": "note", "as": "memo"}]}})
+    master, ids = _master(env)
+    sid = _onboard(master)
+    _configure(sid, lay)
+    rows = [[i, f"{600 + n:03d}-45-{1000 + n:04d}", f"Zelda{n}", f"zelda{n}@example.com"] for n, i in enumerate(ids)]
+    attach_file(sid, f"borrowers_{DATE}.csv", _write(env, f"borrowers_{DATE}.csv", ["LoanRef", "ssn", "borrower_name", "note"], rows),
+                "s3-intake")
+    attach_file(sid, f"payments_{DATE}.csv", _payments(env, ids), "s3-intake")
+    attach_file(sid, f"details_{DATE}.csv", _details(env, ids), "s3-intake")
+    out = attach_file(sid, f"loans_{DATE}.csv", master, "s3-intake")
+    run_batch(out["batch_id"])
+    assert _batch(out["batch_id"]).status == "completed", _batch(out["batch_id"]).error
+    staged = _staging(out["batch_id"])
+    assert staged
+    blob = json.dumps([s.raw for s in staged])
+    assert "Zelda" not in blob and "-45-1000" not in blob and "zelda0@" not in blob
+    r0 = staged[0].raw
+    assert r0["borrower_ssns"].endswith("1000") and r0["names"].startswith("Z") and r0["memo"].endswith("@example.com")
+    assert r0["details.Carrier"] == "Carrier0"  # not PII: kept as is

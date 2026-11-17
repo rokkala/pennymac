@@ -85,6 +85,19 @@ def mask_value(value: str, pii_type: str | None, mode: str = "partial") -> str:
     return "****"
 
 
+DETECT_PII = "DETECT"  # pii-cols marker: type unknown, mask a value only when it looks like PII (detect_value_pii)
+
+
+def detect_value_pii(value: str) -> str | None:
+    """SSN / EMAIL / PHONE when the value (or any `|`-separated part of it) matches that pattern, else None."""
+    for part in str(value).split("|"):
+        part = part.strip()
+        for kind in ("SSN", "EMAIL", "PHONE"):
+            if part and VALUE_PATTERNS[kind].match(part):
+                return kind
+    return None
+
+
 def mask_record(record: dict, pii_fields: dict[str, str], mode: str = "partial") -> dict:
     return {k: (mask_value(str(v), pii_fields[k], mode) if k in pii_fields and v not in (None, "") else v) for k, v in record.items()}
 

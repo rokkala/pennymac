@@ -28,7 +28,7 @@ from sqlalchemy import func, or_, select
 from ..config import get_settings
 from ..exceptions.manager import Triage, _str
 from ..ingestion.parser import ParseOptions, estimate_rows, iter_rows, read_sample
-from ..ingestion.pii import TARGET_PII_TYPES, mask_value
+from ..ingestion.pii import DETECT_PII, TARGET_PII_TYPES, detect_value_pii, mask_value
 from ..mapping.transforms import compile_mapping
 from ..rules.executor import RuleExecutor
 from ..rules.registry import RuleRegistry
@@ -169,7 +169,17 @@ def _chunks(it, size):
 
 
 def _mask_raw(raw: dict, pii_cols: dict[str, str]) -> dict:
-    return {k: (mask_value(v, pii_cols[k]) if k in pii_cols and v else v) for k, v in raw.items()}
+    """Mask the PII columns of a raw row. A DETECT_PII column (joined batches: a detail or aggregate column of
+    unknown type) is masked only when its value looks like PII."""
+    if DETECT_PII not in pii_cols.values():
+        return {k: (mask_value(v, pii_cols[k]) if k in pii_cols and v else v) for k, v in raw.items()}
+    out = {}
+    for k, v in raw.items():
+        kind = pii_cols.get(k)
+        if kind == DETECT_PII:
+            kind = detect_value_pii(v) if v else None
+        out[k] = mask_value(v, kind) if kind and v else v
+    return out
 
 
 class DuplicateFileError(ValueError):

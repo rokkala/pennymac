@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import hmac
 import json
 import logging
 from pathlib import Path
@@ -39,7 +40,7 @@ from sqlalchemy import delete, select
 
 from ..config import get_settings
 from ..ingestion.parser import ParseOptions
-from ..ingestion.pii import TARGET_PII_TYPES, VALUE_PATTERNS, detect_column_pii, mask_value
+from ..ingestion.pii import DETECT_PII, TARGET_PII_TYPES, VALUE_PATTERNS, detect_column_pii, mask_value
 from ..rules.jsonlogic import referenced_vars
 from ..store import db
 from . import joiner
@@ -206,18 +207,35 @@ def _mask_row(raw: dict, pii: dict[str, str]) -> dict:
             out[k] = v
             continue
         v = str(v)
-        kind = pii.get(k) or detect_column_pii(str(k), [])[0] or _value_pii(v)
+        known = pii.get(k)
+        kind = (known if known != DETECT_PII else None) or detect_column_pii(str(k), [])[0] or _value_pii(v)
         out[k] = mask_value(v, kind) if kind else v
     return out
 
 
+FINGERPRINT_LABEL = "join-key-fingerprint"
+
+
 def fingerprint(key: str | None) -> str | None:
-    """A join key in an exception row: the deterministic token used elsewhere for NPI, never the value."""
-    return mask_value(key, "KEY", mode="hash") if key else None
+    """A join key in an exception row, never the value: `tok_` + 12 hex chars of HMAC-SHA256 under a key derived
+    from the server's config-signing secret (config_store.derived_key), so a short key space (an SSN-like key)
+    cannot be brute-forced from the token without that secret. Deterministic per deployment."""
+    if not key:
+        return None
+    from ..config_store import derived_key
+
+    return "tok_" + hmac.new(derived_key(FINGERPRINT_LABEL), str(key).encode(), hashlib.sha256).hexdigest()[:12]
+
+
+def _name_pii(name: str | None) -> str | None:
+    return detect_column_pii(name, [])[0] if name else None
 
 
 def joined_pii_cols(cfg, columns: list[str]) -> dict[str, str]:
-    """{joined column: pii type} for masking the staged raw rows of a joined batch."""
+    """{joined column: pii type} for masking the staged raw rows of a joined batch. Master columns: the master
+    profile and mapping. A detail `role.col` column: its role's known type, else name detection, else DETECT_PII
+    (value-checked per row, since detail roles are rarely profiled). An aggregate output: its source column's
+    known type, else name detection on the source column, then on the `as` name, else DETECT_PII."""
     lay = normalize_layout(cfg.layout or {})
     by_role = _pii_by_role(cfg, lay)
     out = dict(cfg.pii_cols)
@@ -226,12 +244,13 @@ def joined_pii_cols(cfg, columns: list[str]) -> dict[str, str]:
     for col in columns:
         role, sep, name = col.partition(".")
         if sep and role in by_role and role != "master":
-            kind = by_role[role].get(name) or detect_column_pii(name, [])[0]
-        elif col in agg_src and agg_src[col][1]:
-            kind = by_role.get(agg_src[col][0], {}).get(agg_src[col][1])
+            kind = by_role[role].get(name) or _name_pii(name) or DETECT_PII
+        elif col in agg_src:
+            r, src = agg_src[col]
+            kind = (by_role.get(r, {}).get(src) if src else None) or _name_pii(src) or _name_pii(col) or DETECT_PII
         else:
             kind = by_role["master"].get(col)
-        if kind:
+        if kind and not (kind == DETECT_PII and out.get(col)):  # a known type (feed pii_cols) is never downgraded
             out[col] = kind
     return out
 

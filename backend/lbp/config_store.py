@@ -79,6 +79,19 @@ def _key() -> bytes:
     return b"lbp-local-dev-config-key"  # local development only (validate_for_production refuses AWS without a secret)
 
 
+_DERIVED: dict[tuple, bytes] = {}
+
+
+def derived_key(label: str) -> bytes:
+    """A key for one purpose (`label`) derived from the config-signing secret with HMAC-SHA256 under a distinct
+    domain-separation label, so it is never the signing key itself. Cached per process (the secret is read once)."""
+    s = get_settings()
+    ck = (label, s.config_signing_secret_arn, s.env)
+    if ck not in _DERIVED:
+        _DERIVED[ck] = hmac.new(_key(), b"lbp-derived-key/v1/" + label.encode(), hashlib.sha256).digest()
+    return _DERIVED[ck]
+
+
 def _canonical(body: dict) -> bytes:
     return json.dumps(body, sort_keys=True, separators=(",", ":"), default=str).encode()
 
