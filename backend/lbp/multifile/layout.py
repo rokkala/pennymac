@@ -166,6 +166,8 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
                              ("on_duplicate_master", ("reject_all", "first", "last"))):
             if r[key] not in allowed:
                 errs.append(f"{tag}: {key} must be one of {allowed}")
+        if mode == "merge" and r["cardinality"] != "one":
+            errs.append(f"{tag}: mode merge needs cardinality one (use aggregate for more than one detail row)")
         try:
             if not 0 <= float(r["min_match_rate"]) <= 1:
                 errs.append(f"{tag}: min_match_rate must be between 0 and 1")

@@ -5,17 +5,33 @@ Bounded memory, whatever the file sizes: nothing is held per file, only per batc
     pass 1   stream the master; count its normalized keys per relation into SQLite (`master_keys`)
     load     stream each detail into its own SQLite table `(row_no, nkey, data)`, indexed on (nkey, row_no)
     orphans  anti-join of each detail table against `master_keys` (detail rows with no master)
-    pass 2   stream the master again in file order; for each relation look up the detail rows for the
-             row's key in detail file order and let the relation's mode handler turn them into columns
+    pass 2   stream the master again in file order; apply the policies below, then for each relation look up
+             the detail rows for the row's key in detail file order and let the mode handler make the columns
 
-The SQLite database lives in `tmp_dir` and is removed afterwards. Row numbers are 1-based data-row
-indexes (header excluded, blank lines skipped, as `iter_rows` yields them).
+Data problems never abort the join; each becomes one exception row (JSONL beside the output):
+
+    JOIN01  orphan detail (detail role, detail row)        only when on_orphan_detail: exception
+    JOIN02  required detail missing (master row)           on_missing_detail: exception; master excluded
+    JOIN03  duplicate master key (master row)              every row on_duplicate_master drops
+    JOIN04  cardinality violation (master row)             >1 detail row for merge or cardinality one; excluded
+    JOIN05  key unparseable: an empty/null key part         either side; the row is rejected (master excluded)
+    JOIN06  inner join dropped the master (master row)     join: inner, whatever on_missing_detail says
+    JOIN07  aggregate value not numeric (detail row)       the value is skipped, the master still joins
+
+Every excluded master counts as `rejected`. `matched` is key coverage: a master row whose key has at least
+one detail row (in any relation), a detail row whose key has a master row. Messages and logs name roles,
+columns and counts, never row values; row values appear only in an exception's `key` and `raw`.
+
+The SQLite database lives in `tmp_dir` and is removed afterwards; on failure the partial output and
+exceptions files are removed too. Row numbers are 1-based data-row indexes (header excluded, blank lines
+skipped, as `iter_rows` yields them).
 """
 from __future__ import annotations
 
 import contextlib
 import csv
 import json
+import logging
 import os
 import sqlite3
 import tempfile
@@ -27,12 +43,19 @@ from pathlib import Path
 
 from lbp.ingestion.parser import ParseOptions, iter_rows
 from lbp.mapping.transforms import TRUE_VALUES, TransformError, _date
-from lbp.multifile.keys import KEY_SEP, key_text, normalize_key
+from lbp.multifile.keys import KEY_SEP, key_text, normalize_key, normalize_part
 from lbp.multifile.layout import LayoutError, normalize_layout, validate_layout
 from lbp.rules.jsonlogic import _truthy, compile_logic, referenced_vars
 
+log = logging.getLogger(__name__)
+
 BATCH_ROWS = 5000
 JOIN01_ORPHAN = "JOIN01"
+JOIN02_MISSING_DETAIL = "JOIN02"
+JOIN03_DUPLICATE_MASTER = "JOIN03"
+JOIN04_CARDINALITY = "JOIN04"
+JOIN05_KEY_UNPARSEABLE = "JOIN05"
+JOIN06_INNER_DROPPED = "JOIN06"
 JOIN07_AGG_VALUE = "JOIN07"
 MAX_EXPONENT = 40  # a Decimal whose exponent is larger in magnitude is treated as not numeric
 # The join does not care how files are paired into a set; validate the layout with a readiness policy
@@ -280,6 +303,12 @@ class _Relation:
     table: str
     columns: list[str] = field(default_factory=list)  # detail file header
     handler: MergeMode | AggregateMode | None = None
+    rows: _Rows | None = None  # the open detail file
+    masters_matched: int = 0  # master rows whose key has a detail row in this relation
+
+    @property
+    def tag(self) -> str:
+        return f"{self.role}->{self.spec['to']}"
 
     def master_key(self, row: dict[str, str]) -> str | None:
         k = normalize_key([row.get(c) for c in self.parent_cols], self.ops)
@@ -288,6 +317,10 @@ class _Relation:
     def detail_key(self, row: dict[str, str]) -> str | None:
         k = normalize_key([row.get(c) for c in self.detail_cols], self.ops)
         return key_text(k) if k is not None else None
+
+    def empty_parts(self, row: dict[str, str], cols: list[str]) -> list[str]:
+        """The key columns of `row` whose value is null or normalizes to empty (names only)."""
+        return [c for c in cols if normalize_part(row.get(c), self.ops) is None]
 
 
 class _Exceptions:
@@ -315,6 +348,40 @@ def _parse_options(role: str, file_spec: dict, overrides: dict[str, dict]) -> Pa
     if unknown:
         raise LayoutError(f"unknown parse option(s) for {role}: {unknown}; use {sorted(allowed)}")
     return ParseOptions(**opts)
+
+
+class _Rows:
+    """A parser row iterator started at open, so `close()` always releases its file (closing a generator
+    that never ran skips its `finally`). Holds one row of look-ahead."""
+
+    def __init__(self, rows: Iterator[dict[str, str]]):
+        self._rows = rows
+        self._head = next(rows, None)  # None: exhausted, the parser has already closed the file
+
+    def __iter__(self) -> _Rows:
+        return self
+
+    def __next__(self) -> dict[str, str]:
+        if self._head is not None:
+            head, self._head = self._head, None
+            return head
+        return next(self._rows)
+
+    def close(self) -> None:
+        self._rows.close()
+
+
+def _open_rows(role: str, path: Path, opts: ParseOptions) -> tuple[list[str], _Rows]:
+    """Header and lazy rows of one input file; a file with no header row is a LayoutError."""
+    path = Path(path)
+    if path.stat().st_size == 0:
+        raise LayoutError(f"{role} file is an empty file (0 bytes); a file with no data rows still needs a header row")
+    meta, rows = iter_rows(path, opts)
+    opened = _Rows(rows)
+    if not meta.columns:
+        opened.close()
+        raise LayoutError(f"{role} file is an empty file (no header row)")
+    return list(meta.columns), opened
 
 
 def _require_columns(role: str, header: list[str], needed: list[str]) -> None:
@@ -382,7 +449,8 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
                tmp_dir: Path) -> JoinResult:
     """Join `inputs` (role -> file) per `layout`; write the joined CSV to `out_path` in master file order and
     the join exceptions as JSONL beside it. Raises LayoutError when the layout or the files' headers cannot
-    be joined."""
+    be joined (or a file is empty, not even a header). Data problems are exceptions, never errors; a match
+    rate below a relation's `min_match_rate` is reported in `blocked` after the join completes."""
     lay = normalize_layout(layout)
     rels = _relations(lay, inputs)
     master_spec = next(f for f in lay["files"] if f.get("role") == "master")
@@ -391,52 +459,74 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
     out_path = Path(out_path)
     exc_path = out_path.with_name(out_path.stem + ".exceptions.jsonl")
     per_role = {"master": RoleStats(), **{r.role: RoleStats() for r in rels}}
+    m = per_role["master"]
 
+    handles: list[_Rows] = []
+    created: list[Path] = []
+    exc: _Exceptions | None = None
+    done = False
     conn, db_path = _open_db(Path(tmp_dir))
-    exc = _Exceptions(exc_path)
     try:
-        # Pass 1: master key counts per relation (normalize can differ per relation).
-        conn.execute("CREATE TABLE master_rows (rel INTEGER, nkey TEXT)")
-        meta, rows = iter_rows(Path(inputs["master"]), master_opts)
-        master_cols = list(meta.columns)
+        exc = _Exceptions(exc_path)
+        created.append(exc_path)
+
+        # Headers first: every column problem is reported before any row is loaded.
+        master_cols, mrows = _open_rows("master", inputs["master"], master_opts)
+        handles.append(mrows)
         for r in rels:
             _require_columns("master", master_cols, r.parent_cols)
         _require_columns("master", master_cols, list(master_spec.get("key") or []))
+        for r in rels:
+            r.columns, r.rows = _open_rows(r.role, inputs[r.role], _parse_options(
+                r.role, files_by_role.get(r.role) or {}, parse_options or {}))
+            handles.append(r.rows)
+            _require_columns(r.role, r.columns, r.detail_cols)
+            r.handler = MODES[r.spec["mode"]](r.role, r.spec, r.columns)
+        columns = master_cols + [c for r in rels for c in r.handler.columns]
+        dupes = sorted({c for c in columns if columns.count(c) > 1})
+        if dupes:
+            raise LayoutError(f"output column(s) {dupes} produced more than once")
+
+        # Pass 1: per relation, each master key's row count and first/last row (for on_duplicate_master).
+        conn.execute("CREATE TABLE master_rows (rel INTEGER, nkey TEXT, row_no INTEGER)")
 
         def master_keys() -> Iterator[tuple]:
-            for row in rows:
-                per_role["master"].rows_in += 1
+            for n, row in enumerate(mrows, start=1):
+                m.rows_in += 1
                 for r in rels:
                     k = r.master_key(row)
                     if k is not None:
-                        yield (r.idx, k)
+                        yield (r.idx, k, n)
 
-        _batched_insert(conn, "INSERT INTO master_rows VALUES (?, ?)", master_keys())
-        conn.execute("CREATE TABLE master_keys AS SELECT rel, nkey, COUNT(*) AS cnt FROM master_rows GROUP BY rel, nkey")
+        _batched_insert(conn, "INSERT INTO master_rows VALUES (?, ?, ?)", master_keys())
+        conn.execute("CREATE TABLE master_keys AS SELECT rel, nkey, COUNT(*) AS cnt, MIN(row_no) AS first_row, "
+                     "MAX(row_no) AS last_row, 0 AS dcnt FROM master_rows GROUP BY rel, nkey")
         conn.execute("CREATE UNIQUE INDEX ix_master_keys ON master_keys (rel, nkey)")
         conn.execute("DROP TABLE master_rows")
 
-        # Details: one table per relation; rows stored as a JSON list in header order.
+        # Details: one table per relation; rows stored as a JSON list in header order. A row whose key is
+        # unparseable is a JOIN05 and is not stored (it can never match).
         for r in rels:
-            dmeta, drows = iter_rows(Path(inputs[r.role]), _parse_options(r.role, files_by_role.get(r.role) or {},
-                                                                         parse_options or {}))
-            r.columns = list(dmeta.columns)
-            _require_columns(r.role, r.columns, r.detail_cols)
-            r.handler = MODES[r.spec["mode"]](r.role, r.spec, r.columns)
+            st = per_role[r.role]
             conn.execute(f"CREATE TABLE {r.table} (row_no INTEGER, nkey TEXT, data TEXT)")
 
-            def detail_rows(r: _Relation = r, drows: Iterator[dict[str, str]] = drows) -> Iterator[tuple]:
-                for n, row in enumerate(drows, start=1):
-                    yield (n, r.detail_key(row), json.dumps([row[c] for c in r.columns], ensure_ascii=False))
+            def detail_rows(r: _Relation = r, st: RoleStats = st, exc: _Exceptions = exc) -> Iterator[tuple]:
+                for n, row in enumerate(r.rows, start=1):
+                    st.rows_in += 1
+                    k = r.detail_key(row)
+                    if k is None:
+                        st.rejected += 1
+                        exc.add(JOIN05_KEY_UNPARSEABLE, r.role, n, None, f"{r.role} key column(s) "
+                                f"{r.empty_parts(row, r.detail_cols)} empty or null", row)
+                        continue
+                    yield (n, k, json.dumps([row[c] for c in r.columns], ensure_ascii=False))
 
             _batched_insert(conn, f"INSERT INTO {r.table} VALUES (?, ?, ?)", detail_rows())
             # Built after loading (faster than maintaining it per insert); covers lookup + file-order sort.
             conn.execute(f"CREATE INDEX ix_{r.table} ON {r.table} (nkey, row_no)")
-            st = per_role[r.role]
-            st.rows_in = conn.execute(f"SELECT COUNT(*) FROM {r.table}").fetchone()[0]
-            # Task 5: null/empty keys become JOIN05; until then they are counted as rejected.
-            st.rejected = conn.execute(f"SELECT COUNT(*) FROM {r.table} WHERE nkey IS NULL").fetchone()[0]
-            orphan_sql = (f"SELECT row_no, nkey, data FROM {r.table} d WHERE nkey IS NOT NULL AND NOT EXISTS "
+            conn.execute(f"UPDATE master_keys SET dcnt = (SELECT COUNT(*) FROM {r.table} d WHERE d.nkey = "
+                         f"master_keys.nkey) WHERE rel = ?", (r.idx,))
+            orphan_sql = (f"SELECT row_no, nkey, data FROM {r.table} d WHERE NOT EXISTS "
                           f"(SELECT 1 FROM master_keys m WHERE m.rel = ? AND m.nkey = d.nkey) ORDER BY row_no")
             for row_no, nkey, data in conn.execute(orphan_sql, (r.idx,)):
                 st.orphaned += 1
@@ -445,42 +535,68 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
                             dict(zip(r.columns, json.loads(data), strict=True)))
             st.matched = st.rows_in - st.orphaned - st.rejected
 
-        columns = master_cols + [c for r in rels for c in r.handler.columns]
-        dupes = sorted({c for c in columns if columns.count(c) > 1})
-        if dupes:
-            raise LayoutError(f"output column(s) {dupes} produced more than once")
-
         # Pass 2: master again, in file order; details per key in detail file order.
         rows_out = 0
-        _, rows = iter_rows(Path(inputs["master"]), master_opts)
+        _, rows = _open_rows("master", inputs["master"], master_opts)
+        handles.append(rows)
+        lookup = "SELECT cnt, first_row, last_row, dcnt FROM master_keys WHERE rel = ? AND nkey = ?"
+        created.append(out_path)
         with out_path.open("w", encoding="utf-8", newline="") as f:
             w = csv.writer(f, lineterminator="\n")
             w.writerow(columns)
-            for row in rows:
+            for row_no, row in enumerate(rows, start=1):
+                keys = [r.master_key(row) for r in rels]
+                if None in keys:
+                    empty = sorted({c for r, k in zip(rels, keys, strict=True) if k is None
+                                    for c in r.empty_parts(row, r.parent_cols)})
+                    exc.add(JOIN05_KEY_UNPARSEABLE, "master", row_no, None,
+                            f"master key column(s) {empty} empty or null", row)
+                    m.rejected += 1
+                    continue
+                info = [conn.execute(lookup, (r.idx, k)).fetchone() for r, k in zip(rels, keys, strict=True)]
+                m.matched += any(i[3] > 0 for i in info)
+                for r, i in zip(rels, info, strict=True):
+                    r.masters_matched += i[3] > 0
+                problems = _master_problems(rels, keys, info, row_no)
+                if problems:
+                    for code, k, msg in problems:
+                        exc.add(code, "master", row_no, k, msg, row)
+                    m.rejected += 1
+                    continue
                 out = [row[c] for c in master_cols]
-                any_match = False
-                for r in rels:
-                    k = r.master_key(row)
+                for r, k, i in zip(rels, keys, info, strict=True):
                     found: Iterator[list[str]] = iter(())
-                    if k is not None:
+                    if i[3]:
                         cur = conn.execute(f"SELECT row_no, data FROM {r.table} WHERE nkey = ? ORDER BY row_no", (k,))
                         found = _tracked(r.handler, cur)
-                    values, n = r.handler.reduce(found)
-                    for name, col, row_no, vals in getattr(r.handler, "issues", ()):
-                        exc.add(JOIN07_AGG_VALUE, r.role, row_no, k, f"aggregate value in {r.role}.{col} for {name} is "
+                    values, _ = r.handler.reduce(found)
+                    # One row per (relation, detail row, column): only one master per key reduces its details.
+                    for name, col, d_row, vals in getattr(r.handler, "issues", ()):
+                        exc.add(JOIN07_AGG_VALUE, r.role, d_row, k, f"aggregate value in {r.role}.{col} for {name} is "
                                 "not numeric", dict(zip(r.columns, vals, strict=True)))
-                    any_match = any_match or n > 0
                     out.extend(values)
-                per_role["master"].matched += any_match
                 w.writerow(out)
                 rows_out += 1
+        done = True
     finally:
-        exc.close()
+        for h in handles:
+            h.close()
+        if exc is not None:
+            exc.close()
         conn.close()
         with contextlib.suppress(FileNotFoundError):
             db_path.unlink()
+        if not done:
+            for path in created:
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
 
-    m = per_role["master"]
+    detail_rate = {r.role: _rate(per_role[r.role].matched, per_role[r.role].rows_in) for r in rels}
+    blocked = _match_rate_gate(rels, m.rows_in, detail_rate)
+    log.info("join done: master rows in %d, out %d, rejected %d; exceptions %s; blocked: %s",
+             m.rows_in, rows_out, m.rejected, dict(exc.counts), "yes" if blocked else "no")
+    if blocked:
+        log.warning("join blocked by min_match_rate: %s", blocked)
     return JoinResult(
         columns=columns,
         rows_out=rows_out,
@@ -488,6 +604,44 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
         exceptions_path=exc_path,
         exception_counts=dict(exc.counts),
         master_match_rate=_rate(m.matched, m.rows_in),
-        detail_match_rate={r.role: _rate(per_role[r.role].matched, per_role[r.role].rows_in) for r in rels},
-        blocked=None,  # Task 5: min_match_rate gate
+        detail_match_rate=detail_rate,
+        blocked=blocked,
     )
+
+
+def _master_problems(rels: list[_Relation], keys: list[str], info: list[tuple[int, int, int, int]],
+                     row_no: int) -> list[tuple[str, str, str]]:
+    """(code, key, message) for each policy that excludes this master row; empty when it joins.
+    Duplicate-key checks come first: a row dropped as a duplicate is not also judged on its details."""
+    out = []
+    for r, k, (cnt, first_row, last_row, _) in zip(rels, keys, info, strict=True):
+        pol = r.spec["on_duplicate_master"]
+        if cnt > 1 and (pol == "reject_all" or row_no != (first_row if pol == "first" else last_row)):
+            out.append((JOIN03_DUPLICATE_MASTER, k, f"master key for relation {r.tag} is on {cnt} master rows "
+                        f"(on_duplicate_master: {pol})"))
+    if out:
+        return out
+    for r, k, (_, _, _, dcnt) in zip(rels, keys, info, strict=True):
+        if dcnt == 0 and r.spec["join"] == "inner":
+            out.append((JOIN06_INNER_DROPPED, k, f"no {r.role} row for this master; relation {r.tag} is an inner join"))
+        elif dcnt == 0 and r.spec["on_missing_detail"] == "exception":
+            out.append((JOIN02_MISSING_DETAIL, k, f"no {r.role} row for this master (on_missing_detail: exception)"))
+        elif dcnt > 1 and (r.spec["mode"] == "merge" or r.spec["cardinality"] == "one"):
+            out.append((JOIN04_CARDINALITY, k, f"{dcnt} {r.role} rows for this master; relation {r.tag} allows one"))
+    return out
+
+
+def _match_rate_gate(rels: list[_Relation], masters_read: int, detail_rate: dict[str, float]) -> str | None:
+    """Why the join is blocked by `min_match_rate`, or None. Per relation, the threshold applies to the
+    master-side rate (masters with a detail row / masters read) and, when on_orphan_detail is exception, to the
+    detail-side rate as well (details with a master / details read)."""
+    msgs = []
+    for r in rels:
+        thr = float(r.spec["min_match_rate"])
+        rate = _rate(r.masters_matched, masters_read)
+        if rate < thr:
+            msgs.append(f"relation {r.tag}: master match rate {rate:.1%} is below min_match_rate {thr:.1%}")
+        if r.spec["on_orphan_detail"] == "exception" and detail_rate[r.role] < thr:
+            msgs.append(f"relation {r.tag}: {r.role} match rate {detail_rate[r.role]:.1%} is below "
+                        f"min_match_rate {thr:.1%}")
+    return "; ".join(msgs) or None

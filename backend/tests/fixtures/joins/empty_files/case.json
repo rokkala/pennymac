@@ -1,0 +1,138 @@
+{
+  "description": "Header-only files. A header-only detail: every master follows on_missing_detail. A header-only master: zero rows out, the details are orphans. (empty.csv is a 0-byte file, used by test_zero_byte_file_is_layout_error.)",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "variants": [
+    {
+      "id": "detail_header_only_allow",
+      "files": {
+        "details": "details_header.csv"
+      },
+      "relation": {
+        "on_missing_detail": "allow"
+      },
+      "expected_rows": "expected_allow.csv",
+      "expected_exceptions": [],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 2,
+          "matched": 0,
+          "orphaned": 0,
+          "rejected": 0
+        },
+        "details": {
+          "rows_in": 0,
+          "matched": 0,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "detail_header_only_exception",
+      "files": {
+        "details": "details_header.csv"
+      },
+      "relation": {
+        "on_missing_detail": "exception"
+      },
+      "expected_rows": "expected_header.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN02",
+          "role": "master",
+          "row_number": 1
+        },
+        {
+          "code": "JOIN02",
+          "role": "master",
+          "row_number": 2
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 2,
+          "matched": 0,
+          "orphaned": 0,
+          "rejected": 2
+        },
+        "details": {
+          "rows_in": 0,
+          "matched": 0,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "master_header_only",
+      "files": {
+        "master": "master_header.csv"
+      },
+      "relation": {},
+      "expected_rows": "expected_header.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 1
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 0,
+          "matched": 0,
+          "orphaned": 0,
+          "rejected": 0
+        },
+        "details": {
+          "rows_in": 1,
+          "matched": 0,
+          "orphaned": 1,
+          "rejected": 0
+        }
+      }
+    }
+  ]
+}

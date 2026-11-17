@@ -1,0 +1,116 @@
+{
+  "description": "Master 2 has two detail rows. merge (always 1:1) and aggregate with cardinality one write JOIN04 (role master, master row number) and exclude that master; aggregate with cardinality many reduces both rows. Master 3 has no detail (allow).",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "variants": [
+    {
+      "id": "merge",
+      "relation": {},
+      "expected_rows": "expected_merge.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN04",
+          "role": "master",
+          "row_number": 2
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 3,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 1
+        },
+        "details": {
+          "rows_in": 3,
+          "matched": 3,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "aggregate_one",
+      "relation": {
+        "mode": "aggregate",
+        "aggregate": {
+          "columns": [
+            {
+              "as": "val_first",
+              "op": "first",
+              "col": "val"
+            }
+          ]
+        },
+        "cardinality": "one"
+      },
+      "expected_rows": "expected_agg_one.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN04",
+          "role": "master",
+          "row_number": 2
+        }
+      ],
+      "expected_blocked": null
+    },
+    {
+      "id": "aggregate_many",
+      "relation": {
+        "mode": "aggregate",
+        "aggregate": {
+          "columns": [
+            {
+              "as": "val_first",
+              "op": "first",
+              "col": "val"
+            }
+          ]
+        },
+        "cardinality": "many"
+      },
+      "expected_rows": "expected_agg_many.csv",
+      "expected_exceptions": [],
+      "expected_blocked": null
+    }
+  ]
+}

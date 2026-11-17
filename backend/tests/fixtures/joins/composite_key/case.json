@@ -1,0 +1,83 @@
+{
+  "description": "Two-part key (pool, id) with trim, strip_leading_zeros, upper: real differences in case and leading zeros match (a/1 = A/001, B/0002 = b/002). Master A1/2 and detail A/12 do not collide. An empty key part is JOIN05 on either side (master row excluded and rejected, detail row rejected); A/12 is an orphan.",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "pool",
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "pool",
+            "detail": "pool"
+          },
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim",
+          "strip_leading_zeros",
+          "upper"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "expected_rows": "expected.csv",
+  "expected_exceptions": [
+    {
+      "code": "JOIN05",
+      "role": "master",
+      "row_number": 5
+    },
+    {
+      "code": "JOIN01",
+      "role": "details",
+      "row_number": 4
+    },
+    {
+      "code": "JOIN05",
+      "role": "details",
+      "row_number": 5
+    }
+  ],
+  "expected_blocked": null,
+  "expected_per_role": {
+    "master": {
+      "rows_in": 6,
+      "matched": 3,
+      "orphaned": 0,
+      "rejected": 1
+    },
+    "details": {
+      "rows_in": 5,
+      "matched": 3,
+      "orphaned": 1,
+      "rejected": 1
+    }
+  }
+}

@@ -1,0 +1,145 @@
+{
+  "description": "Master 2 has no detail. join inner drops it with JOIN06 (never silently), whatever on_missing_detail says; join left with on_missing_detail exception drops it with JOIN02; left with allow keeps it with empty detail columns.",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "variants": [
+    {
+      "id": "inner_allow",
+      "relation": {
+        "join": "inner",
+        "on_missing_detail": "allow"
+      },
+      "expected_rows": "expected_dropped.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN06",
+          "role": "master",
+          "row_number": 2
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 3,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 1
+        },
+        "details": {
+          "rows_in": 2,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "inner_exception",
+      "relation": {
+        "join": "inner",
+        "on_missing_detail": "exception"
+      },
+      "expected_rows": "expected_dropped.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN06",
+          "role": "master",
+          "row_number": 2
+        }
+      ],
+      "expected_blocked": null
+    },
+    {
+      "id": "left_exception",
+      "relation": {
+        "join": "left",
+        "on_missing_detail": "exception"
+      },
+      "expected_rows": "expected_dropped.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN02",
+          "role": "master",
+          "row_number": 2
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 3,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 1
+        },
+        "details": {
+          "rows_in": 2,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "left_allow",
+      "relation": {
+        "join": "left",
+        "on_missing_detail": "allow"
+      },
+      "expected_rows": "expected_left.csv",
+      "expected_exceptions": [],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 3,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        },
+        "details": {
+          "rows_in": 2,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    }
+  ]
+}

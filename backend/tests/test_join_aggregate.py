@@ -115,3 +115,18 @@ def test_aggregate_needs_a_spec(tmp_path: Path):
     m.write_text("id\n1\n", encoding="utf-8")
     with pytest.raises(LayoutError):
         join_files(lay, {"master": m, "items": m}, {}, tmp_path / "o.csv", tmp_path)
+
+
+@pytest.mark.parametrize(("policy", "n_join07", "rows_out"), [("first", 1, 1), ("last", 1, 1), ("reject_all", 0, 0)])
+def test_join07_not_repeated_for_duplicate_master_keys(tmp_path: Path, policy: str, n_join07: int, rows_out: int):
+    lay = layout([{"as": "total", "op": "sum", "col": "amt"}])
+    lay["relations"][0]["on_duplicate_master"] = policy
+    m, d = tmp_path / "m.csv", tmp_path / "d.csv"
+    m.write_text("id\n1\n1\n1\n", encoding="utf-8")
+    d.write_text("ref,amt\n1,bad\n1,3\n", encoding="utf-8")
+    res = join_files(lay, {"master": m, "items": d}, {}, tmp_path / "o.csv", tmp_path)
+    codes = [e["code"] for e in read_exceptions(res.exceptions_path)]
+    assert codes.count("JOIN07") == n_join07
+    assert res.exception_counts.get("JOIN07", 0) == n_join07
+    assert res.exception_counts["JOIN03"] == 3 - rows_out
+    assert res.rows_out == rows_out

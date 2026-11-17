@@ -1,0 +1,102 @@
+{
+  "description": "Detail rows whose key has no master row. on_orphan_detail exception writes JOIN01 with the detail role and detail row number; drop writes nothing but still counts them as orphaned.",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "variants": [
+    {
+      "id": "exception",
+      "relation": {
+        "on_orphan_detail": "exception"
+      },
+      "expected_rows": "expected.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 2
+        },
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 4
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 2,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        },
+        "details": {
+          "rows_in": 4,
+          "matched": 2,
+          "orphaned": 2,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "drop",
+      "relation": {
+        "on_orphan_detail": "drop"
+      },
+      "expected_rows": "expected.csv",
+      "expected_exceptions": [],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 2,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        },
+        "details": {
+          "rows_in": 4,
+          "matched": 2,
+          "orphaned": 2,
+          "rejected": 0
+        }
+      }
+    }
+  ]
+}

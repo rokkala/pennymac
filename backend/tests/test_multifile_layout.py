@@ -18,7 +18,8 @@ def layout():
             {"role": "fees", "name_pattern": r"fees_(?P<date>\d{8})\.csv", "required": False},
         ],
         "relations": [
-            {"detail": "fees", "to": "master", "on": [{"parent": "loan_id", "detail": "loan_ref"}], "mode": "merge"},
+            {"detail": "fees", "to": "master", "on": [{"parent": "loan_id", "detail": "loan_ref"}], "mode": "merge",
+             "cardinality": "one"},
         ],
     }
 
@@ -50,6 +51,17 @@ def test_unsupported_mode_rejected():
         lay = layout()
         lay["relations"][0]["mode"] = mode
         assert any("not yet supported" in e for e in validate_layout(lay, None))
+
+
+def test_merge_requires_cardinality_one():
+    lay = layout()
+    lay["relations"][0]["cardinality"] = "many"
+    assert any("merge" in e and "cardinality" in e for e in validate_layout(lay, None))
+    del lay["relations"][0]["cardinality"]  # the default (many) is not enough for merge either
+    assert any("merge" in e and "cardinality" in e for e in validate_layout(lay, None))
+    agg = agg_layout("total")
+    agg["relations"][0]["cardinality"] = "many"
+    assert validate_layout(agg, None) == []
 
 
 def agg_layout(*names):
@@ -101,6 +113,7 @@ def test_readiness_timeout_policy_rules():
 
 def test_normalize_layout_fills_defaults_without_mutating():
     lay = layout()
+    del lay["relations"][0]["cardinality"]
     before = copy.deepcopy(lay)
     out = normalize_layout(lay)
     assert lay == before
