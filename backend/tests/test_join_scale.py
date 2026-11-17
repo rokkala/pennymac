@@ -63,25 +63,29 @@ def _write_details(path: Path, n: int) -> None:
 @pytest.mark.slow
 def test_join_scale(tmp_path: Path):
     master, details, out = tmp_path / "m.csv", tmp_path / "i.csv", tmp_path / "joined.csv"
-    t0 = time.monotonic()
-    _write_master(master, MASTERS)
-    _write_details(details, MASTERS)
-    gen_s = time.monotonic() - t0
+    try:
+        t0 = time.monotonic()
+        _write_master(master, MASTERS)
+        _write_details(details, MASTERS)
+        gen_s = time.monotonic() - t0
 
-    t1 = time.monotonic()
-    res = join_files(LAYOUT, {"master": master, "items": details}, {}, out, tmp_path)
-    join_s = time.monotonic() - t1
-    rss = _peak_rss_bytes()
-    print(f"\njoin scale: {MASTERS:,} masters x {MASTERS * DETAILS_PER_MASTER:,} details; generate {gen_s:.1f}s, "
-          f"join {join_s:.1f}s, peak RSS {rss / 1024**2:.0f} MiB")
+        t1 = time.monotonic()
+        res = join_files(LAYOUT, {"master": master, "items": details}, {}, out, tmp_path)
+        join_s = time.monotonic() - t1
+        rss = _peak_rss_bytes()
+        print(f"\njoin scale: {MASTERS:,} masters x {MASTERS * DETAILS_PER_MASTER:,} details; generate {gen_s:.1f}s, "
+              f"join {join_s:.1f}s, peak RSS {rss / 1024**2:.0f} MiB")
+        with out.open(newline="") as f:
+            r = csv.reader(f)
+            header = next(r)
+            first = next(r)
+    finally:  # the generated files are large: never leave them in pytest's tmp dirs
+        for p in (master, details, out, out.with_name(out.stem + ".exceptions.jsonl")):
+            p.unlink(missing_ok=True)
 
     assert res.rows_out == MASTERS
     assert res.per_role["items"].rows_in == MASTERS * DETAILS_PER_MASTER
     assert res.per_role["items"].orphaned == 0 and res.master_match_rate == 1.0
-    with out.open(newline="") as f:
-        r = csv.reader(f)
-        header = next(r)
-        first = next(r)
     row = dict(zip(header, first, strict=True))
     assert row["id"] == "L000000000" and row["total"] == "55" and row["n"] == "10"
     assert join_s < MAX_SECONDS

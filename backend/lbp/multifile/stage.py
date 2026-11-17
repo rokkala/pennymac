@@ -369,7 +369,8 @@ def _regate(lay: dict, summary: dict) -> str | None:
     master = summary.get("master_rate_by_role")
     if master is None:
         master = {r.get("detail"): float(summary.get("master_match_rate", 0.0)) for r in lay.get("relations") or []}
-    return joiner.match_rate_gate(lay.get("relations") or [], master, summary.get("detail_match_rate") or {})
+    return joiner.match_rate_gate(lay.get("relations") or [], master, summary.get("detail_match_rate") or {},
+                                  summary.get("absent_roles") or ())
 
 
 def _accept(batch_id: str, b, summary: dict, stage: str) -> dict:
@@ -429,7 +430,7 @@ def _join(batch_id: str, b, cfg, lay: dict, inputs: dict[str, Path], overrides: 
             overrides[role] = dict(_EMPTY_PARSE_OPTIONS)
         with db.get_engine().begin() as c:  # rows left by an attempt that crashed before recording its file
             c.execute(delete(db.exceptions).where(db.exceptions.c.batch_id == batch_id, db.exceptions.c.category == "join"))
-        res = joiner.join_files(lay, inputs, overrides, out, tmp)
+        res = joiner.join_files(lay, inputs, overrides, out, tmp, absent_roles=absent)
         try:
             n = _insert_join_exceptions(batch_id, b.source_id, res.exceptions_path, lay, _pii_by_role(cfg, lay))
         finally:

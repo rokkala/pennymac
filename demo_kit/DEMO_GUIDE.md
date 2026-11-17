@@ -53,7 +53,7 @@ Across the platform:
 - Four delivery schedules with a month of on-time / late / missed / waived history.
 - A signed, published Glue configuration for every live feed.
 
-## Suggested run of show (about 25 minutes)
+## Suggested run of show (about 27 minutes)
 
 1. **Overview and vendors (Priya, 3 min).** Open Vendors & Mapping and pick a vendor. Each vendor owns feeds, and each feed has mapping versions, a delivery profile, a schedule and a **Glue config vN** badge. Click the badge: this is the signed configuration Glue runs. Drafts are never published.
 2. **Onboard a new vendor live (Priya, 4 min).** Click "Onboard vendor" and enter **Harbor Lending**. Then "Add feed", name it "Loan tape", and upload `2_upload_live/Harbor_Lending_new_vendor/Loan_tape/harbor_lending_first_tape.csv`. The file is profiled, PII is flagged and 100% of columns are auto-mapped. Open a field to show the transformation steps, sample trace and DQ checks, and use ← → to move through fields. Click "Submit for approval…".

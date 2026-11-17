@@ -35,7 +35,7 @@ import logging
 import os
 import sqlite3
 import tempfile
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -447,11 +447,13 @@ def _rate(num: int, den: int) -> float:
 
 
 def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, dict], out_path: Path,
-               tmp_dir: Path) -> JoinResult:
+               tmp_dir: Path, absent_roles: Iterable[str] = ()) -> JoinResult:
     """Join `inputs` (role -> file) per `layout`; write the joined CSV to `out_path` in master file order and
     the join exceptions as JSONL beside it. Raises LayoutError when the layout or the files' headers cannot
     be joined (or a file is empty, not even a header). Data problems are exceptions, never errors; a match
-    rate below a relation's `min_match_rate` is reported in `blocked` after the join completes."""
+    rate below a relation's `min_match_rate` is reported in `blocked` after the join completes. `absent_roles`:
+    detail roles whose file was accepted as missing (the caller joins them against an empty file); their
+    relations are exempt from the match-rate gate."""
     lay = normalize_layout(layout)
     rels = _relations(lay, inputs)
     master_spec = next(f for f in lay["files"] if f.get("role") == "master")
@@ -594,7 +596,7 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
 
     detail_rate = {r.role: _rate(per_role[r.role].matched, per_role[r.role].rows_in) for r in rels}
     master_rate = {r.role: _rate(r.masters_matched, m.rows_in) for r in rels}
-    blocked = match_rate_gate([r.spec for r in rels], master_rate, detail_rate)
+    blocked = match_rate_gate([r.spec for r in rels], master_rate, detail_rate, absent_roles)
     log.info("join done: master rows in %d, out %d, rejected %d; exceptions %s; blocked: %s",
              m.rows_in, rows_out, m.rejected, dict(exc.counts), "yes" if blocked else "no")
     if blocked:
@@ -634,14 +636,19 @@ def _master_problems(rels: list[_Relation], keys: list[str], info: list[tuple[in
     return out
 
 
-def match_rate_gate(relations: list[dict], master_rate: dict[str, float], detail_rate: dict[str, float]) -> str | None:
+def match_rate_gate(relations: list[dict], master_rate: dict[str, float], detail_rate: dict[str, float],
+                    absent_roles: Iterable[str] = ()) -> str | None:
     """Why the join is blocked by `min_match_rate`, or None. Per relation (normalized specs), the threshold applies
     to the master-side rate (masters with a detail row / masters read) and, when on_orphan_detail is exception, to
     the detail-side rate as well (details with a master / details read). Pure: also used to re-check a recorded
-    join from its summary."""
+    join from its summary. A relation whose detail role is in `absent_roles` (accepted as missing by an override
+    or released by load_master_only) is not gated: the missing file was already accepted."""
+    absent = set(absent_roles or ())
     msgs = []
     for spec in relations:
         role, tag = spec["detail"], f"{spec['detail']}->{spec['to']}"
+        if role in absent:
+            continue
         thr = float(spec["min_match_rate"])
         rate = master_rate.get(role, 1.0)
         if rate < thr:

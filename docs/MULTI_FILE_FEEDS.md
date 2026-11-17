@@ -107,8 +107,10 @@ aggregated into `tax_total`, `hazard_total`, `escrow_item_count` and `escrow_pay
    sample is a sanity check only (note (d)).
 5. **Propose** the layout. A different SME (Dan) opens the feed and **approves** it; the same person cannot do
    both. Approval publishes a new signed feed bundle that carries the layout and readiness.
-6. Map the joined columns (`escrow_items.ItemType`, `tax_total`, …) in the mapping workbench; the column
-   picker groups them by file. Submit and approve the mapping as usual.
+6. Map the joined columns (merged `role.column` names such as `escrow_items.ItemType`, aggregate outputs such
+   as `tax_total`). In Phase 1 the workbench's column picker lists the sampled master columns only, and adding
+   a field on a joined name is refused, so use the workaround in "Mapping joined columns in Phase 1" below.
+   Then submit and approve the mapping as usual.
 
 ### Through the API
 
@@ -188,8 +190,9 @@ file is kept, so the resumed batch loads exactly what was checked.
 `POST /api/file-sets/{set_id}/override` with
 
 - `accept_partial` (waiting or expired set with a master): queue the batch with the files present. Missing
-  details join as empty files and follow `on_missing_detail`. A relation with `min_match_rate` above 0 then
-  blocks the batch, because an absent detail matches nothing; a pre-flight override with a reason releases it.
+  details join as empty files and follow `on_missing_detail`. Their relations are exempt from `min_match_rate`
+  (the override already accepted the missing file), so no second override is needed; relations whose detail
+  file is present are still gated.
 - `discard`: close the set without loading.
 - `repair` (`target_pairing_key`, optional `member_role`): move a file to the set with another pairing value,
   before the batch is queued.
@@ -241,8 +244,9 @@ masters with 10,000,000 detail rows; on an Apple Silicon laptop it took 72.5 s w
   relation trees come in later phases). PostgreSQL was not exercised in this work (SQLite only), and the new
   migration 0007 should be run against PostgreSQL before production. The old dev DB needs
   `python -m lbp.cli migrate`.
-- **(m)** An accepted partial set still meets the match-rate gate: an absent detail has a master-side rate of
-  0, so a relation with `min_match_rate` above 0 blocks the batch until a pre-flight override with a reason.
+- **(m)** A relation whose detail role is absent (accepted as missing by an `accept_partial` override, or
+  released by a `load_master_only` timeout; listed in `join_summary.absent_roles`) is exempt from the
+  `min_match_rate` gate. The exemption never applies to a relation whose detail file is present.
 - **(n)** The mapping service validates new fields against the sampled master columns only; see "Mapping
   joined columns in Phase 1" in section 3.
 

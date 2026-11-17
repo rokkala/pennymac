@@ -16,7 +16,7 @@ OPS = {"X-User": "oli", "X-Roles": "ops"}
 N = 40
 
 
-def _feed(files, *, min_match_rate=0.8):
+def _feed(files, *, min_match_rate=0.8, layout=None, readiness=None):
     """Feed created through the services: approved mapping (incl. two aggregate outputs), layout proposed by
     one user and approved by another. Returns the source id."""
     from lbp.mapping import service as ms
@@ -37,7 +37,8 @@ def _feed(files, *, min_match_rate=0.8):
     ms.submit(mid, "analyst1")
     ms.approve(mid, "onboarding.reviewer", ["onboarding_reviewer"], True, "ok")
     sid = reg["source_id"]
-    propose_layout(sid, master_detail_layout(min_match_rate), master_detail_readiness(), "analyst1", ["onboarding"])
+    propose_layout(sid, layout or master_detail_layout(min_match_rate), readiness or master_detail_readiness(), "analyst1",
+                   ["onboarding"])
     decide_layout(sid, "sme1", ["onboarding_reviewer"], True, "two-file escrow feed")
     return sid
 
@@ -109,17 +110,19 @@ def test_e2e_master_then_detail_loads_joined_loans(client, env):
     assert j["master_rows_read"] == N and j["master_rows_excluded_by_join"] == 0
     assert b.processed == N - j["master_rows_excluded_by_join"] and len(_staging(bid)) == N
 
-    # hand-checked aggregate: a loan whose detail rows carry key noise (case / leading zeros / spaces)
-    lid = _norm(noisy[0]["LoanRef"])
-    mine = [x for x in details if _norm(x["LoanRef"]) == lid]
+    # hand-checked aggregate: the first loan with both TAX and HAZ items, at least one spelled with key noise
+    def items(i):
+        return [x for x in details if _norm(x["LoanRef"]) == i]
+
+    lid = next(i for i in ids if {"TAX", "HAZ"} <= {x["ItemType"] for x in items(i)}
+               and any(x["LoanRef"] != i for x in items(i)))
+    mine = items(lid)
+    assert any(x["LoanRef"] != lid for x in mine) and {"TAX", "HAZ"} <= {x["ItemType"] for x in mine}
     tax = sum((Decimal(x["ItemAmount"]) for x in mine if x["ItemType"] == "TAX"), Decimal(0))
     haz = sum((Decimal(x["ItemAmount"]) for x in mine if x["ItemType"] == "HAZ"), Decimal(0))
     rec = {s.loan_number: s.record for s in _staging(bid)}[lid]
-    if tax:
-        assert Decimal(str(rec["tax_annual_amount"])) == tax
-    if haz:
-        assert Decimal(str(rec["hazard_insurance_annual_premium"])) == haz
-    assert tax or haz
+    assert Decimal(str(rec["tax_annual_amount"])) == tax
+    assert Decimal(str(rec["hazard_insurance_annual_premium"])) == haz
     lonely = {s.loan_number: s.record for s in _staging(bid)}[without[0]]  # a master without details still loads
     assert lonely.get("tax_annual_amount") in (None, "") and lonely.get("hazard_insurance_annual_premium") in (None, "")
 
@@ -149,7 +152,7 @@ def test_e2e_master_then_detail_loads_joined_loans(client, env):
 def test_e2e_timeout_alert_then_override_accept_partial(client, env, monkeypatch):
     from lbp.api import main as api
     from lbp.multifile.fileset import expire_sets
-    from lbp.pipeline.batch import override_preflight, run_batch
+    from lbp.pipeline.batch import run_batch
     from lbp.samples import generate_master_detail
 
     started = []
@@ -175,19 +178,41 @@ def test_e2e_timeout_alert_then_override_accept_partial(client, env, monkeypatch
     assert out["status"] == "consumed" and out["missing_roles"] == ["escrow_items"] and started == [out["batch_id"]]
     bid = out["batch_id"]
 
-    # the absent detail joins as an empty file; its master-side match rate is 0, so the gate still asks for a reason
-    res = run_batch(bid)
-    assert res["status"] == "blocked" and "min_match_rate" in _batch(bid).error
-    override_preflight(bid, "sme1", ["onboarding_reviewer"], "partial set accepted: no escrow items expected")
+    # the absent detail joins as an empty file; the override accepted it, so min_match_rate (0.8) does not gate it
     run_batch(bid)
     b = _batch(bid)
     assert b.status == "completed", b.error
+    assert not b.join_summary["overrides"] and not (b.preflight or {}).get("join_overrides")
     assert b.join_summary["absent_roles"] == ["escrow_items"] and b.processed == 20  # on_missing_detail: allow
     assert all(s.record.get("tax_annual_amount") in (None, "") for s in _staging(bid))
     (ov,) = [a for a in _audit("fileset.override") if a.entity_id == m["set_id"]]
     assert ov.actor == "sme1" and ov.detail["action"] == "accept_partial" and ov.detail["missing_roles"] == ["escrow_items"]
     assert ov.detail["reason"] == "vendor confirmed no escrow items today"
     assert [a.entity_id for a in _audit("file_set.timeout")] == [m["set_id"]]
+
+
+def test_e2e_load_master_only_timeout_with_min_match_rate_completes(client, env):
+    """An optional detail that never arrives: load_master_only releases the master after the timeout and the
+    absent role is not gated by its min_match_rate."""
+    from lbp.multifile.fileset import sweep_sets
+    from lbp.pipeline.batch import run_batch
+    from lbp.samples import generate_master_detail, master_detail_layout, master_detail_readiness
+
+    files = generate_master_detail(env / "src", 20)
+    lay = master_detail_layout(0.8)
+    lay["files"][1]["required"] = False
+    sid = _feed(files, layout=lay, readiness={**master_detail_readiness(), "on_timeout": "load_master_only"})
+    m = _upload(client, sid, files["master"])
+    assert m["status"] == "waiting"
+    swept = sweep_sets(datetime.now(UTC) + timedelta(minutes=241))
+    assert swept["handled"] == [m["set_id"]] and len(swept["batches"]) == 1
+    bid = swept["batches"][0]
+    run_batch(bid)
+    b = _batch(bid)
+    assert b.status == "completed", b.error
+    assert b.join_summary["absent_roles"] == ["escrow_items"] and b.processed == 20
+    missed = [a.detail for a in _audit("alert.delivery_missed") if a.detail.get("set_id") == m["set_id"]]
+    assert len(missed) == 1 and missed[0]["missing_roles"] == ["escrow_items"]
 
 
 def test_e2e_legacy_feed_regression(client, env, sample_files):
