@@ -29,10 +29,12 @@ from lbp.ingestion.parser import ParseOptions, iter_rows
 from lbp.mapping.transforms import TRUE_VALUES, TransformError, _date
 from lbp.multifile.keys import KEY_SEP, key_text, normalize_key
 from lbp.multifile.layout import LayoutError, normalize_layout, validate_layout
-from lbp.rules.jsonlogic import _truthy, compile_logic
+from lbp.rules.jsonlogic import _truthy, compile_logic, referenced_vars
 
 BATCH_ROWS = 5000
 JOIN01_ORPHAN = "JOIN01"
+JOIN07_AGG_VALUE = "JOIN07"
+MAX_EXPONENT = 40  # a Decimal whose exponent is larger in magnitude is treated as not numeric
 # The join does not care how files are paired into a set; validate the layout with a readiness policy
 # that imposes no filename rules, so a layout valid under its real readiness is never rejected here.
 _NEUTRAL_READINESS = {"pairing": "window_minutes", "window_minutes": 1, "on_timeout": "alert_only"}
@@ -82,7 +84,9 @@ def _dec(v: str) -> Decimal | None:
         d = Decimal(v.strip().replace("$", "").replace(",", ""))
     except InvalidOperation:
         return None
-    return d if d.is_finite() else None
+    if not d.is_finite() or abs(d.as_tuple().exponent) > MAX_EXPONENT:
+        return None
+    return d
 
 
 def _fmt_decimal(d: Decimal) -> str:
@@ -129,9 +133,12 @@ class _Acc:
     def __init__(self, spec: dict, columns: list[str], tag: str):
         self.op, self.name, self.src = spec["op"], spec["as"], spec.get("col")
         self.tag = tag
+        self.issues: list[tuple[str, str, int, list[str]]] = []  # (as, col, row_no, row)
         self.where = compile_logic(spec["where"]) if spec.get("where") else None
         self.order = [(k["col"], bool(k.get("desc", False)), k.get("type", "text")) for k in spec.get("order_by") or []]
         needed = ([self.src] if self.src else []) + [c for c, _, _ in self.order]
+        if spec.get("where"):
+            needed += sorted(referenced_vars(spec["where"]))
         missing = [c for c in needed if c not in columns]
         if missing:
             raise LayoutError(f"{tag}: aggregate column {self.name} uses column(s) {missing} not in the detail file")
@@ -139,9 +146,11 @@ class _Acc:
         self.reset()
 
     def reset(self) -> None:
+        self.issues.clear()
         self.n = 0
         self.total = Decimal(0)
         self.seen_value = False
+        self.seen_num = False
         self.lo_dec: tuple[Decimal, str] | None = None
         self.hi_dec: tuple[Decimal, str] | None = None
         self.lo_txt: str | None = None
@@ -157,7 +166,7 @@ class _Acc:
         return _SortKey([(v is None, v, desc) for v, desc in
                          ((_sort_value(t, row[self.pos[c]]), d) for c, d, t in self.order)], idx)
 
-    def add(self, row: list[str], rowdict: dict[str, str] | None, idx: int) -> None:
+    def add(self, row: list[str], rowdict: dict[str, str] | None, idx: int, row_no: int) -> None:
         if self.where is not None and not _truthy(self.where(rowdict)):
             return
         self.n += 1
@@ -171,8 +180,10 @@ class _Acc:
         if op == "sum":
             d = _dec(v)
             if d is None:
-                raise LayoutError(f"{self.tag}: aggregate column {self.name}: non-numeric value in {self.src}")
-            self.total += d
+                self.issues.append((self.name, self.src, row_no, row))  # data problem: skip it, report it
+            else:
+                self.seen_num = True
+                self.total += d
         elif op in ("min", "max"):
             d = _dec(v)
             if d is None:
@@ -203,10 +214,10 @@ class _Acc:
         op = self.op
         if op == "count":
             return str(self.n)
+        if op == "sum":
+            return _fmt_decimal(self.total) if self.seen_num else ""
         if not self.seen_value:
             return ""
-        if op == "sum":
-            return _fmt_decimal(self.total)
         if op == "min":
             return self.lo_dec[1] if self.numeric and self.lo_dec else self.lo_txt or ""
         if op == "max":
@@ -238,15 +249,19 @@ class AggregateMode:
         self.columns = [a.name for a in self.accs]
         self._detail_columns = detail_columns
         self._needs_dict = any(a.where is not None for a in self.accs)
+        self.row_no = 0  # file row number of the row being reduced; set by the join engine
+        self.issues: list[tuple[str, str, int, list[str]]] = []  # data problems from the last reduce
 
     def reduce(self, rows: Iterator[list[str]]) -> tuple[list[str], int]:
         for a in self.accs:
             a.reset()
         n = 0
+        self.issues = []
         for n, row in enumerate(rows, start=1):  # noqa: B007 - n is the row count after the loop
             rd = dict(zip(self._detail_columns, row, strict=True)) if self._needs_dict else None
             for a in self.accs:
-                a.add(row, rd, n)
+                a.add(row, rd, n, self.row_no)
+        self.issues = [i for a in self.accs for i in a.issues]
         return [a.result() for a in self.accs], n
 
 
@@ -327,6 +342,13 @@ def _relations(lay: dict, inputs: dict[str, Path]) -> list[_Relation]:
         rels.append(_Relation(idx=i, role=r["detail"], spec=r, parent_cols=[p["parent"] for p in r["on"]],
                               detail_cols=[p["detail"] for p in r["on"]], ops=norm, table=f"detail_{i}"))
     return rels
+
+
+def _tracked(handler: object, cur: Iterator[tuple[int, str]]) -> Iterator[list[str]]:
+    """Detail rows as value lists, telling the handler each row's file row number as it goes."""
+    for row_no, data in cur:
+        handler.row_no = row_no  # type: ignore[attr-defined]
+        yield json.loads(data)
 
 
 def _batched_insert(conn: sqlite3.Connection, sql: str, rows: Iterator[tuple]) -> None:
@@ -441,9 +463,12 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
                     k = r.master_key(row)
                     found: Iterator[list[str]] = iter(())
                     if k is not None:
-                        cur = conn.execute(f"SELECT data FROM {r.table} WHERE nkey = ? ORDER BY row_no", (k,))
-                        found = (json.loads(d) for (d,) in cur)
+                        cur = conn.execute(f"SELECT row_no, data FROM {r.table} WHERE nkey = ? ORDER BY row_no", (k,))
+                        found = _tracked(r.handler, cur)
                     values, n = r.handler.reduce(found)
+                    for name, col, row_no, vals in getattr(r.handler, "issues", ()):
+                        exc.add(JOIN07_AGG_VALUE, r.role, row_no, k, f"aggregate value in {r.role}.{col} for {name} is "
+                                "not numeric", dict(zip(r.columns, vals, strict=True)))
                     any_match = any_match or n > 0
                     out.extend(values)
                 per_role["master"].matched += any_match

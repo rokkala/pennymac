@@ -7,7 +7,7 @@ import pytest
 
 from lbp.multifile.joiner import join_files
 from lbp.multifile.layout import LayoutError
-from tests.test_join_golden import read_csv
+from tests.test_join_golden import read_csv, read_exceptions
 
 
 def layout(columns: list[dict]) -> dict:
@@ -75,10 +75,28 @@ def test_sum_is_decimal_without_float_artifacts(tmp_path: Path):
     assert rows[1][1] == "300"  # no exponent form
 
 
-def test_sum_of_non_numeric_is_a_layout_error_without_the_value(tmp_path: Path):
-    with pytest.raises(LayoutError) as ei:
-        run(tmp_path, [{"as": "t", "op": "sum", "col": "amt"}], "ref,amt\n1,SECRET-123\n")
-    assert "SECRET-123" not in str(ei.value) and "amt" in str(ei.value)
+def test_sum_skips_non_numeric_and_records_join07_without_the_value(tmp_path: Path):
+    m, d = tmp_path / "m.csv", tmp_path / "d.csv"
+    m.write_text("id\n1\n2\n", encoding="utf-8")
+    d.write_text("ref,amt\n1,4\n1,SECRET-123\n1,6\n2,N/A\n", encoding="utf-8")
+    cols = [{"as": "t", "op": "sum", "col": "amt"}, {"as": "n", "op": "count"}]
+    res = join_files(layout(cols), {"master": m, "items": d}, {}, tmp_path / "o.csv", tmp_path)
+    assert read_csv(tmp_path / "o.csv") == [["id", "t", "n"], ["1", "10", "3"], ["2", "", "1"]]
+    assert res.exception_counts == {"JOIN07": 2}
+    exc = read_exceptions(res.exceptions_path)
+    assert [(e["code"], e["role"], e["row_number"], e["key"]) for e in exc] == [
+        ("JOIN07", "items", 2, "1"), ("JOIN07", "items", 4, "2")]
+    assert all("SECRET-123" not in e["message"] and "amt" in e["message"] and "items" in e["message"] for e in exc)
+
+
+def test_absurd_exponents_are_not_numeric(tmp_path: Path):
+    from lbp.multifile.joiner import _dec
+
+    assert _dec("1E999999999") is None and _dec("1e-50") is None and _dec("NaN") is None
+    assert _dec("1E5") is not None
+    rows = run(tmp_path, [{"as": "t", "op": "sum", "col": "amt"}, {"as": "hi", "op": "max", "col": "amt"}],
+               "ref,amt\n1,1E999999999\n1,3\n")
+    assert rows[1][1] == "3" and len(rows[1][2]) < 50
 
 
 def test_missing_aggregate_source_column_is_layout_error(tmp_path: Path):
@@ -86,6 +104,8 @@ def test_missing_aggregate_source_column_is_layout_error(tmp_path: Path):
         run(tmp_path, [{"as": "t", "op": "sum", "col": "nope"}], "ref,amt\n1,1\n")
     with pytest.raises(LayoutError, match="zip"):
         run(tmp_path, [{"as": "t", "op": "count", "order_by": [{"col": "zip"}]}], "ref,amt\n1,1\n")
+    with pytest.raises(LayoutError, match=r"items.*status"):
+        run(tmp_path, [{"as": "t", "op": "count", "where": {"==": [{"var": "status"}, "x"]}}], "ref,amt\n1,1\n")
 
 
 def test_aggregate_needs_a_spec(tmp_path: Path):
