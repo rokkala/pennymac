@@ -5,6 +5,7 @@ import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, 
 import { Segments, Sparkline } from "../charts.jsx";
 import { batchStep } from "../monitorQuery.js";
 import { SCREEN } from "../screenCopy.js";
+import FileSetPanel, { JoinCounts } from "./FileSetPanel.jsx";
 
 const STEP_PILL = { succeeded: "pass", failed: "fail", running: "accent" };
 
@@ -371,6 +372,7 @@ export function BatchModal({ id, onClose, persona, go, nav }) {
           {data.sequence_detail?.config && <><dt>Configuration</dt><dd><span className="chip">published v{data.sequence_detail.config.version}</span> <span className="mono faint" style={{ fontSize: ".74rem" }}>{data.sequence_detail.config.sha256}</span></dd></>}
           {data.error && <><dt>Error</dt><dd style={{ color: "var(--fail)" }}>{data.error}</dd></>}
         </dl>
+        <JoinCounts summary={data.join_summary || data.reconciliation?.join} />
         <ChangeSummary data={data} persona={persona} onChanged={reload} />
         <Segments total={data.total_rows} parts={[
           { label: "Passed", value: data.passed, color: "var(--pass)" }, { label: "Warn", value: data.warned, color: "var(--warn)" },
@@ -428,6 +430,7 @@ export default function Imports({ persona, go, vendor }) {
         { label: "Peak throughput", value: `${fmt(peak)}/s` },
         { label: "Completed batches", value: done.length, detail: `${fmt(done.reduce((a, x) => a + x.processed, 0))} loans` },
       ]} />
+      <FileSetPanel persona={persona} sources={s.data.sources} />
       <Panel title="Batches" sub="Select a file to see its progress, checks and actions" pad={false}>
           {!batches.length ? (
             <EmptyState

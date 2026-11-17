@@ -53,6 +53,7 @@ export const CAPS = {
   publishConfig: ["onboarding_reviewer"],
   editDelivery: ["onboarding"],
   approveDelivery: ["onboarding_reviewer"],
+  overrideFileSet: ["onboarding_reviewer", "compliance_reviewer"],
   skipGap: ["monitoring", "onboarding_reviewer"],
   applyOutOfOrder: ["onboarding_reviewer", "compliance_reviewer"],
   discardBatch: ["monitoring", "onboarding_reviewer"],

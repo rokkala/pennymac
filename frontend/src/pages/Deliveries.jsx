@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { api, scoped } from "../api.js";
 import { canCap } from "../roles.js";
+import FileSetPanel from "./FileSetPanel.jsx";
 import { useApi, useAction, Panel, Status, Loading, Kpis, Modal, Tabs, fmt, ago, human, useDialog, PageHeader, EmptyState, ActionBar } from "../ui.jsx";
 
 const TZS = ["America/New_York", "America/Chicago", "America/Denver", "America/Phoenix", "America/Los_Angeles", "UTC", "Europe/London", "Asia/Kolkata"];
@@ -258,6 +259,7 @@ export default function Deliveries({ persona }) {
           </Panel>
         </div>
       </div>
+      <FileSetPanel persona={persona} sources={srcs.data.sources} />
       <Panel title="Schedules" sub="Timetables live in the application (per-vendor timezone and business calendar); changes need a second approver" pad={false}>
         <div className="tbl-wrap"><table className="tbl">
           <thead><tr><th>Schedule</th><th>Vendor · feed</th><th>When</th><th>Channel</th><th>Next due</th><th className="r">On time (30 d)</th><th>Status</th><th></th></tr></thead>
