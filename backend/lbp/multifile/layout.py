@@ -46,9 +46,13 @@ class LayoutError(ValueError):
 
 def normalize_layout(layout: dict) -> dict:
     """Layout with relation defaults filled in. The input is never mutated."""
-    out = copy.deepcopy(layout or {})
-    out.setdefault("files", [])
-    out["relations"] = [{**copy.deepcopy(DEFAULT_RELATION), **r} for r in (out.get("relations") or [])]
+    out = copy.deepcopy(layout) if isinstance(layout, dict) else {}
+    out["files"] = out.get("files") or []
+    rels = out.get("relations") or []
+    out["relations"] = [
+        {**copy.deepcopy(DEFAULT_RELATION), **{k: v for k, v in r.items() if v is not None}}
+        for r in rels if isinstance(r, dict)
+    ]
     return out
 
 
@@ -57,8 +61,21 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
 
     `columns` maps role -> known column names, when available (sample or hand-entered)."""
     errs: list[str] = []
-    lay = normalize_layout(layout)
-    ready = {**DEFAULT_READINESS, **(readiness or {})}
+    raw = layout if isinstance(layout, dict) else {}
+    if not isinstance(layout, dict):
+        errs.append("layout must be an object")
+    for key in ("files", "relations"):
+        if raw.get(key) is not None and not isinstance(raw[key], list):
+            errs.append(f"layout.{key} must be a list")
+            raw = {**raw, key: []}
+    raw = {**raw, "files": [f for f in (raw.get("files") or []) if isinstance(f, dict)]}
+    n_bad = len(layout.get("files") or []) - len(raw["files"]) if isinstance(layout, dict) and isinstance(layout.get("files"), list) else 0
+    if n_bad:
+        errs.append("every entry in files must be an object")
+    if any(not isinstance(r, dict) for r in (raw.get("relations") or [])):
+        errs.append("every entry in relations must be an object")
+    lay = normalize_layout(raw)
+    ready = {**DEFAULT_READINESS, **{k: v for k, v in (readiness if isinstance(readiness, dict) else {}).items() if v is not None}}
     files = lay["files"]
     roles = [f.get("role") for f in files]
 
@@ -79,8 +96,10 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
             errs.append(f"name_pattern for {role} is not a valid regex: {e}")
         if not f.get("name_pattern"):
             errs.append(f"name_pattern is required for {role}")
-    if masters and not masters[0].get("key"):
-        errs.append("master file needs a key")
+    if masters:
+        mk = masters[0].get("key")
+        if not isinstance(mk, list) or not mk or not all(isinstance(k, str) and k for k in mk):
+            errs.append("master key must be a non-empty list of column names")
 
     details_seen: set[str] = set()
     outputs: dict[str, str] = {}
@@ -97,13 +116,14 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
         if detail in details_seen:
             errs.append(f"{tag}: detail role {detail!r} has more than one relation")
         details_seen.add(detail)
-        on = r.get("on") or []
-        if not on or any(not (p.get("parent") and p.get("detail")) for p in on):
+        on = r.get("on") if isinstance(r.get("on"), list) else []
+        if not on or any(not (isinstance(p, dict) and p.get("parent") and p.get("detail")) for p in on):
             errs.append(f"{tag}: on needs at least one key part with parent and detail columns")
         parent_key = (by_role.get(parent) or {}).get("key")
-        if on and parent_key and len(on) != len(parent_key):
+        if on and isinstance(parent_key, list) and parent_key and len(on) != len(parent_key):
             errs.append(f"{tag}: key parts ({len(on)}) must match the parent key ({len(parent_key)})")
-        bad = [n for n in r["normalize"] if n not in NORMALIZERS]
+        norm = r["normalize"] if isinstance(r["normalize"], list) else [r["normalize"]]
+        bad = [n for n in norm if n not in NORMALIZERS]
         if bad:
             errs.append(f"{tag}: unknown normalizer {bad}; use {NORMALIZERS}")
         mode = r.get("mode")
@@ -122,10 +142,14 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
         except (TypeError, ValueError):
             errs.append(f"{tag}: min_match_rate must be a number")
         if mode == "aggregate":
-            cols = (r.get("aggregate") or {}).get("columns") or []
+            agg = r.get("aggregate") if isinstance(r.get("aggregate"), dict) else {}
+            cols = agg.get("columns") if isinstance(agg.get("columns"), list) else []
             if not cols:
                 errs.append(f"{tag}: aggregate needs at least one column")
             for c in cols:
+                if not isinstance(c, dict):
+                    errs.append(f"{tag}: every aggregate column must be an object")
+                    continue
                 name = c.get("as")
                 if not name:
                     errs.append(f"{tag}: every aggregate column needs an 'as' name")

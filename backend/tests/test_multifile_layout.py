@@ -122,3 +122,35 @@ def test_name_pattern_must_compile_and_named_groups_required_for_pairing():
     lay["files"][1]["name_pattern"] = r"fees_\d{8}\.csv"
     assert any("fees" in e and "group" in e for e in validate_layout(lay, {"pairing": "business_date"}))
     assert validate_layout(lay, {"pairing": "window_minutes", "window_minutes": 30}) == []
+
+
+def test_malformed_shapes_return_errors_without_raising():
+    lay = layout()
+    lay["relations"][0]["normalize"] = None
+    assert validate_layout(lay, None) == []  # null falls back to the default
+    lay = layout()
+    lay["relations"][0]["on"] = ["loan_id"]
+    assert any("key part" in e for e in validate_layout(lay, None))
+    lay = agg_layout("total")
+    lay["relations"][0]["aggregate"]["columns"] = ["total"]
+    assert any("object" in e for e in validate_layout(lay, None))
+    assert validate_layout({"files": None, "relations": None}, None)
+    assert validate_layout({"files": "x", "relations": 3}, None)
+    assert validate_layout(None, None)
+    assert any("object" in e for e in validate_layout({"files": [1], "relations": ["r"]}, None))
+    assert validate_layout(layout(), ["bad"]) == []
+    lay = layout()
+    lay["files"][0]["key"] = "loan_id"
+    assert any("master key" in e for e in validate_layout(lay, None))
+
+
+def test_other_validation_branches():
+    lay = layout()
+    lay["relations"][0]["join"] = "outer"
+    lay["relations"][0]["min_match_rate"] = 2
+    errs = validate_layout(lay, None)
+    assert any("join" in e for e in errs) and any("min_match_rate" in e for e in errs)
+    lay = layout()
+    lay["relations"].append(dict(lay["relations"][0]))
+    assert any("more than one relation" in e for e in validate_layout(lay, None))
+    assert any("window_minutes" in e for e in validate_layout(layout(), {"pairing": "window_minutes"}))
