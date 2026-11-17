@@ -295,3 +295,90 @@ def generate_all(out_dir: Path, n: int = 500) -> dict[str, Path]:
     for key, (_, ext, fn) in SOURCES.items():
         out[key] = fn(out_dir / f"{key}_sample.{ext}", n)
     return out
+
+
+# ---------------------------------------------------------------- master/detail (multi-file feed)
+ESCROW_ITEM_TYPES = ["TAX", "TAX", "HAZ", "HAZ", "MI", "FLOOD"]
+PAYEES = {"TAX": ["County Tax Collector", "City Treasurer", "School District Tax Office"],
+          "HAZ": ["Acme Home Insurance Co", "Harbor Mutual Insurance", "Summit Property Insurance"],
+          "MI": ["Example Mortgage Insurance Corp", "Keystone MI Co"],
+          "FLOOD": ["National Flood Program (sample)", "Riverbend Flood Insurance"]}
+DETAIL_HEADER = ["LoanRef", "ItemType", "ItemAmount", "DueDate", "PayeeName", "PayerTIN"]
+
+
+def _noisy_ref(rng: random.Random, loan_id: str) -> str:
+    """The detail system's spelling of a loan number: mostly exact, sometimes lower case, zero-padded or
+    padded with spaces. trim + strip_leading_zeros + upper resolves every variant."""
+    r = rng.random()
+    if r < 0.70:
+        return loan_id
+    if r < 0.80:
+        return loan_id.lower()
+    if r < 0.90:
+        return "00" + loan_id
+    if r < 0.95:
+        return f" {loan_id} "
+    return "0" + loan_id.lower()
+
+
+def generate_master_detail(dir: Path, n: int, *, date: str = "20261117", seed: int = 515, offset: int = 0) -> dict[str, Path]:
+    """A two-file delivery for one business date: `loans_<date>.csv` (the master, PCG Retail columns, one row per
+    loan) and `escrow_items_<date>.csv` (1:N escrow disbursement items, about 3 per loan, in no particular order).
+
+    Data problems on purpose: every 10th loan has no escrow items, a few items point at loans that are not in
+    the master (orphans), and about 30% of the items spell the loan number differently (case, leading zeros,
+    spaces). Deterministic for a given (n, date, seed, offset). All data is fake (see the module docstring)."""
+    dir = Path(dir)
+    dir.mkdir(parents=True, exist_ok=True)
+    master = write_pcg_retail(dir / f"loans_{date}.csv", n, seed=seed, offset=offset, defect_rate=0.0)
+    ids = [f"PCG{i:08d}" for i in range(offset + 1, offset + n + 1)]
+    rng = random.Random(seed * 31 + n)
+
+    def item(ref: str) -> list:
+        kind = rng.choice(ESCROW_ITEM_TYPES)
+        amount = {"TAX": (900, 7200), "HAZ": (600, 3600), "MI": (300, 2400), "FLOOD": (400, 2800)}[kind]
+        due = f"{date[:4]}-{rng.randint(1, 12):02d}-01"
+        tin = f"{rng.randint(100, 665):03d}-{rng.randint(10, 99):02d}-{rng.randint(1000, 9999):04d}"
+        return [ref, kind, f"{rng.uniform(*amount):.2f}", due, rng.choice(PAYEES[kind]), tin]
+
+    rows = []
+    for idx, loan_id in enumerate(ids):
+        if idx % 10 == 7:  # masters without details
+            continue
+        for _ in range(rng.choice([2, 3, 3, 4])):
+            rows.append(item(_noisy_ref(rng, loan_id)))
+    for k in range(max(2, n // 40)):  # orphans: loan numbers the master does not have
+        rows.append(item(f"PCG{90_000_000 + offset + k:08d}"))
+    rng.shuffle(rows)
+    details = dir / f"escrow_items_{date}.csv"
+    with details.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(DETAIL_HEADER)
+        w.writerows(rows)
+    return {"master": master, "details": details}
+
+
+def master_detail_layout(min_match_rate: float = 0.8) -> dict:
+    """The layout of the generate_master_detail delivery: escrow items aggregated onto the loan."""
+    return {
+        "files": [
+            {"role": "master", "entity": "loan", "name_pattern": r"loans_(?P<date>\d{8})\.csv", "key": ["LoanID"], "required": True},
+            {"role": "escrow_items", "name_pattern": r"escrow_items_(?P<date>\d{8})\.csv", "required": True,
+             "columns": list(DETAIL_HEADER)},
+        ],
+        "relations": [{
+            "detail": "escrow_items", "to": "master", "on": [{"parent": "LoanID", "detail": "LoanRef"}],
+            "normalize": ["trim", "strip_leading_zeros", "upper"], "mode": "aggregate", "join": "left",
+            "on_orphan_detail": "exception", "on_missing_detail": "allow", "min_match_rate": min_match_rate,
+            "aggregate": {"columns": [
+                {"as": "tax_total", "op": "sum", "col": "ItemAmount", "where": {"==": [{"var": "ItemType"}, "TAX"]}},
+                {"as": "hazard_total", "op": "sum", "col": "ItemAmount", "where": {"==": [{"var": "ItemType"}, "HAZ"]}},
+                {"as": "escrow_item_count", "op": "count"},
+                {"as": "escrow_payees", "op": "concat_distinct", "col": "PayeeName"},
+            ]},
+        }],
+    }
+
+
+def master_detail_readiness() -> dict:
+    return {"require": "all_required", "pairing": "business_date", "wait_timeout_minutes": 240, "on_timeout": "alert_only"}

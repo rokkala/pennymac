@@ -16,7 +16,8 @@ changed file on resume is an error (StageError), never a silent re-join.
 Absent optional roles (a set queued with load_master_only or an accepted partial set): the role joins
 against an empty header-only CSV, so masters follow `on_missing_detail`. Its header is the layout file's
 declared `columns` when given, else the columns the relation references (its `on` detail keys, aggregate
-`col`s, `where` variables and `order_by` columns). A required role is never absent: that is a StageError.
+`col`s, `where` variables and `order_by` columns). A required role is absent only when a recorded
+`accept_partial` override on the set names it among its missing roles; otherwise that is a StageError.
 
 Pre-flight per role: every role's header must hold its declared `columns` and the columns the relation
 references; a missing one blocks the batch and names the role (resumable through override_preflight).
@@ -322,6 +323,13 @@ def _members(c, set_id: str) -> dict[str, str]:
     return {r.role: r.file_path for r in c.execute(select(bf.c.role, bf.c.file_path).where(bf.c.set_id == set_id))}
 
 
+def _accepted_missing(c, set_id: str) -> set[str]:
+    """Roles a recorded `accept_partial` override on the set accepted as missing (never the master)."""
+    ov = c.execute(select(db.file_sets.c.override).where(db.file_sets.c.set_id == set_id)).scalar() or {}
+    return {r for o in ov.get("overrides") or [] if o.get("action") == "accept_partial"
+            for r in o.get("missing_roles") or [] if r != "master"}
+
+
 def _record(batch_id: str, vals: dict, audits: list[tuple[str, dict]]) -> None:
     """Every join-stage state change is ONE write: the batch columns and its audit entries commit together."""
     with db.get_engine().begin() as c:
@@ -458,6 +466,7 @@ def materialize_join(batch_id: str, cfg) -> dict:
         if b is None or not b.file_set_id:
             raise StageError(f"batch {batch_id} is not a file-set batch")
         members = _members(c, b.file_set_id)
+        accepted_missing = _accepted_missing(c, b.file_set_id)
     if not cfg.layout:
         raise StageError(f"batch {batch_id} belongs to a file set but feed {b.source_id} has no published layout")
     lay = normalize_layout(cfg.layout)
@@ -478,7 +487,7 @@ def materialize_join(batch_id: str, cfg) -> dict:
             override = None
     else:
         required = [r for r, f in files.items() if r == "master" or f.get("required")]
-        missing_req = [r for r in required if r not in members]
+        missing_req = [r for r in required if r not in members and r not in accepted_missing]
         if missing_req:
             raise StageError(f"file set {b.file_set_id} has no file for required role(s) {missing_req}; "
                              "the batch cannot run without them")
