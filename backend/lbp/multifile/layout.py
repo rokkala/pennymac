@@ -15,9 +15,12 @@ from __future__ import annotations
 import copy
 import re
 
+from lbp.rules.jsonlogic import compile_logic
+
 SUPPORTED_MODES = frozenset({"merge", "aggregate"})
 KNOWN_MODES = frozenset({"merge", "flatten", "aggregate", "child"})
 NORMALIZERS = ("trim", "strip_leading_zeros", "upper")
+ORDER_TYPES = ("text", "number", "date")
 AGG_OPS = ("sum", "count", "min", "max", "first", "last", "any", "concat_distinct")
 
 DEFAULT_RELATION = {
@@ -54,6 +57,33 @@ def normalize_layout(layout: dict) -> dict:
         for r in rels if isinstance(r, dict)
     ]
     return out
+
+
+def _aggregate_expr_errors(tag: str, name: str, col: dict) -> list[str]:
+    """Shape errors of an aggregate column's optional `where` (JSON logic) and `order_by` (sort keys)."""
+    errs: list[str] = []
+    if col.get("where") is not None:
+        w = col["where"]
+        if not isinstance(w, dict):
+            errs.append(f"{tag}: where for {name} must be a JSON-logic object")
+        else:
+            try:
+                compile_logic(w)
+            except Exception as e:  # noqa: BLE001 - any compile failure is a layout error
+                errs.append(f"{tag}: where for {name} is not valid JSON logic: {e}")
+    if col.get("order_by") is not None:
+        ob = col["order_by"]
+        if not isinstance(ob, list):
+            errs.append(f"{tag}: order_by for {name} must be a list of sort keys")
+        else:
+            for k in ob:
+                if not (isinstance(k, dict) and isinstance(k.get("col"), str) and k["col"]):
+                    errs.append(f"{tag}: every order_by key for {name} needs a col name")
+                elif k.get("type", "text") not in ORDER_TYPES:
+                    errs.append(f"{tag}: order_by type for {name} must be one of {ORDER_TYPES}")
+                elif not isinstance(k.get("desc", False), bool):
+                    errs.append(f"{tag}: order_by desc for {name} must be true or false")
+    return errs
 
 
 def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, list[str]] | None = None) -> list[str]:
@@ -163,6 +193,7 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
                 elif name in master_cols:
                     errs.append(f"output column {name!r} from {detail} clashes with a master column")
                 outputs.setdefault(name, str(detail))
+                errs.extend(_aggregate_expr_errors(tag, name, c))
 
     if ready["require"] not in ("all_required", "master_only"):
         errs.append("readiness.require must be all_required or master_only")

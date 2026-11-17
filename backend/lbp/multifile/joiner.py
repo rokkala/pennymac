@@ -19,13 +19,17 @@ import json
 import os
 import sqlite3
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field, fields
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from lbp.ingestion.parser import ParseOptions, iter_rows
+from lbp.mapping.transforms import TRUE_VALUES, TransformError, _date
 from lbp.multifile.keys import KEY_SEP, key_text, normalize_key
 from lbp.multifile.layout import LayoutError, normalize_layout, validate_layout
+from lbp.rules.jsonlogic import _truthy, compile_logic
 
 BATCH_ROWS = 5000
 JOIN01_ORPHAN = "JOIN01"
@@ -68,8 +72,186 @@ class MergeMode:
         return first, 1 + sum(1 for _ in rows)
 
 
-# Mode name -> handler class with `.columns` and `.reduce(rows)`. Aggregate registers here (Task 4).
-MODES: dict[str, type] = {"merge": MergeMode}
+def _blank(v: str | None) -> bool:
+    return v is None or v.strip() == ""
+
+
+def _dec(v: str) -> Decimal | None:
+    """A finite Decimal from a numeric string ($ and thousands separators allowed), else None."""
+    try:
+        d = Decimal(v.strip().replace("$", "").replace(",", ""))
+    except InvalidOperation:
+        return None
+    return d if d.is_finite() else None
+
+
+def _fmt_decimal(d: Decimal) -> str:
+    """Plain notation, no exponent and no trailing zeros (so 0.1+0.2 gives 0.3, 100+200 gives 300)."""
+    d = d.normalize()
+    return "0" if d == 0 else format(d, "f")
+
+
+class _SortKey:
+    """Total order over a row's order_by values: per key text/Decimal/date, null or unparseable last
+    whatever the direction, ties broken by detail file order (the row index)."""
+
+    __slots__ = ("parts", "idx")
+
+    def __init__(self, parts: list[tuple[bool, object, bool]], idx: int):
+        self.parts, self.idx = parts, idx
+
+    def __lt__(self, other: _SortKey) -> bool:
+        for (an, av, desc), (bn, bv, _) in zip(self.parts, other.parts, strict=True):
+            if an != bn:
+                return bn  # a non-null value sorts before a null one in both directions
+            if an or av == bv:
+                continue
+            return (av > bv) if desc else (av < bv)
+        return self.idx < other.idx
+
+
+def _sort_value(kind: str, v: str | None) -> object | None:
+    if _blank(v):
+        return None
+    if kind == "number":
+        return _dec(v)
+    if kind == "date":
+        try:
+            return datetime.strptime(_date(v), "%Y-%m-%d").date()
+        except (TransformError, ValueError):
+            return None
+    return v
+
+
+class _Acc:
+    """Streaming state of one aggregate column over one master's detail rows (file order)."""
+
+    def __init__(self, spec: dict, columns: list[str], tag: str):
+        self.op, self.name, self.src = spec["op"], spec["as"], spec.get("col")
+        self.tag = tag
+        self.where = compile_logic(spec["where"]) if spec.get("where") else None
+        self.order = [(k["col"], bool(k.get("desc", False)), k.get("type", "text")) for k in spec.get("order_by") or []]
+        needed = ([self.src] if self.src else []) + [c for c, _, _ in self.order]
+        missing = [c for c in needed if c not in columns]
+        if missing:
+            raise LayoutError(f"{tag}: aggregate column {self.name} uses column(s) {missing} not in the detail file")
+        self.pos = {c: i for i, c in enumerate(columns)}
+        self.reset()
+
+    def reset(self) -> None:
+        self.n = 0
+        self.total = Decimal(0)
+        self.seen_value = False
+        self.lo_dec: tuple[Decimal, str] | None = None
+        self.hi_dec: tuple[Decimal, str] | None = None
+        self.lo_txt: str | None = None
+        self.hi_txt: str | None = None
+        self.numeric = True
+        self.any_true = False
+        self.pick: tuple[_SortKey, str] | None = None  # first/last by order, or file order
+        self.distinct: list[str] = []
+        self.distinct_seen: set[str] = set()
+        self.keyed: list[tuple[_SortKey, str]] = []
+
+    def _key(self, row: list[str], idx: int) -> _SortKey:
+        return _SortKey([(v is None, v, desc) for v, desc in
+                         ((_sort_value(t, row[self.pos[c]]), d) for c, d, t in self.order)], idx)
+
+    def add(self, row: list[str], rowdict: dict[str, str] | None, idx: int) -> None:
+        if self.where is not None and not _truthy(self.where(rowdict)):
+            return
+        self.n += 1
+        if self.src is None:
+            return
+        v = row[self.pos[self.src]]
+        if _blank(v):
+            return
+        self.seen_value = True
+        op = self.op
+        if op == "sum":
+            d = _dec(v)
+            if d is None:
+                raise LayoutError(f"{self.tag}: aggregate column {self.name}: non-numeric value in {self.src}")
+            self.total += d
+        elif op in ("min", "max"):
+            d = _dec(v)
+            if d is None:
+                self.numeric = False
+            else:
+                if self.lo_dec is None or d < self.lo_dec[0]:
+                    self.lo_dec = (d, v)
+                if self.hi_dec is None or d > self.hi_dec[0]:
+                    self.hi_dec = (d, v)
+            if self.lo_txt is None or v < self.lo_txt:
+                self.lo_txt = v
+            if self.hi_txt is None or v > self.hi_txt:
+                self.hi_txt = v
+        elif op == "any":
+            self.any_true = self.any_true or v.strip().lower() in TRUE_VALUES
+        elif op in ("first", "last"):
+            key = self._key(row, idx)
+            if self.pick is None or (key < self.pick[0] if op == "first" else self.pick[0] < key):
+                self.pick = (key, v)
+        elif op == "concat_distinct":
+            if self.order:
+                self.keyed.append((self._key(row, idx), v))
+            elif v not in self.distinct_seen:
+                self.distinct_seen.add(v)
+                self.distinct.append(v)
+
+    def result(self) -> str:
+        op = self.op
+        if op == "count":
+            return str(self.n)
+        if not self.seen_value:
+            return ""
+        if op == "sum":
+            return _fmt_decimal(self.total)
+        if op == "min":
+            return self.lo_dec[1] if self.numeric and self.lo_dec else self.lo_txt or ""
+        if op == "max":
+            return self.hi_dec[1] if self.numeric and self.hi_dec else self.hi_txt or ""
+        if op == "any":
+            return "true" if self.any_true else "false"
+        if op in ("first", "last"):
+            return self.pick[1] if self.pick else ""
+        if self.order:
+            seen: set[str] = set()
+            out = []
+            for _, v in sorted(self.keyed, key=lambda kv: kv[0]):
+                if v not in seen:
+                    seen.add(v)
+                    out.append(v)
+            return "|".join(out)
+        return "|".join(self.distinct)
+
+
+class AggregateMode:
+    """aggregate (1:N): a master's detail rows reduced to the declared columns, named by `as`. Streams the
+    rows (no per-master buffer except concat_distinct with order_by, which holds that master's values)."""
+
+    def __init__(self, role: str, relation: dict, detail_columns: list[str]):
+        specs = (relation.get("aggregate") or {}).get("columns") or []
+        if not specs:
+            raise LayoutError(f"relation {role}->{relation.get('to')}: aggregate needs at least one column")
+        self.accs = [_Acc(c, detail_columns, f"relation {role}->{relation.get('to')}") for c in specs]
+        self.columns = [a.name for a in self.accs]
+        self._detail_columns = detail_columns
+        self._needs_dict = any(a.where is not None for a in self.accs)
+
+    def reduce(self, rows: Iterator[list[str]]) -> tuple[list[str], int]:
+        for a in self.accs:
+            a.reset()
+        n = 0
+        for n, row in enumerate(rows, start=1):  # noqa: B007 - n is the row count after the loop
+            rd = dict(zip(self._detail_columns, row, strict=True)) if self._needs_dict else None
+            for a in self.accs:
+                a.add(row, rd, n)
+        return [a.result() for a in self.accs], n
+
+
+# Mode name -> handler class with `.columns` and `.reduce(rows)`.
+MODES: dict[str, Callable[..., object]] = {"merge": MergeMode, "aggregate": AggregateMode}
 
 
 @dataclass
@@ -82,7 +264,7 @@ class _Relation:
     ops: list[str]
     table: str
     columns: list[str] = field(default_factory=list)  # detail file header
-    handler: MergeMode | None = None
+    handler: MergeMode | AggregateMode | None = None
 
     def master_key(self, row: dict[str, str]) -> str | None:
         k = normalize_key([row.get(c) for c in self.parent_cols], self.ops)

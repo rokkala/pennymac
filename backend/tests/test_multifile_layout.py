@@ -154,3 +154,19 @@ def test_other_validation_branches():
     lay["relations"].append(dict(lay["relations"][0]))
     assert any("more than one relation" in e for e in validate_layout(lay, None))
     assert any("window_minutes" in e for e in validate_layout(layout(), {"pairing": "window_minutes"}))
+
+
+def test_aggregate_where_and_order_by_shape_validated():
+    def errs_for(**col_extra):
+        lay = agg_layout("total")
+        lay["relations"][0]["aggregate"]["columns"][0].update(col_extra)
+        return validate_layout(lay, None)
+
+    assert errs_for(where={">": [{"var": "amt"}, 5]}, order_by=[{"col": "d", "desc": True, "type": "date"}]) == []
+    assert any("where" in e for e in errs_for(where="amt > 5"))
+    assert any("where" in e for e in errs_for(where={"nope": [1]}) + errs_for(where=[1]))
+    assert any("order_by" in e for e in errs_for(order_by={"col": "d"}))
+    assert any("order_by" in e for e in errs_for(order_by=["d"]))
+    assert any("order_by" in e for e in errs_for(order_by=[{"desc": True}]))
+    assert any("order_by" in e for e in errs_for(order_by=[{"col": "d", "type": "money"}]))
+    assert any("order_by" in e for e in errs_for(order_by=[{"col": "d", "desc": "yes"}]))

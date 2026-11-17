@@ -108,13 +108,11 @@ def test_orphan_detail_is_an_exception(tmp_path: Path):
     assert res.detail_match_rate == {"details": 0.5}
 
 
-def test_aggregate_not_supported_yet(tmp_path: Path):
+def test_unsupported_mode_is_layout_error(tmp_path: Path):
     master = tmp_path / "m.csv"
     master.write_text("id\n1\n", encoding="utf-8")
-    lay = quirks_layout("aggregate")
-    lay["relations"][0]["aggregate"] = {"columns": [{"as": "n", "op": "count"}]}
-    with pytest.raises(LayoutError, match="not supported"):
-        join_files(lay, {"master": master, "details": master}, {}, tmp_path / "o.csv", tmp_path)
+    with pytest.raises(LayoutError, match="mode"):
+        join_files(quirks_layout("flatten"), {"master": master, "details": master}, {}, tmp_path / "o.csv", tmp_path)
 
 
 def test_missing_key_column_is_layout_error(tmp_path: Path):

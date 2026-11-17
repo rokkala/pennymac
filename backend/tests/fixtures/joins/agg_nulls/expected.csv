@@ -1,0 +1,5 @@
+id,name,total,n,lo,hi,first_tag,last_tag,any_flag,tags
+1,A,10,4,4,6,b,b,false,b|a
+2,B,,2,,,,,,
+3,C,,0,,,,,,
+4,D,6,1,6,6,a,a,true,a

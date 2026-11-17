@@ -1,0 +1,89 @@
+{
+  "description": "Nulls and empty/blank strings are ignored by sum/min/max/first/last/any/concat_distinct; an all-null group is empty; count counts every row; no detail gives count 0.",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "items",
+        "name_pattern": "i_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "items",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "many",
+        "mode": "aggregate",
+        "on_missing_detail": "allow",
+        "aggregate": {
+          "columns": [
+            {
+              "as": "total",
+              "op": "sum",
+              "col": "amt"
+            },
+            {
+              "as": "n",
+              "op": "count"
+            },
+            {
+              "as": "lo",
+              "op": "min",
+              "col": "amt"
+            },
+            {
+              "as": "hi",
+              "op": "max",
+              "col": "amt"
+            },
+            {
+              "as": "first_tag",
+              "op": "first",
+              "col": "tag"
+            },
+            {
+              "as": "last_tag",
+              "op": "last",
+              "col": "tag"
+            },
+            {
+              "as": "any_flag",
+              "op": "any",
+              "col": "flag"
+            },
+            {
+              "as": "tags",
+              "op": "concat_distinct",
+              "col": "tag"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "items": "details.csv"
+  },
+  "parse_options": {},
+  "expected_rows": "expected.csv",
+  "expected_exceptions": [],
+  "expected_blocked": null
+}
