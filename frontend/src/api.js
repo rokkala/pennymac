@@ -57,3 +57,32 @@ let vendorScope = (() => { try { return localStorage.getItem("lbp.vendor") || nu
 export const getVendorScope = () => vendorScope;
 export const setVendorScope = (id) => { vendorScope = id || null; try { id ? localStorage.setItem("lbp.vendor", id) : localStorage.removeItem("lbp.vendor"); } catch { /* storage unavailable */ } };
 export const scoped = (path) => (vendorScope ? `${path}${path.includes("?") ? "&" : "?"}vendor_id=${encodeURIComponent(vendorScope)}` : path);
+
+// ---- Multi-file feeds: layout, join preview, file sets ----
+const enc = encodeURIComponent;
+export const getLayout = (sourceId) => api(`/api/sources/${enc(sourceId)}/layout`);
+export const proposeLayout = (sourceId, layout, readiness) => api(`/api/sources/${enc(sourceId)}/layout`, { method: "PUT", body: { layout, readiness } });
+export const decideLayout = (sourceId, approve, comment) => api(`/api/sources/${enc(sourceId)}/layout/decide`, { method: "POST", body: { approve, comment } });
+/** filesByRole: {role: File}. Dry run: nothing is stored. */
+export const previewJoin = (sourceId, layout, readiness, filesByRole) => {
+  const form = new FormData();
+  Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) form.append(role, file, file.name); });
+  form.append("layout", JSON.stringify(layout));
+  form.append("readiness", JSON.stringify(readiness || {}));
+  return api(`/api/sources/${enc(sourceId)}/layout/preview`, { method: "POST", form });
+};
+export const listFileSets = (params = {}) => {
+  const q = Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${enc(v)}`).join("&");
+  return api(`/api/file-sets${q ? `?${q}` : ""}`);
+};
+export const overrideFileSet = (id, action, reason, targetKey) =>
+  api(`/api/file-sets/${enc(id)}/override`, { method: "POST", body: { action, reason, ...(targetKey ? { target_pairing_key: targetKey } : {}) } });
+/** filesByRole: {role: File}; sent as one multipart upload with a role manifest (file name per role). */
+export const uploadSet = (sourceId, filesByRole) => {
+  const form = new FormData();
+  form.append("source_id", sourceId);
+  const manifest = {};
+  Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) { form.append("files", file, file.name); manifest[role] = file.name; } });
+  form.append("manifest", JSON.stringify(manifest));
+  return api("/api/upload/set", { method: "POST", form });
+};

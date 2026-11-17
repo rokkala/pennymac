@@ -3,7 +3,16 @@ import { api, takeIntent } from "../api.js";
 import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog, ActionBar, PageHeader } from "../ui.jsx";
 import DeliveryProfile from "./DeliveryProfile.jsx";
+import FeedLayout from "./FeedLayout.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
+import { groupColumnsByRole } from "../layoutModel.js";
+
+/** <option>s for a source column picker. Feeds with a multi-file layout group `role.column` names under their file; others stay flat. */
+function ColumnOptions({ columns, grouped }) {
+  if (!grouped) return columns.map((c) => <option key={c}>{c}</option>);
+  return groupColumnsByRole(columns).map((g) => (
+    <optgroup key={g.role} label={g.role === "master" ? "Main file" : `${g.role} file`}>{g.columns.map((c) => <option key={c} value={c}>{c}</option>)}</optgroup>));
+}
 import { VendorList, VendorWorkspace } from "./Vendors.jsx";
 import { Segments } from "../charts.jsx";
 
@@ -100,7 +109,7 @@ function ValueMap({ mappingId, target, draft, onSaved }) {
   );
 }
 
-function FieldInspector({ mappingId, field, columns, draft, catalog, lookups, onField, onClose, go, onMap, feedsOf, nav }) {
+function FieldInspector({ mappingId, field, columns, grouped, draft, catalog, lookups, onField, onClose, go, onMap, feedsOf, nav }) {
   const base = useApi(`/api/mappings/${mappingId}/fields/${field.target}/inspect`, [field.target, JSON.stringify(field.transform), (field.sources || []).join()]);
   const [editing, setEditing] = useState(false);
   const [steps, setSteps] = useState(field.transform || []);
@@ -140,7 +149,7 @@ function FieldInspector({ mappingId, field, columns, draft, catalog, lookups, on
                 <label className="stack" style={{ gap: 4 }} htmlFor="tb-src"><span className="eyebrow">Source column{srcs.length > 1 ? "s (N:1)" : ""}</span>
                   {srcs.map((sv, i) => (
                     <div key={i} className="row" style={{ flexWrap: "nowrap" }}>
-                      <select id={i === 0 ? "tb-src" : undefined} className="input" style={{ flex: 1 }} value={sv || ""} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}>{columns.map((c) => <option key={c}>{c}</option>)}</select>
+                      <select id={i === 0 ? "tb-src" : undefined} className="input" style={{ flex: 1 }} value={sv || ""} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}><ColumnOptions columns={columns} grouped={grouped} /></select>
                       {srcs.length > 1 && <button className="btn sm danger" onClick={() => setSrcs(srcs.filter((_, j) => j !== i))}>✕</button>}
                     </div>))}
                   <button className="btn sm" style={{ alignSelf: "flex-start" }} onClick={() => setSrcs([...srcs, columns[0]])}>+ Add source column</button></label>
@@ -237,7 +246,7 @@ function ProfileTab({ sourceId, feedsOf, draft, onMap, onPick }) {
 }
 
 /** Map any source column(s) to any SSE attribute (incl. 1:N), or re-point an existing mapping. */
-function MapTargetModal({ mappingId, fields, columns, catalog, lookups, preset, onClose, onSaved }) {
+function MapTargetModal({ mappingId, fields, columns, grouped, catalog, lookups, preset, onClose, onSaved }) {
   const schema = useApi("/api/schema/target");
   const retarget = preset?.retargetFrom;
   const [target, setTarget] = useState(preset?.target || "");
@@ -283,7 +292,7 @@ function MapTargetModal({ mappingId, fields, columns, catalog, lookups, preset, 
           <span className="eyebrow">Source column{srcs.length > 1 ? "s (N:1, joined in order)" : ""}</span>
           {srcs.map((sv, i) => (
             <div key={i} className="row" style={{ flexWrap: "nowrap" }}>
-              <select className="input" style={{ flex: 1 }} aria-label={`Source column ${i + 1}`} value={sv} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}>{columns.map((c) => <option key={c}>{c}</option>)}</select>
+              <select className="input" style={{ flex: 1 }} aria-label={`Source column ${i + 1}`} value={sv} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}><ColumnOptions columns={columns} grouped={grouped} /></select>
               {srcs.length > 1 && <button className="btn sm danger" onClick={() => setSrcs(srcs.filter((_, j) => j !== i))}>✕</button>}
             </div>))}
           <button className="btn sm" style={{ alignSelf: "flex-start" }} onClick={() => setSrcs([...srcs, columns[0]])}>+ Add source column</button>
@@ -375,6 +384,8 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
   const m = useApi(`/api/mappings/${mappingId}`);
   const dq = useApi(`/api/mappings/${mappingId}/dq`);
   const meta = useApi("/api/meta/transforms");
+  const lay = useApi(m.data?.source_id ? `/api/sources/${m.data.source_id}/layout` : null, [m.data?.source_id]);
+  const layoutOn = !!(lay.data?.configured || lay.data?.draft);
   const [filter, setFilter] = useState("all");
   const [view, setView] = useState(initialView || "fields");
   const [sel, setSel] = useState(initialTarget || null);
@@ -453,11 +464,13 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
       {modal === "diff" && <DiffModal mappingId={mappingId} onClose={() => setModal(null)} />}
       {modal === "approve" && <ApproveModal mp={mp} dqFails={dqFails} onClose={() => setModal(null)} onDone={() => { setModal(null); m.reload(); }} />}
       {dialog}
-      <Tabs value={view} onChange={setView} tabs={[{ id: "fields", label: "Field mappings & transformations", count: fields.length }, { id: "dq", label: "DQ rules", count: dq.data?.rules.length }, { id: "profile", label: "Source profile", count: mp.source.columns.length }, { id: "delivery", label: "Delivery & schedule" }]} />
+      <Tabs value={view} onChange={setView} tabs={[{ id: "fields", label: "Field mappings & transformations", count: fields.length }, { id: "dq", label: "DQ rules", count: dq.data?.rules.length }, { id: "profile", label: "Source profile", count: mp.source.columns.length }, { id: "delivery", label: "Delivery & schedule" }, ...(layoutOn || view === "layout" ? [{ id: "layout", label: "File layout" }] : [])]} />
       {view === "dq" && <DqTab mappingId={mappingId} go={go} />}
       {view === "delivery" && <DeliveryProfile sourceId={mp.source_id} persona={persona} go={go} />}
+      {view === "delivery" && lay.data && !layoutOn && canCap(persona, "editDelivery") && <div className="row"><button type="button" className="btn sm" onClick={() => setView("layout")}>This feed arrives as several files…</button></div>}
+      {view === "layout" && <FeedLayout sourceId={mp.source_id} persona={persona} />}
       {view === "profile" && <ProfileTab sourceId={mp.source_id} feedsOf={feedsOf} draft={draft} onMap={(c) => setMapModal({ sources: [c] })} onPick={(t) => { setView("fields"); setSel(t); }} />}
-      {mapModal && <MapTargetModal mappingId={mappingId} fields={fields} columns={mp.source.columns} catalog={meta.data?.ops || []} lookups={Object.keys(meta.data?.lookup_tables || {})}
+      {mapModal && <MapTargetModal mappingId={mappingId} fields={fields} columns={mp.source.columns} grouped={layoutOn} catalog={meta.data?.ops || []} lookups={Object.keys(meta.data?.lookup_tables || {})}
         preset={mapModal} onClose={() => setMapModal(null)} onSaved={(t) => { setMapModal(null); m.reload(); dq.reload(); setView("fields"); setSel(t); }} />}
       {view === "fields" && draft && <div className="row"><button className="btn primary" onClick={() => setMapModal({})}>+ Map a source column to an SSE field</button>
         <span className="faint" style={{ fontSize: ".8rem" }}>Any column can feed several SSE fields (1:N). Select a row to change its target or transformation.</span></div>}
@@ -498,7 +511,7 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
               })}</tbody>
             </table></div>
           </Panel>
-          {selField && <FieldInspector key={selField.target} mappingId={mappingId} field={{ ...selField, _version: mp.version }} columns={mp.source.columns} draft={draft}
+          {selField && <FieldInspector key={selField.target} mappingId={mappingId} field={{ ...selField, _version: mp.version }} columns={mp.source.columns} grouped={layoutOn} draft={draft}
             catalog={meta.data?.ops || []} lookups={Object.keys(meta.data?.lookup_tables || {})} onField={doField} onClose={() => setSel(null)} go={go}
             onMap={setMapModal} feedsOf={feedsOf}
             nav={{ label: selIdx >= 0 ? `${selIdx + 1} of ${order.length}` : "", onPrev: selIdx > 0 ? () => setSel(order[selIdx - 1].target) : null,

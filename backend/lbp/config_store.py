@@ -57,6 +57,8 @@ class FeedConfig:
     version: int = 0
     sha256: str = ""
     published_at: str = ""
+    layout: dict | None = None
+    readiness: dict | None = None
     extra: dict = field(default_factory=dict)
 
     @property
@@ -75,6 +77,19 @@ def _key() -> bytes:
     if s.env != "local":
         raise ConfigError("LBP_CONFIG_SIGNING_SECRET_ARN is required outside local")
     return b"lbp-local-dev-config-key"  # local development only (validate_for_production refuses AWS without a secret)
+
+
+_DERIVED: dict[tuple, bytes] = {}
+
+
+def derived_key(label: str) -> bytes:
+    """A key for one purpose (`label`) derived from the config-signing secret with HMAC-SHA256 under a distinct
+    domain-separation label, so it is never the signing key itself. Cached per process (the secret is read once)."""
+    s = get_settings()
+    ck = (label, s.config_signing_secret_arn, s.env)
+    if ck not in _DERIVED:
+        _DERIVED[ck] = hmac.new(_key(), b"lbp-derived-key/v1/" + label.encode(), hashlib.sha256).digest()
+    return _DERIVED[ck]
 
 
 def _canonical(body: dict) -> bytes:
@@ -155,13 +170,26 @@ def build(source_id: str) -> dict:
         m = c.execute(select(db.mappings).where(db.mappings.c.mapping_id == src.active_mapping_id)).first()
         feeds = siblings(c, source_id)
     rs = RuleRegistry().runtime_set()
-    return {
+    body = {
         "schema": SCHEMA, "source_id": source_id, "vendor_id": src.vendor_id, "feed_name": src.name, "vendor_feeds": sorted(feeds),
         "mapping": {"mapping_id": m.mapping_id, "version": m.version, "approved_by": m.approved_by,
                     "approved_at": m.approved_at.isoformat() if m.approved_at else None, "fields": m.fields},
         "parse_options": src.parse_options or {}, "profile": src.profile or {}, "delivery": profile_of(src.delivery),
         "rules": rs, "rules_key": rules_key(rs),
     }
+    if src.layout:  # multi-file feed; a layout-less bundle stays byte-identical (same content hash)
+        from .multifile.layout import DEFAULT_READINESS, normalize_layout, validate_layout
+
+        errs = validate_layout(src.layout, src.readiness)
+        if errs:  # never sign an invalid layout; messages carry no data values
+            raise ConfigError("feed layout is invalid: " + "; ".join(errs))
+        # Intentional: the bundle freezes the EFFECTIVE policy (defaults filled in), so a later change to
+        # DEFAULT_READINESS or relation defaults changes the content hash and republishes on the next publish.
+        body["layout"] = normalize_layout(src.layout)
+        stored = src.readiness if isinstance(src.readiness, dict) else {}
+        body["readiness"] = {**DEFAULT_READINESS, **{k: v for k, v in stored.items() if v is not None}}
+        body["mappings"] = {"loan": body["mapping"]}
+    return body
 
 
 def rules_key(rs: dict) -> str:
@@ -215,7 +243,7 @@ def load(source_id: str) -> FeedConfig:
                       mapping_id=b["mapping"]["mapping_id"], mapping_version=b["mapping"]["version"], fields=b["mapping"]["fields"],
                       parse_options=b.get("parse_options") or {}, profile=b.get("profile") or {}, delivery=b.get("delivery"),
                       runtime_set=b["rules"], rules_key=b.get("rules_key", ""), version=b["version"], sha256=b["sha256"],
-                      published_at=b.get("published_at", ""))
+                      published_at=b.get("published_at", ""), layout=b.get("layout"), readiness=b.get("readiness"))
 
 
 def history(source_id: str) -> list[dict]:

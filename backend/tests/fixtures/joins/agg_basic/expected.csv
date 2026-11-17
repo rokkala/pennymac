@@ -1,0 +1,4 @@
+id,name,total,n,lo,hi,first_tag,last_tag,any_flag,tags
+1,A,19.75,3,2.25,10.50,x,z,true,x|z
+2,B,6,2,1,5,y,y,false,y
+3,C,,0,,,,,,

@@ -56,10 +56,13 @@ All three jobs run in the VPC through a Glue `NETWORK` connection, with the SSE 
 |---|---|
 | Mapping version approved (SME, not the preparer) | that feed |
 | Delivery profile change approved (a second SME) | that feed |
+| Multi-file layout change approved (a second SME) | that feed |
 | Rule enters or leaves active / canary / shadow, or retires | every live feed |
 | Feed moved to another vendor | every live feed (a vendor's feed list is part of each bundle) |
 | `migrate` Lambda on each deploy | any live feed whose bundle is missing |
 | Republish (SME, with a reason) | that feed. Used after a failed publication or a signing-key rotation. No new version is created if nothing changed. |
+
+A feed may also declare a multi-file **layout** (master and detail files, relations, readiness). It is approved by a second SME like a delivery profile, compiled into the same signed bundle, and its file sets are joined by the standard engine before mapping (never Glue/Spark in Phase 1). See [MULTI_FILE_FEEDS.md](MULTI_FILE_FEEDS.md).
 
 The web app shows each feed's publication as a "Glue config vN" chip (on feed cards and in the mapping workbench). Open it to see the version, the mapping version, rule counts, the signature status, whether it is in sync with the active mapping, and the publication history.
 

@@ -76,6 +76,36 @@ def test_run_demo_setup_compact_creates_vendors_and_batches(env, monkeypatch):
     assert result.batches >= 4
 
 
+def test_run_demo_setup_builds_master_detail_feed(env, monkeypatch):
+    """One two-file feed: layout approved by two users, one set loaded, one set waiting for its detail file."""
+    monkeypatch.setenv("LBP_PULL_ALLOWED_HOSTS", "sftp.westside-partner.example")
+    from sqlalchemy import select
+
+    from lbp.demo_setup import run_demo_setup
+    from lbp.store import db
+
+    run_demo_setup(scale="compact")
+    with db.get_engine().connect() as c:
+        feeds = c.execute(select(db.sources).where(db.sources.c.layout.is_not(None))).all()
+        assert len(feeds) == 1
+        sid = feeds[0].source_id
+        assert feeds[0].layout_draft is None and feeds[0].active_mapping_id
+        acts = {(r.action, r.actor) for r in c.execute(select(db.audit_log).where(db.audit_log.c.entity_id == sid))}
+        proposer = next(a for act, a in acts if act == "source.layout_propose")
+        approver = next(a for act, a in acts if act == "source.layout_approve")
+        assert proposer != approver
+        sets = {s.status: s for s in c.execute(select(db.file_sets).where(db.file_sets.c.source_id == sid))}
+        assert set(sets) == {"consumed", "waiting"}
+        b = c.execute(select(db.batches).where(db.batches.c.batch_id == sets["consumed"].batch_id)).first()
+        assert b.status == "completed" and b.reconciliation["join"]["per_role"]["escrow_items"]["orphaned"] > 0
+        waiting = [m.role for m in c.execute(select(db.batch_files).where(db.batch_files.c.set_id == sets["waiting"].set_id))]
+        assert waiting == ["master"]
+    from lbp.config import get_settings
+
+    live = get_settings().data_dir / "demo_uploads" / "3_multi_file"
+    assert [p.name for p in live.iterdir()] == [f"escrow_items_{sets['waiting'].pairing_key}.csv"]
+
+
 def test_run_demo_setup_conflict_without_force(env, monkeypatch):
     monkeypatch.setenv("LBP_PULL_ALLOWED_HOSTS", "sftp.westside-partner.example")
     from lbp.demo_setup import DemoSetupConflict, run_demo_setup

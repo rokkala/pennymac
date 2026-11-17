@@ -304,6 +304,14 @@ def tick(now=None, pull: bool = True) -> dict:
         return {"skipped": "another scheduler instance holds the lease"}
     res = {"at": now.isoformat(), "materialized": 0, "late": [], "missed": [], "pulled": [], "batches": [], "pull_errors": []}
     try:
+        try:  # multi-file sets past their wait timeout, and ready sets still without a batch
+            from ..multifile import fileset
+
+            swept = fileset.sweep_sets(now)
+            res["file_sets_expired"] = swept["handled"]
+            res["batches"] += swept["batches"]  # queued by load_master_only timeouts / ready-set retries: started by the caller
+        except Exception as e:  # noqa: BLE001 - the sweep never breaks the tick; no message text (may hold data values)
+            log.warning("file set sweep failed: %s", e.__class__.__name__)
         t = db.deliveries
         with db.get_engine().begin() as c:
             sch = c.execute(select(db.delivery_schedules).where(db.delivery_schedules.c.status == "active")).all()
@@ -382,14 +390,28 @@ def pull_now(schedule_id: str, actor: str, roles: list[str], now=None) -> dict:
             select(db.pulled_files).where(db.pulled_files.c.schedule_id == schedule_id))}
     cfg = effective(s.config)
     out = {"schedule_id": schedule_id, "fetched": [], "batches": [], "skipped": []}
+    pull_cfg = cfg["pull"]
     try:
-        got, out["skipped"] = fetch_new(cfg["pull"], already)
+        from ..multifile import fileset
+
+        layout = fileset.feed_layout(s.source_id)
+        if layout:  # multi-file feed: one pull pattern per role, from the layout's name_patterns
+            pull_cfg = {**pull_cfg, "name_patterns": [f["name_pattern"] for f in layout.get("files") or [] if f.get("name_pattern")]}
+        got, out["skipped"] = fetch_new(pull_cfg, already)
     except Exception as e:  # noqa: BLE001 - any connector failure is recorded, never raised into the tick
         msg = f"{e.__class__.__name__}: {str(e).splitlines()[0][:300] if str(e) else ''}"
         out["error"] = msg
         _record_pull_error(s, msg, now)
         return out
     aws = get_settings().env == "aws" and get_settings().raw_bucket
+
+    def record(pid, remote, sha, bid):
+        with db.get_engine().begin() as c:
+            c.execute(db.pulled_files.update().where(db.pulled_files.c.id == pid).values(batch_id=bid))
+            db.audit(c, actor, "delivery.pulled", "schedule", schedule_id, {"file": remote.name, "size": remote.size, "batch_id": bid,
+                                                                            "sha256": sha})
+
+    staged = []  # multi-file feed: attached once every file is in hand, the master last
     for remote, local, sha in got:
         with db.get_engine().begin() as c:
             try:
@@ -402,6 +424,9 @@ def pull_now(schedule_id: str, actor: str, roles: list[str], now=None) -> dict:
                 continue  # fetched concurrently by another instance
         uri = persist_upload(local, f"incoming/{s.source_id}/{sha[:12]}", metadata={"submitted-by": f"scheduler:{schedule_id}"})
         out["fetched"].append(remote.name)
+        if not aws and layout:
+            staged.append((remote, local, sha, pid, uri))
+            continue
         bid = None
         if not aws:
             try:
@@ -413,10 +438,21 @@ def pull_now(schedule_id: str, actor: str, roles: list[str], now=None) -> dict:
                 out["skipped"].append(f"{remote.name}: identical to batch {e.batch_id}")
             except ValueError as e:
                 out["skipped"].append(f"{remote.name}: {e}")
-        with db.get_engine().begin() as c:
-            c.execute(db.pulled_files.update().where(db.pulled_files.c.id == pid).values(batch_id=bid))
-            db.audit(c, actor, "delivery.pulled", "schedule", schedule_id, {"file": remote.name, "size": remote.size, "batch_id": bid,
-                                                                            "sha256": sha})
+        record(pid, remote, sha, bid)
+    # with require master_only the master alone makes a set ready: attach it after the details pulled with it
+    for remote, local, sha, pid, uri in sorted(staged, key=lambda x: (fileset.route_file(layout, x[1].name) or ("",))[0] == "master"):
+        bid = None
+        try:  # unattended: a set batch that cannot be sequenced is recorded as failed, never dropped
+            r = fileset.attach_file(s.source_id, local.name, uri, f"scheduler:{schedule_id}", strict=False)
+            bid = r["batch_id"]
+            if bid:
+                out["batches"].append(bid)
+        except DuplicateFileError as e:
+            bid = e.batch_id
+            out["skipped"].append(f"{remote.name}: identical to batch {e.batch_id}")
+        except ValueError as e:
+            out["skipped"].append(f"{remote.name}: {fileset.safe_message(e)}")
+        record(pid, remote, sha, bid)
     with db.get_engine().begin() as c:
         c.execute(db.deliveries.update().where(db.deliveries.c.schedule_id == schedule_id, db.deliveries.c.status.in_(OPEN))
                   .values(last_pull_error=None))

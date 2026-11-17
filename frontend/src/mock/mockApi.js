@@ -345,6 +345,14 @@ export function createMockApi() {
       if (!c.current.verified) fail("feed has no approved mapping");
       return publishCfg(m[1], user.id, b.reason || "manual republish");
     }],
+    // Multi-file feeds: the demo's feeds are single-file, so these answer "no layout" and have no file sets.
+    ["GET", /^\/api\/sources\/([^/]+)\/layout$/, (m) => ({ source_id: m[1], layout: null, readiness: null, configured: false, draft: null, readiness_draft: null, proposed_by: null })],
+    ["PUT", /^\/api\/sources\/([^/]+)\/layout$/, () => fail("Multi-file layouts are not available in the demo.")],
+    ["POST", /^\/api\/sources\/([^/]+)\/layout\/decide$/, () => fail("Multi-file layouts are not available in the demo.")],
+    ["POST", /^\/api\/sources\/([^/]+)\/layout\/preview$/, () => ({ errors: ["The demo cannot preview a join of sample files."] })],
+    ["GET", /^\/api\/file-sets$/, () => []],
+    ["POST", /^\/api\/file-sets\/([^/]+)\/override$/, () => fail("There are no file sets in the demo.")],
+    ["POST", /^\/api\/upload\/set$/, () => fail("Multi-file uploads are not available in the demo.")],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery\/test$/, (m, b, u, q) => filenameTest(m[1], q.get("filename") || "", q.get("draft") === "true")],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery$/, (m) => s.delivery_profiles[m[1]] || { ...clone(Object.values(s.delivery_profiles)[0]), source_id: m[1], delivery: clone(Object.values(s.delivery_profiles)[0].defaults), configured: false, draft: null, proposed_by: null, last_sequence: null }],
     ["PUT", /^\/api\/sources\/([^/]+)\/delivery$/, (m, b, user) => {

@@ -1,0 +1,4 @@
+id,name,details.ref,details.val
+1,A,1,x
+2,B,,
+3,C,3,z

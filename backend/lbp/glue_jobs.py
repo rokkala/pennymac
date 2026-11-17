@@ -107,6 +107,8 @@ def prepare_large(batch_id: str):
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
     if not b:
         raise ValueError(f"unknown batch {batch_id}")
+    if b.file_set_id:  # the Spark path has no join stage: it would load the master file alone
+        raise ValueError(f"batch {batch_id} belongs to a multi-file file set; it runs on the standard engine (lbp-feed), not Spark")
     cfg = load_config(b.source_id)
     leased, g = acquire(batch_id, f"glue:{socket.gethostname()}:{os.getpid()}", LEASE_FROM)
     if not leased:

@@ -32,7 +32,7 @@ from sqlalchemy import func, select, text
 from .. import samples
 from ..analytics import service as analytics
 from ..config import get_settings
-from ..dispatch import aws_mode, dispatch, start_glue
+from ..dispatch import aws_mode, dispatch, dispatchable, start_glue
 from ..exceptions.manager import ExceptionActionError, ExceptionManager
 from ..exceptions.policy import DEFAULT_POLICY, TIER_LABELS, PolicyError, get_policy, set_policy
 from ..ingestion.parser import read_sample
@@ -77,6 +77,7 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/mappings/{mapping_id}/approve"): ONBOARDING_REVIEW,
     ("POST", "/api/upload"): ("monitoring",),
     ("POST", "/api/upload/presign"): ("monitoring",),
+    ("POST", "/api/upload/set"): ("monitoring",),
     ("POST", "/api/batches/{batch_id}/pause"): ("monitoring",),
     ("POST", "/api/batches/{batch_id}/resume"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/override-preflight"): ("onboarding_reviewer", "compliance_reviewer"),
@@ -85,6 +86,7 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/exceptions/{exception_id}/resolve"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/checker"): MONITORING_REVIEW,
     ("POST", "/api/exceptions/{exception_id}/reject"): WORK_EXCEPTIONS,
+    ("POST", "/api/exceptions/{exception_id}/acknowledge"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/escalate"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/compliance-clear"): COMPLIANCE_REVIEW,
     ("POST", "/api/exceptions/{exception_id}/rollback"): ("monitoring", "monitoring_reviewer"),
@@ -119,9 +121,13 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     # incremental loads, sequencing, delivery scheduler
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
+    ("PUT", "/api/sources/{source_id}/layout"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/layout/preview"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/layout/decide"): ONBOARDING_REVIEW,
     ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/discard"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/file-sets/{set_id}/override"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/snapshot-reviews"): ONBOARDING_REVIEW,
     ("POST", "/api/schedules"): ("monitoring", "onboarding"),
     ("PUT", "/api/schedules/{schedule_id}"): ("monitoring", "onboarding"),
@@ -212,7 +218,7 @@ def _start_local_scheduler():
     def loop():
         while not stop.wait(60):
             try:
-                for bid in sched.tick().get("batches", []):
+                for bid in dispatchable(sched.tick().get("batches", [])):
                     dispatch(bid)
             except Exception:  # noqa: BLE001 - keep ticking
                 log.exception("scheduler tick failed")
@@ -313,6 +319,12 @@ def _save_upload(f: UploadFile) -> Path:
                 dest.unlink(missing_ok=True)
                 raise HTTPException(413, f"file exceeds the {get_settings().max_upload_mb} MB limit")
             out.write(chunk)
+    _check_upload_content(dest, ext, limit)
+    return dest
+
+
+def _check_upload_content(dest: Path, ext: str, limit: int) -> None:
+    """Content checks on a saved upload (removed when refused): Excel must be a sane workbook, text not binary."""
     head = dest.open("rb").read(8192)
     if ext in (".xlsx", ".xlsm"):
         if head[:2] != b"PK":
@@ -330,7 +342,87 @@ def _save_upload(f: UploadFile) -> Path:
     elif b"\x00" in head or head[:2] in (b"MZ", b"\x7fE"):
         dest.unlink(missing_ok=True)
         raise HTTPException(415, "binary content is not a delimited text file")
-    return dest
+
+
+ZIP_MAX_MEMBERS = 20
+ZIP_TOTAL_FACTOR = 20  # total uncompressed size of an archive: at most this many upload limits (as for workbooks)
+
+
+def _extract_zip(f: UploadFile) -> list[tuple[str, Path]]:
+    """Save an uploaded zip (size-capped) and extract its members to the upload dir under sanitized names.
+    Refused: path traversal, absolute or nested names, folders, links, encrypted or duplicate members, types
+    not allowed for upload, more than ZIP_MAX_MEMBERS members, a member (as declared and as actually
+    decompressed) over the upload limit, a total over ZIP_TOTAL_FACTOR limits. Nothing is left on refusal."""
+    import stat
+    import zipfile
+    import zlib
+
+    mb = get_settings().max_upload_mb
+    limit = mb * 1024 * 1024
+    archive = upload_dir() / f"{uuid.uuid4().hex[:12]}_set.zip"
+    out: list[tuple[str, Path]] = []
+    try:
+        size = 0
+        with archive.open("wb") as w:
+            while chunk := f.file.read(1 << 20):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(413, f"file exceeds the {mb} MB limit")
+                w.write(chunk)
+        try:
+            z = zipfile.ZipFile(archive)
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "not a valid zip archive") from None
+        with z:
+            infos = z.infolist()
+            if not infos:
+                raise HTTPException(400, "the zip archive is empty")
+            if len(infos) > ZIP_MAX_MEMBERS:
+                raise HTTPException(400, f"the zip archive has {len(infos)} members; at most {ZIP_MAX_MEMBERS} are accepted")
+            seen, total = set(), 0
+            for i in infos:
+                n = i.filename
+                if n.startswith(("/", "\\")) or "/" in n or "\\" in n or ":" in n or ".." in n:
+                    raise HTTPException(400, f"zip member '{n}' is not a plain file name (folders, absolute paths and '..' are refused)")
+                if i.is_dir() or stat.S_ISLNK(i.external_attr >> 16) or i.flag_bits & 0x1:
+                    raise HTTPException(400, f"zip member '{n}' is not a regular file (links and encrypted members are refused)")
+                ext = Path(n).suffix.lower()
+                if n.startswith(".") or ext not in ALLOWED_UPLOADS:
+                    raise HTTPException(400, f"zip member '{n}': unsupported file type {ext or '(none)'}; "
+                                             f"allowed: {', '.join(sorted(ALLOWED_UPLOADS))}")
+                if n in seen:
+                    raise HTTPException(400, f"zip member '{n}' appears twice")
+                seen.add(n)
+                if i.file_size > limit:
+                    raise HTTPException(413, f"zip member '{n}' exceeds the {mb} MB limit")
+                total += i.file_size
+            if total > limit * ZIP_TOTAL_FACTOR:
+                raise HTTPException(413, "the zip archive expands beyond the allowed size")
+            for i in infos:
+                safe = Path(i.filename).name.replace("..", "_")
+                dest = upload_dir() / f"{uuid.uuid4().hex[:12]}_{safe}"
+                out.append((i.filename, dest))
+                written = 0
+                try:
+                    with z.open(i) as src, dest.open("wb") as w:
+                        while chunk := src.read(1 << 20):
+                            written += len(chunk)
+                            if written > limit or written > i.file_size:
+                                raise HTTPException(413, f"zip member '{i.filename}' expands beyond its declared size "
+                                                         f"or the {mb} MB limit")
+                            w.write(chunk)
+                except (zipfile.BadZipFile, zlib.error, EOFError):
+                    raise HTTPException(400, f"zip member '{i.filename}' is corrupt") from None
+                except NotImplementedError:
+                    raise HTTPException(400, f"zip member '{i.filename}' uses an unsupported compression method") from None
+                _check_upload_content(dest, Path(safe).suffix.lower(), limit)
+    except BaseException:
+        for _, p in out:
+            p.unlink(missing_ok=True)
+        raise
+    finally:
+        archive.unlink(missing_ok=True)
+    return out
 
 
 # ------------------------------------------------------------------ meta
@@ -696,13 +788,59 @@ def approve_mapping(mapping_id: str, body: Decision, user: User = Depends(curren
 
 
 # ------------------------------------------------------------------ upload & batches (Workflow 2)
+def _feed_layout(source_id: str) -> dict | None:
+    """The feed's published multi-file layout (None: a single-file feed)."""
+    from ..config_store import ConfigError
+    from ..multifile.fileset import feed_layout
+
+    try:
+        return feed_layout(source_id)
+    except ConfigError as e:
+        _err(e)
+
+
+def _attach_uploads(source_id: str, items: list[tuple[str, Path, str | None]], user: User, auto_start: bool) -> list[dict]:
+    """Attach saved uploads to the feed's file sets (strict: the API reports errors, it never records them as
+    failed batches). Batches queued before an error are still started; the error is then raised."""
+    from ..multifile import fileset
+    from ..storage import persist_upload
+
+    out: list[dict] = []
+    try:
+        for name, local, role in items:
+            digest = pipeline.file_sha256(local)
+            # uploads/ (not incoming/) in AWS: the API attaches the file itself, the S3 arrival rule must not do it again
+            uri = persist_upload(local, f"{'uploads' if aws_mode() else 'incoming'}/{source_id}/{digest[:12]}")
+            out.append(fileset.attach_file(source_id, name, uri, user.name, role=role or None, strict=True))
+    except pipeline.DuplicateFileError as e:
+        raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
+    except ValueError as e:
+        _err(e)
+    finally:
+        if auto_start:
+            for r in out:
+                if r["batch_id"]:
+                    dispatch(r["batch_id"])
+    return out
+
+
 @app.post("/api/upload")
 def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start: bool = Form(True),
            allow_duplicate: bool = Form(False), reason: str | None = Form(None), load_type: str | None = Form(None),
-           user: User = Depends(current_user)):
+           role: str | None = Form(None), user: User = Depends(current_user)):
+    """One file. A feed with a multi-file layout attaches it to its file set (optional `role`, else routed by
+    name) and returns {set_id, role, status, batch_id}; a single-file feed registers a batch as before."""
     from ..storage import persist_upload
 
+    layout = _feed_layout(source_id)
+    if layout:
+        given = [n for n, v in (("allow_duplicate", allow_duplicate), ("reason", reason), ("load_type", load_type)) if v]
+        if given:  # refused, never silently dropped
+            raise HTTPException(400, f"{', '.join(given)} cannot be used for a multi-file feed: its file sets always load as full "
+                                     "and a set identical to a live one is refused as a duplicate")
     local = _save_upload(file)
+    if layout:
+        return _attach_uploads(source_id, [(file.filename or local.name, local, role)], user, auto_start)[0]
     try:
         digest = pipeline.file_sha256(local)
         # uploads/ (not incoming/): the API registers this batch itself, so the S3 arrival rule must not register it twice
@@ -717,9 +855,60 @@ def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start:
     return {"batch_id": bid, "status": "submitted" if auto_start else "queued"}
 
 
+@app.post("/api/upload/set")
+def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), manifest: str | None = Form(None),
+               auto_start: bool = Form(True), user: User = Depends(current_user)):
+    """The files of one multi-file delivery: several `files` parts, or one .zip. An optional `manifest`
+    (JSON {role: filename}) assigns roles; other files are routed by the layout's name patterns. All or
+    nothing: a file that routes nowhere (or any other problem found before attaching) attaches no file.
+    Returns the per-file results [{set_id, role, status, batch_id}], the master last."""
+    from ..config_store import load
+    from ..multifile.fileset import FileSetError, plan_files
+
+    layout = _feed_layout(source_id)
+    if not layout:
+        raise HTTPException(400, "this feed has no multi-file layout; upload its file with POST /api/upload")
+    roles = None
+    if manifest:
+        try:
+            roles = json.loads(manifest)
+        except ValueError:
+            raise HTTPException(400, "manifest must be JSON: {role: filename}") from None
+        if not isinstance(roles, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in roles.items()):
+            raise HTTPException(400, "manifest must be JSON: {role: filename}")
+    saved: list[tuple[str, Path]] = []
+    try:
+        if any(Path(f.filename or "").suffix.lower() == ".zip" for f in files):
+            if len(files) != 1:
+                raise HTTPException(400, "send one .zip, or several files, not both")
+            saved = _extract_zip(files[0])
+        else:
+            cap = min(len([f for f in layout.get("files") or [] if f.get("role")]), ZIP_MAX_MEMBERS)
+            if len(files) > cap:  # refused before any part is saved
+                raise HTTPException(400, f"this upload has {len(files)} files; the feed layout accepts at most {cap}")
+            for f in files:
+                name = Path(f.filename or "upload").name
+                if name in {n for n, _ in saved}:
+                    raise HTTPException(400, f"'{name}' appears twice in this upload")
+                saved.append((name, _save_upload(f)))
+        try:
+            plan = plan_files(layout, load(source_id).readiness or {}, [n for n, _ in saved], roles)
+        except FileSetError as e:
+            _err(e)
+    except BaseException:
+        for _, p in saved:
+            p.unlink(missing_ok=True)
+        raise
+    local = dict(saved)
+    # Not transactional across files: an error while attaching (e.g. a 409 on the last file) leaves the files
+    # attached before it in their sets; routing, manifest and pairing problems are all refused above, before any.
+    return _attach_uploads(source_id, [(n, local[n], role) for n, role in plan], user, auto_start)
+
+
 @app.post("/api/upload/presign")
-def presign(source_id: str, filename: str, user: User = Depends(current_user)):
-    """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline."""
+def presign(source_id: str, filename: str, role: str | None = None, user: User = Depends(current_user)):
+    """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline.
+    `role` (a multi-file feed) is passed to the arrival handler as object metadata."""
     s = get_settings()
     if s.env != "aws" or not s.raw_bucket:
         raise HTTPException(400, "presigned upload is only available in AWS mode; use POST /api/upload locally")
@@ -727,7 +916,8 @@ def presign(source_id: str, filename: str, user: User = Depends(current_user)):
 
     key = f"incoming/{source_id}/{uuid.uuid4().hex[:8]}_{Path(filename).name}"
     url = boto3.client("s3").generate_presigned_url("put_object", Params={"Bucket": s.raw_bucket, "Key": key,
-                                                                         "Metadata": {"source-id": source_id, "submitted-by": user.name}},
+                                                                         "Metadata": {"source-id": source_id, "submitted-by": user.name,
+                                                                                      **({"role": role} if role else {})}},
                                                     ExpiresIn=900)
     return {"url": url, "bucket": s.raw_bucket, "key": key}
 
@@ -916,6 +1106,104 @@ def approve_delivery(source_id: str, body: Decision, user: User = Depends(curren
         _err(e)
 
 
+class LayoutIn(BaseModel):
+    layout: dict
+    readiness: dict = {}
+
+
+@app.get("/api/sources/{source_id}/layout")
+def get_layout(source_id: str):
+    with db.get_engine().connect() as c:
+        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise HTTPException(404, "source not found")
+    return {"source_id": source_id, "layout": src.layout, "readiness": src.readiness, "configured": bool(src.layout),
+            "draft": src.layout_draft, "readiness_draft": src.readiness_draft, "proposed_by": src.layout_proposed_by}
+
+
+@app.put("/api/sources/{source_id}/layout")
+def put_layout(source_id: str, body: LayoutIn, user: User = Depends(current_user)):
+    from ..multifile.service import LayoutServiceError, propose_layout
+
+    try:
+        return propose_layout(source_id, body.layout, body.readiness, user.name, user.roles)
+    except LayoutServiceError as e:
+        _err(e)
+
+
+@app.post("/api/sources/{source_id}/layout/preview")
+async def preview_layout(source_id: str, request: Request):
+    """Dry-run join of sample files (multipart: one part per layout role, named by the role) with the `layout` and
+    `readiness` JSON form fields (omitted: the feed's live layout). Read-only: nothing is stored or audited, and
+    the uploads are deleted. Invalid layouts and join errors come back as 200 with `errors`."""
+    from types import SimpleNamespace
+
+    from starlette.concurrency import run_in_threadpool
+
+    from .. import config_store
+    from ..multifile import stage
+    from ..multifile.preview import preview_join
+
+    with db.get_engine().connect() as c:
+        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise HTTPException(404, "source not found")
+    form = await request.form()
+
+    def _json(name: str, default):
+        raw = form.get(name)
+        if raw in (None, ""):
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{name} must be JSON") from None
+
+    layout = _json("layout", src.layout)
+    if not layout:
+        raise HTTPException(400, "send a layout, or configure one for this feed first")
+    readiness = _json("readiness", src.readiness if "layout" not in form else {})
+    parts = [(k, v) for k, v in form.multi_items() if hasattr(v, "filename") and hasattr(v, "file")]
+    roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
+        if isinstance(layout, dict) else set()
+    if len(parts) > len(roles):
+        raise HTTPException(400, f"this preview has {len(parts)} files; the layout has {len(roles)} roles")
+    names = [k for k, _ in parts]
+    if len(set(names)) != len(names) or any(k not in roles for k in names):
+        raise HTTPException(400, f"send one file per layout role, as a part named by the role ({sorted(roles)})")
+    saved: list[Path] = []
+    samples: dict[str, tuple[bytes, str]] = {}
+    try:
+        for role, f in parts:
+            p = _save_upload(f)
+            saved.append(p)
+            samples[role] = (p.read_bytes(), f.filename or p.name)
+    finally:
+        for p in saved:
+            p.unlink(missing_ok=True)
+    try:
+        cfg = config_store.load(source_id)
+    except config_store.ConfigError:
+        cfg = SimpleNamespace(profile=src.profile or {}, fields=[], parse_options=src.parse_options or {})
+    try:
+        opts = stage._parse_overrides(layout, cfg)
+    except (AttributeError, TypeError):  # a malformed layout: preview_join reports it as errors
+        opts = {}
+    return await run_in_threadpool(preview_join, layout, readiness, samples, opts, 10, cfg)
+
+
+@app.post("/api/sources/{source_id}/layout/decide")
+def decide_layout_endpoint(source_id: str, body: Decision, user: User = Depends(current_user)):
+    from ..multifile.service import LayoutPublishError, LayoutServiceError, decide_layout
+
+    try:
+        return decide_layout(source_id, user.name, user.roles, body.approve, body.comment)
+    except LayoutPublishError as e:  # the approval is saved; the publish must be retried
+        _err(e, 502)
+    except LayoutServiceError as e:
+        _err(e)
+
+
 @app.get("/api/sources/{source_id}/delivery/test")
 def test_filename(source_id: str, filename: str, draft: bool = False):
     """How a file named like this would be treated: load type, file-level action, sequence."""
@@ -1007,6 +1295,57 @@ def batch_discard(batch_id: str, body: ReasonIn, user: User = Depends(current_us
     for b in released:
         dispatch(b)
     return {"batch_id": batch_id, "status": "discarded", "released": released}
+
+
+@app.get("/api/file-sets")
+def list_file_sets(source_id: str | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=500)):
+    """File sets of multi-file feeds with their members (role, filename, row count; never contents or paths)."""
+    from sqlalchemy import select
+
+    fs, bf = db.file_sets, db.batch_files
+    q = select(fs).order_by(fs.c.opened_at.desc()).limit(limit)
+    if source_id:
+        q = q.where(fs.c.source_id == source_id)
+    if status:
+        q = q.where(fs.c.status.in_([x.strip() for x in status.split(",") if x.strip()]))
+    with db.get_engine().connect() as c:
+        sets = c.execute(q).all()
+        members: dict[str, list] = {}
+        if sets:
+            for m in c.execute(select(bf).where(bf.c.set_id.in_([s.set_id for s in sets])).order_by(bf.c.id)):
+                members.setdefault(m.set_id, []).append({"role": m.role, "filename": m.filename, "row_count": m.row_count,
+                                                         "sha256": m.file_sha256, "received_at": m.received_at})
+    out = []
+    for s in sets:
+        ov = s.override or {}
+        out.append({"set_id": s.set_id, "source_id": s.source_id, "pairing_key": s.pairing_key, "status": s.status,
+                    "opened_at": s.opened_at, "ready_at": s.ready_at, "expires_at": s.expires_at, "batch_id": s.batch_id,
+                    "members": members.get(s.set_id, []),
+                    "override": {"timeout": ov.get("timeout"), "duplicate_of": ov.get("duplicate_of"),
+                                 "error": (ov.get("error") or {}).get("message"), "overrides": ov.get("overrides") or []}})
+    return out
+
+
+class FileSetOverrideIn(BaseModel):
+    action: str
+    reason: str = ""
+    target_pairing_key: str | None = None
+    member_role: str | None = None
+
+
+@app.post("/api/file-sets/{set_id}/override")
+def file_set_override(set_id: str, body: FileSetOverrideIn, user: User = Depends(current_user)):
+    from ..multifile import fileset
+
+    try:
+        out = fileset.override_set(set_id, body.action, user.name, user.roles, body.reason, body.target_pairing_key, body.member_role)
+    except pipeline.DuplicateFileError as e:
+        raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
+    except ValueError as e:
+        _err(e)
+    if out.get("batch_id") and out.get("status", out.get("target_status")) == "consumed":
+        dispatch(out["batch_id"])
+    return out
 
 
 @app.post("/api/batches/{batch_id}/snapshot-reviews")
@@ -1138,7 +1477,7 @@ def schedules_pull(schedule_id: str, user: User = Depends(current_user)):
             db.audit(c, user.name, "schedule.pull_submitted", "schedule", schedule_id, {"glue_run_id": run_id})
         return {"schedule_id": schedule_id, "submitted": True, "glue_run_id": run_id, "fetched": [], "batches": []}
     out = _sched_call(sched.pull_now, schedule_id, user.name, user.roles)
-    for bid in out.get("batches", []):
+    for bid in dispatchable(out.get("batches", [])):
         dispatch(bid)
     return out
 
@@ -1175,7 +1514,7 @@ def scheduler_tick(user: User = Depends(current_user)):
     from ..scheduling import service as sched
 
     out = sched.tick()
-    for bid in out.get("batches", []):
+    for bid in dispatchable(out.get("batches", [])):
         dispatch(bid)
     return out
 
@@ -1262,6 +1601,15 @@ class Reason(BaseModel):
 def reject(exception_id: str, body: Reason, user: User = Depends(current_user)):
     try:
         return exceptions_mgr.reject_loan(exception_id, user.name, user.roles, body.reason)
+    except ExceptionActionError as e:
+        _err(e)
+
+
+@app.post("/api/exceptions/{exception_id}/acknowledge")
+def acknowledge(exception_id: str, body: Reason, user: User = Depends(current_user)):
+    """Close a join exception with a reason (join exceptions have no staged loan to resolve or reject)."""
+    try:
+        return exceptions_mgr.acknowledge(exception_id, user.name, user.roles, body.reason)
     except ExceptionActionError as e:
         _err(e)
 

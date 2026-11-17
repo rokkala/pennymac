@@ -512,3 +512,54 @@ def _build_scenario(tmp: Path, rows: int) -> None:
     ms.register_source(
         "Loan tape", newp, "onboarding", "New correspondent partner, first tape", vendor_id=west["vendor_id"],
     )
+
+    _build_master_detail_feed(tmp, rows, vendor_ids["pcg_retail"], loc)
+
+
+def _build_master_detail_feed(tmp: Path, rows: int, vendor_id: str, loc) -> None:
+    """A two-file feed (loan master + escrow items, aggregated onto the loan): mapping and layout approved
+    by two users, yesterday's set delivered and loaded, today's master waiting for its escrow items file.
+    Today's escrow items file is left in demo_uploads/3_multi_file for a live upload."""
+    from datetime import timedelta as _td
+
+    from . import samples
+    from .config import get_settings
+    from .mapping import service as ms
+    from .multifile.fileset import attach_file
+    from .multifile.service import decide_layout, propose_layout
+    from .pipeline.batch import run_batch
+    from .store import db as _db
+
+    n = max(50, min(400, rows))
+    d1, d2 = f"{loc - _td(days=1):%Y%m%d}", f"{loc:%Y%m%d}"
+    day1 = samples.generate_master_detail(tmp / "multi_file", n, date=d1, seed=611, offset=700_000)
+    day2 = samples.generate_master_detail(tmp / "multi_file", n, date=d2, seed=612, offset=700_000 + n)
+
+    reg = ms.register_source("Escrow items feed (two files)", day1["master"], "onboarding",
+                             "PennyMac Retail (PCG) daily loan file plus escrow items file", vendor_id=vendor_id)
+    mid = reg["mapping_id"]
+    ms.accept_all(mid, "onboarding", 0.0)
+    with _db.get_engine().connect() as c:
+        fields = c.execute(_db.mappings.select().where(_db.mappings.c.mapping_id == mid)).first().fields
+    money = next(f for f in fields if f["target"] == "escrow_balance")["transform"]
+    for target, col in (("tax_annual_amount", "tax_total"), ("hazard_insurance_annual_premium", "hazard_total")):
+        # add_field checks the sampled (master) columns; the override then points it at the aggregate output
+        ms.add_field(mid, target, "onboarding", ["EscrowBalance"], money)
+        ms.update_field(mid, target, "override", "onboarding", sources=[col], transform=money)
+    ms.submit(mid, "onboarding")
+    ms.approve(mid, "onboarding.reviewer", ["onboarding_reviewer"], True, "Escrow totals come from the escrow items file")
+    sid = reg["source_id"]
+    propose_layout(sid, samples.master_detail_layout(), samples.master_detail_readiness(), "onboarding", ["onboarding"])
+    decide_layout(sid, "onboarding.reviewer", ["onboarding_reviewer"], True, "Vendor sends the loan file and the escrow items file daily")
+
+    attach_file(sid, day1["master"].name, day1["master"], "s3-auto-arrival")
+    done = attach_file(sid, day1["details"].name, day1["details"], "s3-auto-arrival")
+    if done["batch_id"]:
+        run_batch(done["batch_id"])
+    attach_file(sid, day2["master"].name, day2["master"], "s3-auto-arrival")  # waits for its escrow items file
+
+    live = get_settings().data_dir / "demo_uploads" / "3_multi_file"
+    if live.exists():
+        shutil.rmtree(live)
+    live.mkdir(parents=True)
+    shutil.copy2(day2["details"], live / day2["details"].name)
