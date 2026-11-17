@@ -61,3 +61,4 @@ docs/superpowers/palette-picker.html
 aws/terraform/*.bin
 backend/build/
 frontend/graphify-out/
+.superpowers/
