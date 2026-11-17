@@ -542,3 +542,52 @@ def test_upload_set_refuses_bad_requests_before_attaching(client, feed, env):
     # a non-monitoring role is refused
     assert post([("files", ("loans_20261117.csv", MASTER))], {"X-User": "ana", "X-Roles": "analyst"}).status_code == 403
     assert _rows(db.file_sets) == [] and _upload_dir_files(env) == before
+
+
+@pytest.fixture()
+def unpublished(sample_files):
+    """I1: a feed whose approved layout never reached its published bundle (publish failed after approval)."""
+    sid = _onboard(sample_files)
+    with db.get_engine().begin() as c:
+        c.execute(update(db.sources).where(db.sources.c.source_id == sid).values(layout=LAYOUT, readiness=READY))
+    assert config_store.load(sid).layout is None
+    return sid
+
+
+def test_approved_layout_without_published_bundle_is_an_error(unpublished):
+    from lbp.multifile.fileset import feed_layout
+
+    with pytest.raises(config_store.ConfigError, match="republish"):
+        feed_layout(unpublished)
+
+
+def test_upload_refuses_feed_whose_layout_is_not_published(client, unpublished, env):
+    with open(env / "samples" / "pcg_retail_sample.csv", "rb") as f:
+        r = client.post("/api/upload", data={"source_id": unpublished, "auto_start": "false"},
+                        files={"file": ("loans_20261117.csv", f)}, headers=OPS)
+    assert r.status_code == 400 and "republish" in r.text
+    assert _rows(db.batches, source_id=unpublished) == []
+
+
+def test_s3_arrival_for_unpublished_layout_is_alerted(unpublished, env, monkeypatch, tmp_path):
+    import boto3
+    from moto import mock_aws
+
+    from tests.test_lambdas import _aws, _load
+
+    with mock_aws():
+        h = _load(monkeypatch)
+        with db.get_engine().begin() as c:  # _aws republishes every feed: publish this one without its layout again
+            c.execute(update(db.sources).where(db.sources.c.source_id == unpublished).values(layout=None))
+        _aws(monkeypatch)
+        with db.get_engine().begin() as c:
+            c.execute(update(db.sources).where(db.sources.c.source_id == unpublished).values(layout=LAYOUT))
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="lbp-raw")
+        p = tmp_path / "loans_20261117.csv"
+        p.write_text(MASTER)
+        key = f"incoming/{unpublished}/loans_20261117.csv"
+        s3.upload_file(str(p), "lbp-raw", key)
+        out = h.on_file_arrival({"detail": {"bucket": {"name": "lbp-raw"}, "object": {"key": key}}}, None)
+        assert out.get("rejected") and "ConfigError" in out["rejected"]  # alerted, never a single-file batch
+    assert _rows(db.batches, source_id=unpublished) == []

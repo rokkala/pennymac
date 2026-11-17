@@ -161,14 +161,19 @@ def _missing(layout: dict, readiness: dict, present: set[str]) -> list[str]:
 def feed_layout(source_id: str) -> dict | None:
     """The published layout of a feed, or None for a single-file feed. The feed row's approved `layout` is read
     first: a feed without one is single-file and its configuration bundle is never read (so a missing or corrupt
-    bundle behaves exactly as before). A feed with one loads its published bundle; its ConfigError is raised."""
-    from ..config_store import load
+    bundle behaves exactly as before). A feed with one loads its published bundle; its ConfigError is raised, and
+    so is a bundle without a layout (approved but never published): such a feed is never treated as single-file."""
+    from ..config_store import ConfigError, load
 
     with db.get_engine().connect() as c:
         approved = c.execute(select(db.sources.c.layout).where(db.sources.c.source_id == source_id)).scalar()
     if not approved:
         return None
-    return load(source_id).layout or None
+    layout = load(source_id).layout
+    if not layout:
+        raise ConfigError(f"feed {source_id} has an approved layout but its published configuration has none; republish "
+                          "the feed configuration before sending files")
+    return layout
 
 
 def _config(source_id: str):
@@ -272,8 +277,8 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
             status = "consumed"
         except SetNotReadyError:  # queued (or discarded) by another worker meanwhile: report what it is now
             with db.get_engine().connect() as c:
-                now_set = c.execute(select(fs.c.status, fs.c.batch_id).where(fs.c.set_id == set_id)).first()
-            status, batch_id = now_set.status, now_set.batch_id
+                status = c.execute(select(fs.c.status).where(fs.c.set_id == set_id)).scalar()
+            batch_id = None  # queued by the other worker, which dispatches it: never dispatched twice
     return {"set_id": set_id, "role": role, "status": status, "batch_id": batch_id}
 
 
@@ -318,13 +323,17 @@ def _merge_override(set_id: str, patch: dict) -> dict:
 
 
 def _record_error(set_id: str, stage: str, e: Exception, now: datetime) -> bool:
-    """Record a failure on the set (override.error), audit and log it. True when it was not alerted before."""
+    """Record a failure on the set (override.error) and log it; audit it only when it is new (first occurrence,
+    or another stage or message than the recorded one), so a persistent failure does not grow the audit log
+    every tick. True when it was not alerted before."""
     msg = _safe_message(e)
     log.warning("file set %s: %s failed: %s", set_id, stage, msg)
     try:
         prev = _merge_override(set_id, {"error": {"at": now.isoformat(), "stage": stage, "message": msg}})
-        with db.get_engine().begin() as c:
-            db.audit(c, "scheduler", "file_set.error", "file_set", set_id, {"stage": stage, "message": msg})
+        last = prev.get("error") or {}
+        if (last.get("stage"), last.get("message")) != (stage, msg):
+            with db.get_engine().begin() as c:
+                db.audit(c, "scheduler", "file_set.error", "file_set", set_id, {"stage": stage, "message": msg})
         return not (prev.get("error_alerted") or {}).get(stage)
     except Exception:  # noqa: BLE001 - recording must never stop the sweep
         log.exception("could not record the error of file set %s", set_id)
@@ -332,7 +341,17 @@ def _record_error(set_id: str, stage: str, e: Exception, now: datetime) -> bool:
 
 
 def _expire_one(set_id: str, source_id: str, now: datetime):
-    """Apply the timeout to one waiting set (once). Returns the alert to send, or None when not handled."""
+    """Apply the timeout to one waiting set (once). Returns the alert to send, or None when not handled.
+    A set whose timeout was already handled is skipped before any configuration load or feed lock."""
+    fs = db.file_sets
+    with db.get_engine().connect() as c:
+        cur = c.execute(select(fs.c.status, fs.c.override).where(fs.c.set_id == set_id)).first()
+    if cur is None or cur.status != "waiting":
+        return None
+    if (cur.override or {}).get("timeout"):  # handled before (a row from before expires_at was cleared): stop selecting it
+        with db.get_engine().begin() as c:
+            c.execute(fs.update().where(fs.c.set_id == set_id, fs.c.status == "waiting").values(expires_at=None))
+        return None
     try:
         cfg = _config(source_id)
     except FileSetError as e:
@@ -340,7 +359,6 @@ def _expire_one(set_id: str, source_id: str, now: datetime):
         return None
     layout, readiness = cfg.layout, cfg.readiness or {}
     policy = readiness.get("on_timeout") or "alert_only"
-    fs = db.file_sets
     with db.get_engine().begin() as c:
         _lock_source(c, source_id)
         s = c.execute(select(fs).where(fs.c.set_id == set_id).with_for_update()).first()
@@ -353,7 +371,9 @@ def _expire_one(set_id: str, source_id: str, now: datetime):
         if policy == "load_master_only" and ("master" not in present or not set(missing) <= optional):
             action = "fail"
         record = {"at": now.isoformat(), "policy": policy, "action": action, "missing_roles": missing}
-        vals: dict = {"override": {**(s.override or {}), "timeout": record}}
+        # expires_at cleared: the due query never selects a handled set again (alert_only keeps it waiting, so a
+        # late file still completes it); the timeout itself stays recorded in override.timeout
+        vals: dict = {"override": {**(s.override or {}), "timeout": record}, "expires_at": None}
         if action == "fail":
             vals["status"] = "expired"
         elif action == "load_master_only":  # the batch is queued by the ready-set sweep
@@ -402,7 +422,9 @@ def sweep_sets(now: datetime | None = None) -> dict:
                             .order_by(fs.c.ready_at)).all()
     for set_id, source_id in pending:
         try:
-            queued.append(create_batch_for_set(set_id, "scheduler"))
+            # strict=False, like S3 and scheduler arrivals: a batch that cannot be sequenced (or a suspended
+            # vendor's set) is recorded as a failed batch, so the set ends consumed instead of retried forever
+            queued.append(create_batch_for_set(set_id, "scheduler", strict=False))
         except DuplicateFileError:
             continue  # recorded on the set (discarded, duplicate_of) by create_batch_for_set
         except SetNotReadyError:
@@ -615,8 +637,7 @@ def _repair(set_id: str, actor: str, reason: str, now: datetime, target_key: str
         try:
             batch_id = create_batch_for_set(target_id, actor, strict=True)
             status = "consumed"
-        except SetNotReadyError:
+        except SetNotReadyError:  # queued by another worker, which dispatches it
             with db.get_engine().connect() as c:
-                cur = c.execute(select(fs.c.status, fs.c.batch_id).where(fs.c.set_id == target_id)).first()
-            status, batch_id = cur.status, cur.batch_id
+                status = c.execute(select(fs.c.status).where(fs.c.set_id == target_id)).scalar()
     return {"set_id": set_id, "role": role, "target_set_id": target_id, "target_status": status, "batch_id": batch_id}

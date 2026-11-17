@@ -96,3 +96,34 @@ def test_layout_endpoints_roundtrip(client, onboarded):
     assert client.post(url + "/decide", json={"approve": True, "comment": "ok"}, headers=sme).status_code == 200
     g = client.get(url).json()
     assert g["configured"] and g["draft"] is None and g["layout"]["files"][0]["role"] == "master"
+
+
+def test_publish_failure_after_approval_is_reported_not_silent(onboarded, monkeypatch):
+    """I1: the approval commits, then publishing fails: decide_layout says so explicitly (the approval is saved,
+    the feed must be republished) instead of returning success."""
+    from lbp.multifile.service import LayoutPublishError
+
+    sid = onboarded["pcg_retail"]["source_id"]
+    propose_layout(sid, LAYOUT, READY, "ana", ANA)
+
+    def boom(*_a, **_k):
+        raise config_store.ConfigError("storage unavailable")
+
+    monkeypatch.setattr(config_store, "publish", boom)
+    with pytest.raises(LayoutPublishError, match="approved.*republish"):
+        decide_layout(sid, "sam", SME, True, "ok")
+    assert _src(sid).layout is not None
+    assert "source.layout_publish_failed" in _audit_actions(sid)
+
+
+def test_decide_endpoint_reports_publish_failure(client, onboarded, monkeypatch):
+    sid = onboarded["pcg_retail"]["source_id"]
+    an, sme = {"X-User": "ana", "X-Roles": "analyst"}, {"X-User": "sam", "X-Roles": "sme"}
+    assert client.put(f"/api/sources/{sid}/layout", json={"layout": LAYOUT, "readiness": READY}, headers=an).status_code == 200
+
+    def boom(*_a, **_k):
+        raise RuntimeError("s3 down")
+
+    monkeypatch.setattr(config_store, "publish", boom)
+    r = client.post(f"/api/sources/{sid}/layout/decide", json={"approve": True}, headers=sme)
+    assert r.status_code == 502 and "republish" in r.json()["detail"] and "approved" in r.json()["detail"]

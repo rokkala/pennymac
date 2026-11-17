@@ -1189,10 +1189,12 @@ async def preview_layout(source_id: str, request: Request):
 
 @app.post("/api/sources/{source_id}/layout/decide")
 def decide_layout_endpoint(source_id: str, body: Decision, user: User = Depends(current_user)):
-    from ..multifile.service import LayoutServiceError, decide_layout
+    from ..multifile.service import LayoutPublishError, LayoutServiceError, decide_layout
 
     try:
         return decide_layout(source_id, user.name, user.roles, body.approve, body.comment)
+    except LayoutPublishError as e:  # the approval is saved; the publish must be retried
+        _err(e, 502)
     except LayoutServiceError as e:
         _err(e)
 

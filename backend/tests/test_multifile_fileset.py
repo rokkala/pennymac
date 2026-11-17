@@ -5,7 +5,16 @@ import pytest
 from sqlalchemy import select, update
 
 from lbp import config_store
-from lbp.multifile.fileset import FileSetError, attach_file, create_batch_for_set, evaluate_set, expire_sets, pairing_key, route_file
+from lbp.multifile.fileset import (
+    FileSetError,
+    attach_file,
+    create_batch_for_set,
+    evaluate_set,
+    expire_sets,
+    pairing_key,
+    route_file,
+    sweep_sets,
+)
 from lbp.pipeline.batch import DuplicateFileError
 from lbp.store import db
 
@@ -469,7 +478,7 @@ def test_set_already_consumed_is_a_benign_no_op(env, feed, monkeypatch):
     _consumed_meanwhile(monkeypatch)
     b = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
     s = _set(a["set_id"])
-    assert b["status"] == "consumed" and b["batch_id"] == s.batch_id and len(_batches(feed)) == 1
+    assert b["status"] == "consumed" and b["batch_id"] is None and s.batch_id and len(_batches(feed)) == 1  # no double dispatch
     assert not (s.override or {}).get("error") and not _audit("file_set.error")
     monkeypatch.undo()
     # sweep: a ready set without a batch that another worker queues meanwhile -> no error, no alert
@@ -508,3 +517,97 @@ def test_strict_false_records_a_failed_set_batch(env, feed):
                        strict=False, arrived_at=T0)
     assert done["set_id"] == m["set_id"] and done["batch_id"] and done["status"] == "consumed"
     assert next(x for x in _batches(feed) if x.batch_id == done["batch_id"]).status == "failed"
+
+
+# ------------------------------------------------------------------ final review I2 / I3 / double dispatch
+def test_sweep_records_unsequenceable_ready_set_as_failed_batch_once(env, feed):
+    """I2: a ready set whose batch cannot be registered (suspended vendor) is recorded by the sweep as a failed
+    batch (strict=False, like S3 and scheduler arrivals); the set ends consumed and is not retried."""
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with db.get_engine().begin() as c:
+        vid = c.execute(select(db.sources.c.vendor_id).where(db.sources.c.source_id == feed)).scalar()
+        c.execute(update(db.vendors).where(db.vendors.c.vendor_id == vid).values(status="suspended"))
+    from lbp.pipeline.delivery import DeliveryError
+
+    with pytest.raises(DeliveryError):  # strict API path: raised, the set stays ready
+        _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    out = sweep_sets(T0 + timedelta(minutes=5))
+    s = _set(a["set_id"])
+    assert s.status == "consumed" and s.batch_id
+    b = _batches(feed)[0]
+    assert b.status == "failed" and "suspended" in b.error and out["batches"] == [b.batch_id]
+    n_audit = len(_audit_all())
+    for m in (6, 7, 8):
+        assert sweep_sets(T0 + timedelta(minutes=m))["batches"] == []
+    assert len(_batches(feed)) == 1 and len(_audit_all()) == n_audit and not _audit("file_set.error")
+
+
+def test_persistent_batch_error_is_audited_once_per_message(env, feed, monkeypatch):
+    """I2: a set that keeps failing for the same reason writes file_set.error once, not every tick; a new
+    message is audited again."""
+    from lbp.multifile import fileset
+
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    with db.get_engine().begin() as c:
+        c.execute(update(db.file_sets).where(db.file_sets.c.set_id == a["set_id"]).values(status="ready"))
+    msg = {"text": "first"}
+
+    def boom(set_id, actor, **kw):
+        raise FileSetError(f"simulated {msg['text']}")
+
+    monkeypatch.setattr(fileset, "create_batch_for_set", boom)
+    for m in range(5, 10):
+        sweep_sets(T0 + timedelta(minutes=m))
+    errs = [r for r in _audit("file_set.error") if r.entity_id == a["set_id"]]
+    assert len(errs) == 1 and "simulated first" in errs[0].detail["message"]
+    assert _set(a["set_id"]).override["error"]["message"].endswith("simulated first")
+    msg["text"] = "second"
+    sweep_sets(T0 + timedelta(minutes=11))
+    sweep_sets(T0 + timedelta(minutes=12))
+    errs = [r for r in _audit("file_set.error") if r.entity_id == a["set_id"]]
+    assert len(errs) == 2 and "simulated second" in errs[1].detail["message"]
+
+
+def test_handled_alert_only_set_is_not_reprocessed_and_can_still_complete(env, feed, monkeypatch):
+    """I3: after an alert_only timeout the set stays waiting but the sweep no longer selects it (no config load,
+    no feed lock per tick); a late file still completes it."""
+    from lbp.multifile import fileset
+
+    a = _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    assert expire_sets(T0 + timedelta(minutes=241)) == [a["set_id"]]
+    calls = {"config": 0, "lock": 0}
+    real_cfg, real_lock = fileset._config, fileset._lock_source
+
+    def cfg(sid):
+        calls["config"] += 1
+        return real_cfg(sid)
+
+    def lock(c, sid):
+        calls["lock"] += 1
+        return real_lock(c, sid)
+
+    monkeypatch.setattr(fileset, "_config", cfg)
+    monkeypatch.setattr(fileset, "_lock_source", lock)
+    for m in (300, 400, 500):
+        assert expire_sets(T0 + timedelta(minutes=m)) == []
+    assert calls == {"config": 0, "lock": 0}
+    s = _set(a["set_id"])
+    assert s.status == "waiting" and s.override["timeout"]["action"] == "alert_only" and len(_alerts("delivery_late")) == 1
+    monkeypatch.undo()
+    late = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=600))
+    assert late["set_id"] == a["set_id"] and late["status"] == "consumed" and late["batch_id"]
+
+
+def test_attach_does_not_return_a_batch_it_did_not_queue(env, feed, monkeypatch):
+    """Minor (double dispatch): when another worker queued the set meanwhile, attach reports batch_id None so
+    only the queuing caller dispatches it."""
+    _consumed_meanwhile(monkeypatch)
+    _attach(env, feed, "loans_20261117.csv", MASTER, T0)
+    b = _attach(env, feed, "borrowers_20261117.csv", BORR, T0 + timedelta(minutes=1))
+    assert b["status"] == "consumed" and b["batch_id"] is None
+    assert len(_batches(feed)) == 1
+
+
+def _audit_all():
+    with db.get_engine().connect() as c:
+        return c.execute(select(db.audit_log)).all()

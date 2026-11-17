@@ -11,6 +11,11 @@ class LayoutServiceError(ValueError):
     pass
 
 
+class LayoutPublishError(LayoutServiceError):
+    """The layout decision was saved, but publishing the feed configuration failed: the feed refuses files until
+    it is republished (never a silent single-file fallback)."""
+
+
 def _roles(roles: list[str]) -> set[str]:
     from ..security import expand_roles
 
@@ -67,9 +72,16 @@ def decide_layout(source_id: str, actor: str, roles: list[str], approve: bool, c
         db.audit(c, actor, "source.layout_approve" if approve else "source.layout_reject", "source", source_id,
                  {"comment": comment, **({"layout": src.layout_draft, "readiness": src.readiness_draft} if approve else {})})
     if approve and src.active_mapping_id:
-        from ..config_store import publish
+        from .. import config_store
 
-        publish(source_id, actor, "layout approved")
+        try:
+            config_store.publish(source_id, actor, "layout approved")
+        except Exception as e:  # noqa: BLE001 - reported, never swallowed
+            with db.get_engine().begin() as c:
+                db.audit(c, actor, "source.layout_publish_failed", "source", source_id, {"error": e.__class__.__name__})
+            raise LayoutPublishError(f"the layout was approved and saved, but publishing the feed configuration failed "
+                                     f"({e.__class__.__name__}); the feed refuses files until it is republished "
+                                     f"(POST /api/sources/{source_id}/publish)") from None
     return {"source_id": source_id, "approved": approve}
 
 
