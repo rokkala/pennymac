@@ -119,6 +119,8 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     # incremental loads, sequencing, delivery scheduler
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
+    ("PUT", "/api/sources/{source_id}/layout"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/layout/decide"): ONBOARDING_REVIEW,
     ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/discard"): ("monitoring", "onboarding_reviewer"),
@@ -913,6 +915,41 @@ def approve_delivery(source_id: str, body: Decision, user: User = Depends(curren
     try:
         return decide_profile(source_id, user.name, user.roles, body.approve, body.comment)
     except DeliveryError as e:
+        _err(e)
+
+
+class LayoutIn(BaseModel):
+    layout: dict
+    readiness: dict = {}
+
+
+@app.get("/api/sources/{source_id}/layout")
+def get_layout(source_id: str):
+    with db.get_engine().connect() as c:
+        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise HTTPException(404, "source not found")
+    return {"source_id": source_id, "layout": src.layout, "readiness": src.readiness, "configured": bool(src.layout),
+            "draft": src.layout_draft, "readiness_draft": src.readiness_draft, "proposed_by": src.layout_proposed_by}
+
+
+@app.put("/api/sources/{source_id}/layout")
+def put_layout(source_id: str, body: LayoutIn, user: User = Depends(current_user)):
+    from ..multifile.service import LayoutServiceError, propose_layout
+
+    try:
+        return propose_layout(source_id, body.layout, body.readiness, user.name, user.roles)
+    except LayoutServiceError as e:
+        _err(e)
+
+
+@app.post("/api/sources/{source_id}/layout/decide")
+def decide_layout_endpoint(source_id: str, body: Decision, user: User = Depends(current_user)):
+    from ..multifile.service import LayoutServiceError, decide_layout
+
+    try:
+        return decide_layout(source_id, user.name, user.roles, body.approve, body.comment)
+    except LayoutServiceError as e:
         _err(e)
 
 
