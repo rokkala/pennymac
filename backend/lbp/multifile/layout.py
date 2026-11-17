@@ -52,10 +52,14 @@ def normalize_layout(layout: dict) -> dict:
     out = copy.deepcopy(layout) if isinstance(layout, dict) else {}
     out["files"] = out.get("files") or []
     rels = out.get("relations") or []
-    out["relations"] = [
-        {**copy.deepcopy(DEFAULT_RELATION), **{k: v for k, v in r.items() if v is not None}}
-        for r in rels if isinstance(r, dict)
-    ]
+    out["relations"] = []
+    for r in rels:
+        if not isinstance(r, dict):
+            continue
+        rel = {**copy.deepcopy(DEFAULT_RELATION), **{k: v for k, v in r.items() if v is not None}}
+        if r.get("cardinality") is None:  # merge is 1:1 by nature; every other mode defaults to many
+            rel["cardinality"] = "one" if rel.get("mode") == "merge" else "many"
+        out["relations"].append(rel)
     return out
 
 

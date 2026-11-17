@@ -57,8 +57,8 @@ def test_merge_requires_cardinality_one():
     lay = layout()
     lay["relations"][0]["cardinality"] = "many"
     assert any("merge" in e and "cardinality" in e for e in validate_layout(lay, None))
-    del lay["relations"][0]["cardinality"]  # the default (many) is not enough for merge either
-    assert any("merge" in e and "cardinality" in e for e in validate_layout(lay, None))
+    del lay["relations"][0]["cardinality"]  # the merge default is one, so this is now valid
+    assert not any("cardinality" in e for e in validate_layout(lay, None))
     agg = agg_layout("total")
     agg["relations"][0]["cardinality"] = "many"
     assert validate_layout(agg, None) == []
@@ -118,7 +118,7 @@ def test_normalize_layout_fills_defaults_without_mutating():
     out = normalize_layout(lay)
     assert lay == before
     rel = out["relations"][0]
-    assert rel["join"] == "left" and rel["cardinality"] == "many"
+    assert rel["join"] == "left" and rel["cardinality"] == "one"  # merge defaults to one
     assert rel["on_orphan_detail"] == "exception" and rel["on_missing_detail"] == "allow"
     assert rel["on_duplicate_master"] == "reject_all" and rel["min_match_rate"] == 0.0
     assert rel["normalize"] == ["trim"]
@@ -183,3 +183,16 @@ def test_aggregate_where_and_order_by_shape_validated():
     assert any("order_by" in e for e in errs_for(order_by=[{"desc": True}]))
     assert any("order_by" in e for e in errs_for(order_by=[{"col": "d", "type": "money"}]))
     assert any("order_by" in e for e in errs_for(order_by=[{"col": "d", "desc": "yes"}]))
+
+
+def test_cardinality_default_depends_on_mode():
+    lay = layout()
+    del lay["relations"][0]["cardinality"]
+    assert normalize_layout(lay)["relations"][0]["cardinality"] == "one"
+    lay["relations"][0]["mode"] = "aggregate"
+    assert normalize_layout(lay)["relations"][0]["cardinality"] == "many"
+    lay["relations"][0]["cardinality"] = "one"
+    assert normalize_layout(lay)["relations"][0]["cardinality"] == "one"
+    lay["relations"][0]["mode"] = "merge"
+    lay["relations"][0]["cardinality"] = "many"
+    assert normalize_layout(lay)["relations"][0]["cardinality"] == "many"  # explicit never overridden
