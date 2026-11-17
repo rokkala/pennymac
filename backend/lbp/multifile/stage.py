@@ -310,7 +310,8 @@ def _summary_of(res, sha: str, cfg, lay: dict, absent: list[str]) -> dict:
         "per_role": {r: {"rows_in": s.rows_in, "matched": s.matched, "orphaned": s.orphaned, "rejected": s.rejected}
                      for r, s in res.per_role.items()},
         "exception_counts": dict(res.exception_counts), "master_match_rate": round(res.master_match_rate, 6),
-        "detail_match_rate": {r: round(v, 6) for r, v in res.detail_match_rate.items()}, "rows_out": res.rows_out,
+        "detail_match_rate": {r: round(v, 6) for r, v in res.detail_match_rate.items()},
+        "master_rate_by_role": {r: round(v, 6) for r, v in res.master_rate_by_role.items()}, "rows_out": res.rows_out,
         "columns": list(res.columns), "layout_version": cfg.version, "layout_sha256": _layout_sha(lay),
         "config_sha256": (cfg.sha256 or "")[:16], "sha256": sha, "absent_roles": absent, "joined_at": db.now().isoformat(),
     }
@@ -321,14 +322,17 @@ def _members(c, set_id: str) -> dict[str, str]:
     return {r.role: r.file_path for r in c.execute(select(bf.c.role, bf.c.file_path).where(bf.c.set_id == set_id))}
 
 
-def _save(batch_id: str, **vals) -> None:
+def _record(batch_id: str, vals: dict, audits: list[tuple[str, dict]]) -> None:
+    """Every join-stage state change is ONE write: the batch columns and its audit entries commit together."""
     with db.get_engine().begin() as c:
         c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(**vals))
+        for action, detail in audits:
+            db.audit(c, "pipeline", action, "batch", batch_id, detail)
 
 
-def _block(batch_id: str, b, summary: dict, stage: str, message: str, cfg, extra_pf: dict | None = None) -> dict:
-    """Record a join-stage block: join_summary.blocked and a blocking pre-flight (any previous override is kept
-    in its history, so a new override is needed for this block)."""
+def _block_values(b, summary: dict, stage: str, message: str, cfg, extra_pf: dict | None = None) -> tuple[dict, dict]:
+    """(batch values, summary) of a join-stage block: join_summary.blocked, a blocking pre-flight and the batch
+    `blocked` (any previous override is kept in its history, so a new override is needed for this block)."""
     pf = dict(b.preflight or {})
     old = pf.pop("override", None)
     pf.update({"decision": "block", "summary": message, "stage": f"join_{stage}", "mapping_id": cfg.mapping_id,
@@ -337,11 +341,27 @@ def _block(batch_id: str, b, summary: dict, stage: str, message: str, cfg, extra
     if old:
         pf["join_overrides"] = [*pf.get("join_overrides", []), old]
     summary = {**summary, "blocked": {"stage": stage, "message": message}}
-    with db.get_engine().begin() as c:
-        c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(preflight=pf, join_summary=summary))
-        db.audit(c, "pipeline", "batch.join_blocked", "batch", batch_id, {"stage": stage, "summary": message})
+    return {"preflight": pf, "join_summary": summary, "status": "blocked", "error": message, "worker_id": None}, summary
+
+
+def _blocked_result(stage: str, message: str, summary: dict) -> dict:
     return {"status": "blocked", "stage": stage, "message": message, "joined_path": summary.get("joined_path"),
             "summary": summary}
+
+
+def _block(batch_id: str, b, summary: dict, stage: str, message: str, cfg, extra_pf: dict | None = None) -> dict:
+    vals, summary = _block_values(b, summary, stage, message, cfg, extra_pf)
+    _record(batch_id, vals, [("batch.join_blocked", {"stage": stage, "summary": message})])
+    return _blocked_result(stage, message, summary)
+
+
+def _regate(lay: dict, summary: dict) -> str | None:
+    """The match-rate gate re-applied to a recorded join (the joiner's own comparison). A summary without
+    per-relation master rates falls back to the overall master match rate for every relation."""
+    master = summary.get("master_rate_by_role")
+    if master is None:
+        master = {r.get("detail"): float(summary.get("master_match_rate", 0.0)) for r in lay.get("relations") or []}
+    return joiner.match_rate_gate(lay.get("relations") or [], master, summary.get("detail_match_rate") or {})
 
 
 def _accept(batch_id: str, b, summary: dict, stage: str) -> dict:
@@ -372,6 +392,15 @@ def _reuse(batch_id: str, b) -> tuple[Path, dict]:
         raise StageError(f"joined file of batch {batch_id} changed since it was joined (sha256 mismatch); "
                          "it is never regenerated on resume")
     return path, summary
+
+
+def replay_source(b, cfg) -> tuple[str, dict, dict[str, str], dict]:
+    """(joined file uri, parse options, pii cols, join summary) for replaying a file-set batch's held rows: the
+    recorded joined file, verified like a resume; StageError when it is missing or changed."""
+    if not b.joined_path:
+        raise StageError(f"batch {b.batch_id} has no joined file; held rows of a file-set batch replay only from it")
+    _, summary = _reuse(b.batch_id, b)
+    return b.joined_path, dict(JOINED_PARSE_OPTIONS), joined_pii_cols(cfg, summary.get("columns") or []), summary
 
 
 def _join(batch_id: str, b, cfg, lay: dict, inputs: dict[str, Path], overrides: dict[str, dict], absent: list[str]) -> dict:
@@ -406,13 +435,18 @@ def _join(batch_id: str, b, cfg, lay: dict, inputs: dict[str, Path], overrides: 
         raise StageError(f"joined file of batch {batch_id} did not persist intact")
     summary = {**_summary_of(res, sha, cfg, lay, absent), "joined_path": uri, "exceptions_recorded": n,
                "blocked": None, "overrides": list((b.join_summary or {}).get("overrides") or [])}
-    _save(batch_id, joined_path=uri, join_summary=summary, total_rows=res.rows_out)
-    with db.get_engine().begin() as c:
-        db.audit(c, "pipeline", "batch.joined", "batch", batch_id, {
-            "rows_out": res.rows_out, "exception_counts": summary["exception_counts"], "sha256": sha,
-            "absent_roles": absent, "per_role": summary["per_role"]})
-    summary["_gate"] = res.blocked
-    return summary
+    vals = {"joined_path": uri, "total_rows": res.rows_out}
+    audits = [("batch.joined", {"rows_out": res.rows_out, "exception_counts": summary["exception_counts"], "sha256": sha,
+                                "absent_roles": absent, "per_role": summary["per_role"]})]
+    result = None
+    if res.blocked:  # the block marker is written with joined_path: a crash can never leave an unblocked join behind
+        msg = f"Blocked: {res.blocked}."
+        block_vals, summary = _block_values(b, summary, "match_rate", msg, cfg)
+        vals.update(block_vals)
+        audits.append(("batch.join_blocked", {"stage": "match_rate", "summary": msg}))
+        result = _blocked_result("match_rate", msg, summary)
+    _record(batch_id, {**vals, "join_summary": summary}, audits)
+    return result or summary
 
 
 def materialize_join(batch_id: str, cfg) -> dict:
@@ -437,6 +471,11 @@ def materialize_join(batch_id: str, cfg) -> dict:
 
     if b.joined_path:
         _, summary = _reuse(batch_id, b)
+        gate = None if summary.get("blocked") else _regate(lay, summary)
+        if gate and not any(o.get("stage") == "match_rate" for o in summary.get("overrides") or []):
+            summary["blocked"] = {"stage": "match_rate", "message": f"Blocked: {gate}."}
+            blocked = summary["blocked"]  # a fresh block: only an override given after it is accepted
+            override = None
     else:
         required = [r for r, f in files.items() if r == "master" or f.get("required")]
         missing_req = [r for r in required if r not in members]
@@ -457,11 +496,8 @@ def materialize_join(batch_id: str, cfg) -> dict:
             with db.get_engine().connect() as c:
                 b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
         summary = _join(batch_id, b, cfg, lay, inputs, overrides, absent)
-        gate = summary.pop("_gate")
-        if gate:
-            with db.get_engine().connect() as c:
-                b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
-            return _block(batch_id, b, summary, "match_rate", f"Blocked: {gate}.", cfg)
+        if summary.get("status") == "blocked":
+            return summary
     if summary.get("blocked"):
         stage = summary["blocked"]["stage"]
         if not accepted(stage):

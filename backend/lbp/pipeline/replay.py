@@ -55,7 +55,12 @@ def replay_batch(batch_id: str, actor: str, dry_run: bool = False) -> dict:
     raws = []
     from ..storage import local_path
 
-    _, it = iter_rows(local_path(b.file_path), ParseOptions(**(cfg.parse_options or {})))
+    src_path, src_opts, pii_cols, join_summary = b.file_path, cfg.parse_options, cfg.pii_cols, None
+    if b.file_set_id:  # a file-set batch's rows are the joined file's rows (same row numbers)
+        from ..multifile import stage
+
+        src_path, src_opts, pii_cols, join_summary = stage.replay_source(b, cfg)
+    _, it = iter_rows(local_path(src_path), ParseOptions(**(src_opts or {})))
     for i, raw in enumerate(it):
         if i in held:
             raws.append((i, raw))
@@ -111,7 +116,6 @@ def replay_batch(batch_id: str, actor: str, dry_run: bool = False) -> dict:
     if dry_run:
         return summary
 
-    pii_cols = cfg.pii_cols
     with eng.begin() as c:
         ids = [held[r["row"]].id for r, _, _ in staged]
         c.execute(db.exceptions.update().where(and_(db.exceptions.c.staging_id.in_(ids), db.exceptions.c.status.in_(OPEN_STATES)))
@@ -131,6 +135,8 @@ def replay_batch(batch_id: str, actor: str, dry_run: bool = False) -> dict:
         from .batch import reconcile
 
         rec = reconcile(c, batch_id, b.processed or b.total_rows or 0)
+        if join_summary is not None:
+            rec = stage.join_reconciliation(rec, join_summary)
         c.execute(bt.update().where(bt.c.batch_id == batch_id).values(reconciliation=rec))
         db.audit(c, actor, "batch.replay", "batch", batch_id, {k: summary[k] for k in ("mapping_version", "replayed", "now_boarded", "still_held")})
     summary["now_boarded"] = loaded

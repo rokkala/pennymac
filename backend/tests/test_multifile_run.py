@@ -401,3 +401,172 @@ def test_absent_required_role_fails_clearly(env):
     assert b.status == "failed" and "details" in b.error and "required" in b.error
     with db.get_engine().connect() as c:
         assert c.execute(select(func.count()).select_from(db.loans_staging).where(db.loans_staging.c.batch_id == bid)).scalar() == 0
+
+
+# ------------------------------------------------------------------ fix round 1
+def test_gate_block_survives_a_crash_after_the_join_is_recorded(env, monkeypatch):
+    """The block marker is written with joined_path in one write; a crash right after it still blocks the rerun."""
+    from lbp.multifile import stage
+    from lbp.pipeline.batch import run_batch
+
+    sid, out, ids = _feed(env, layout=_layout(details_min_rate=0.95))
+    bid = out["batch_id"]
+    real = stage._record
+
+    def record_then_die(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("worker killed")
+
+    monkeypatch.setattr(stage, "_record", record_then_die)
+    with pytest.raises(RuntimeError):
+        run_batch(bid)
+    b = _batch(bid)
+    assert b.joined_path and b.join_summary["blocked"]["stage"] == "match_rate"
+    monkeypatch.setattr(stage, "_record", real)
+    with db.get_engine().begin() as c:  # whatever the crash left, the batch is picked up again
+        c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(status="failed"))
+    assert run_batch(bid)["status"] == "blocked"
+    assert _batch(bid).status == "blocked" and _staging(bid) == []
+
+
+def test_reuse_rechecks_match_rate_when_the_marker_is_missing(env):
+    """A recorded join whose summary lost (or never had) the block marker is re-gated from its recorded rates."""
+    from lbp.pipeline.batch import run_batch
+
+    sid, out, ids = _feed(env, layout=_layout(details_min_rate=0.95))
+    bid = out["batch_id"]
+    assert run_batch(bid)["status"] == "blocked"
+    b = _batch(bid)
+    for drop_rates in (False, True):
+        js = {**b.join_summary, "blocked": None}
+        if drop_rates:
+            js.pop("master_rate_by_role", None)
+        with db.get_engine().begin() as c:  # the state a crash between the two old writes left behind
+            c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(status="queued", join_summary=js, preflight={}))
+        assert run_batch(bid)["status"] == "blocked"
+        assert _batch(bid).status == "blocked" and _staging(bid) == []
+
+
+def test_crash_between_exceptions_and_record_does_not_duplicate_exceptions(env, monkeypatch):
+    from lbp.multifile import stage
+    from lbp.pipeline.batch import run_batch
+
+    sid, out, ids = _feed(env)
+    bid = out["batch_id"]
+    real = stage._record
+
+    def die(*a, **k):
+        raise RuntimeError("worker killed")
+
+    monkeypatch.setattr(stage, "_record", die)
+    with pytest.raises(RuntimeError):
+        run_batch(bid)
+    assert _batch(bid).joined_path is None and len(_join_exceptions(bid)) == 2
+    monkeypatch.setattr(stage, "_record", real)
+    run_batch(bid)
+    b = _batch(bid)
+    assert b.status == "completed", b.error
+    assert sorted(e.rule_id for e in _join_exceptions(bid)) == ["JOIN01", "JOIN04"]
+
+
+def test_join_heartbeat_only_refreshes_its_own_lease(env, monkeypatch):
+    import time
+    from datetime import datetime
+
+    from lbp.multifile import stage
+    from lbp.pipeline import batch as pb
+
+    sid, out, ids = _feed(env)
+    bid = out["batch_id"]
+    old = datetime(2020, 1, 1)
+    monkeypatch.setattr(pb, "JOIN_HEARTBEAT_SECONDS", 0.02)
+    seen = {}
+
+    def slow_join(batch_id, cfg):
+        for owner in ("other-worker:1", None):
+            with db.get_engine().begin() as c:
+                c.execute(update(db.batches).where(db.batches.c.batch_id == batch_id)
+                          .values(heartbeat_at=old, worker_id=owner or seen["mine"]))
+            time.sleep(0.2)
+            seen[owner or "own"] = _batch(batch_id).heartbeat_at
+        return {"status": "blocked", "stage": "roles", "message": "Blocked: test."}
+
+    from lbp.pipeline import sequencing
+
+    orig = sequencing.acquire
+
+    def acquire(batch_id, worker_id, lease_from):
+        seen["mine"] = worker_id
+        return orig(batch_id, worker_id, lease_from)
+
+    monkeypatch.setattr(sequencing, "acquire", acquire)
+    monkeypatch.setattr(stage, "materialize_join", slow_join)
+    pb.run_batch(bid)
+    assert seen["other-worker:1"] == old  # another worker's lease is never refreshed
+    assert seen["own"] > old
+
+
+def _handlers(monkeypatch):
+    import importlib.util
+    import sys
+
+    path = Path(__file__).resolve().parents[2] / "aws" / "lambdas" / "handlers.py"
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
+    spec = importlib.util.spec_from_file_location("handlers", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["handlers"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_route_sends_file_set_batches_to_the_standard_engine(env, monkeypatch):
+    from moto import mock_aws
+
+    sid, out, ids = _feed(env)
+    bid = out["batch_id"]
+    with mock_aws():
+        h = _handlers(monkeypatch)
+        monkeypatch.setattr(h, "SPARK_THRESHOLD_ROWS", 2)
+        assert (_batch(bid).total_rows or 0) > 2
+        assert h.route_batch({"batch_id": bid}, None)["engine"] == "standard"
+        with db.get_engine().begin() as c:  # the same batch as a single-file batch would go to Spark
+            c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(file_set_id=None))
+        assert h.route_batch({"batch_id": bid}, None)["engine"] == "spark"
+
+
+def test_prepare_large_refuses_file_set_batches(env):
+    from lbp import glue_jobs
+
+    sid, out, ids = _feed(env)
+    bid = out["batch_id"]
+    with pytest.raises(ValueError, match="file set"):
+        glue_jobs.prepare_large(bid)
+    b = _batch(bid)
+    assert b.status == "queued" and b.worker_id is None
+
+
+def test_replay_of_a_file_set_batch_reads_the_joined_file(env):
+    from lbp.pipeline.batch import run_batch
+    from lbp.pipeline.replay import replay_batch
+
+    sid, out, ids = _feed(env)
+    bid = out["batch_id"]
+    run_batch(bid)
+    with db.get_engine().begin() as c:  # hold loan 0 again, as if a rule had failed it
+        c.execute(update(db.loans_staging).where(db.loans_staging.c.batch_id == bid, db.loans_staging.c.loan_number == ids[0])
+                  .values(boarded=False, status="FAIL", record={}))
+        c.execute(delete(db.sse_loans).where(db.sse_loans.c.loan_number == ids[0]))
+    res = replay_batch(bid, "sme1")
+    assert res["replayed"] == 1
+    st = {s.loan_number: s for s in _staging(bid)}[ids[0]]
+    assert st.record["hazard_insurance_carrier"] == "Carrier0"
+    assert float(st.record["escrow_payment"]) == pytest.approx(150.1)
+    assert st.raw["details.CoSSN"] != "500121000"
+    b = _batch(bid)
+    assert "join" in b.reconciliation
+    with db.get_engine().begin() as c:  # held again, but the joined file is gone: replay refuses, never the master
+        c.execute(update(db.loans_staging).where(db.loans_staging.c.batch_id == bid, db.loans_staging.c.loan_number == ids[0])
+                  .values(boarded=False, status="FAIL"))
+        c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(joined_path=None))
+    with pytest.raises(Exception, match="joined file"):
+        replay_batch(bid, "sme1", dry_run=True)

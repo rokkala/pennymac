@@ -125,7 +125,7 @@ def route_batch(event, _ctx):
             raise ValueError(f"unknown batch {batch_id}")
         fmt = c.execute(select(db.sources.c.format).where(db.sources.c.source_id == b.source_id)).scalar()
     spark = (b.load_type or "full") == "full" and fmt in ("csv", "txt", "psv", "dat") and (b.total_rows or 0) > SPARK_THRESHOLD_ROWS \
-        and (b.checkpoint or 0) == 0
+        and (b.checkpoint or 0) == 0 and not b.file_set_id  # multi-file sets: standard engine only (join stage)
     job = GLUE_SPARK_JOB if spark else GLUE_FEED_JOB
     return {**event, "job_name": job, "engine": "spark" if spark else "standard", "total_rows": b.total_rows,
             "load_type": b.load_type or "full"}

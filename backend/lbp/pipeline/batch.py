@@ -344,7 +344,10 @@ def _safe_error(e: Exception) -> str:
     return f"{e.__class__.__name__}: {msg}"[:1000]
 
 
-def _join_stage(batch_id: str, cfg) -> dict:
+JOIN_HEARTBEAT_SECONDS = 60
+
+
+def _join_stage(batch_id: str, cfg, worker_id: str) -> dict:
     """Multi-file batches only (the caller holds the lease): materialize the joined file. A block sets the batch
     `blocked` (resumable through override_preflight); a failure sets it `failed` and re-raises. The error text
     keeps only our own messages (roles, columns, counts); any other error is reduced to its class name."""
@@ -355,10 +358,10 @@ def _join_stage(batch_id: str, cfg) -> dict:
     stop = threading.Event()
 
     def beat():  # a long join must not look like a dead worker to recover_stale
-        while not stop.wait(60):
-            with contextlib.suppress(Exception), eng.begin() as c:
-                c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status == "running")
-                          .values(heartbeat_at=db.now()))
+        while not stop.wait(JOIN_HEARTBEAT_SECONDS):
+            with contextlib.suppress(Exception), eng.begin() as c:  # only this worker's own lease
+                c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status == "running",
+                                                    db.batches.c.worker_id == worker_id).values(heartbeat_at=db.now()))
 
     hb = threading.Thread(target=beat, daemon=True, name=f"join-heartbeat-{batch_id}")
     hb.start()
@@ -375,10 +378,7 @@ def _join_stage(batch_id: str, cfg) -> dict:
     finally:
         stop.set()
         hb.join(timeout=5)
-    if res["status"] == "blocked":
-        with eng.begin() as c:
-            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="blocked", error=res["message"],
-                                                                                          worker_id=None))
+    if res["status"] == "blocked":  # materialize_join has already set the batch blocked in the same write
         return res
     return {**res, "parse_options": dict(stage.JOINED_PARSE_OPTIONS),
             "pii_cols": stage.joined_pii_cols(cfg, res["summary"].get("columns") or [])}
@@ -429,7 +429,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
 
     src_path, src_opts, pf_extra, pf_keep, join = b.file_path, cfg.parse_options, {}, {}, None
     if b.file_set_id:  # multi-file set: join once, then read the joined file in place of the master
-        join = _join_stage(batch_id, cfg)
+        join = _join_stage(batch_id, cfg, worker_id)
         if join["status"] == "blocked":
             return {"batch_id": batch_id, "status": "blocked", "join": {k: join[k] for k in ("stage", "message")}}
         with eng.connect() as c:

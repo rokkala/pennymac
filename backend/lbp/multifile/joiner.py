@@ -81,6 +81,7 @@ class JoinResult:
     master_match_rate: float
     detail_match_rate: dict[str, float]
     blocked: str | None
+    master_rate_by_role: dict[str, float] = field(default_factory=dict)  # per relation (detail role), master side
 
 
 class MergeMode:
@@ -592,7 +593,8 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
                     path.unlink()
 
     detail_rate = {r.role: _rate(per_role[r.role].matched, per_role[r.role].rows_in) for r in rels}
-    blocked = _match_rate_gate(rels, m.rows_in, detail_rate)
+    master_rate = {r.role: _rate(r.masters_matched, m.rows_in) for r in rels}
+    blocked = match_rate_gate([r.spec for r in rels], master_rate, detail_rate)
     log.info("join done: master rows in %d, out %d, rejected %d; exceptions %s; blocked: %s",
              m.rows_in, rows_out, m.rejected, dict(exc.counts), "yes" if blocked else "no")
     if blocked:
@@ -606,6 +608,7 @@ def join_files(layout: dict, inputs: dict[str, Path], parse_options: dict[str, d
         master_match_rate=_rate(m.matched, m.rows_in),
         detail_match_rate=detail_rate,
         blocked=blocked,
+        master_rate_by_role=master_rate,
     )
 
 
@@ -631,17 +634,19 @@ def _master_problems(rels: list[_Relation], keys: list[str], info: list[tuple[in
     return out
 
 
-def _match_rate_gate(rels: list[_Relation], masters_read: int, detail_rate: dict[str, float]) -> str | None:
-    """Why the join is blocked by `min_match_rate`, or None. Per relation, the threshold applies to the
-    master-side rate (masters with a detail row / masters read) and, when on_orphan_detail is exception, to the
-    detail-side rate as well (details with a master / details read)."""
+def match_rate_gate(relations: list[dict], master_rate: dict[str, float], detail_rate: dict[str, float]) -> str | None:
+    """Why the join is blocked by `min_match_rate`, or None. Per relation (normalized specs), the threshold applies
+    to the master-side rate (masters with a detail row / masters read) and, when on_orphan_detail is exception, to
+    the detail-side rate as well (details with a master / details read). Pure: also used to re-check a recorded
+    join from its summary."""
     msgs = []
-    for r in rels:
-        thr = float(r.spec["min_match_rate"])
-        rate = _rate(r.masters_matched, masters_read)
+    for spec in relations:
+        role, tag = spec["detail"], f"{spec['detail']}->{spec['to']}"
+        thr = float(spec["min_match_rate"])
+        rate = master_rate.get(role, 1.0)
         if rate < thr:
-            msgs.append(f"relation {r.tag}: master match rate {rate:.1%} is below min_match_rate {thr:.1%}")
-        if r.spec["on_orphan_detail"] == "exception" and detail_rate[r.role] < thr:
-            msgs.append(f"relation {r.tag}: {r.role} match rate {detail_rate[r.role]:.1%} is below "
+            msgs.append(f"relation {tag}: master match rate {rate:.1%} is below min_match_rate {thr:.1%}")
+        if spec["on_orphan_detail"] == "exception" and detail_rate.get(role, 1.0) < thr:
+            msgs.append(f"relation {tag}: {role} match rate {detail_rate[role]:.1%} is below "
                         f"min_match_rate {thr:.1%}")
     return "; ".join(msgs) or None
