@@ -370,9 +370,20 @@ def preview(mapping_id: str, n: int = 500) -> dict:
             "samples": samples, "first_record": mask_record(mapper(rows[0])[0], TARGET_PII_TYPES) if rows else None}
 
 
+def _refuse_if_archived(c, source_id: str) -> None:
+    """An archived feed's mappings are frozen: approving one would silently make the feed live again, skipping
+    the restore reason, audit row and name check. Restore the feed first."""
+    row = c.execute(select(db.sources.c.name, db.sources.c.status).where(db.sources.c.source_id == source_id)).first()
+    if row is not None and row.status == "retired":
+        from ..lifecycle import FeedArchivedError
+
+        raise FeedArchivedError(f"feed '{row.name}' is archived; restore the feed first")
+
+
 def submit(mapping_id: str, actor: str) -> dict:
     with db.get_engine().begin() as c:
         m = _require_draft(c, mapping_id)
+        _refuse_if_archived(c, m.source_id)
         pending = [f["target"] for f in m.fields if f["status"] in ("suggested", "needs_review")]
         if pending:
             raise MappingError(f"{len(pending)} field(s) not yet reviewed: {pending[:8]}")
@@ -393,6 +404,7 @@ def approve(mapping_id: str, actor: str, roles: list[str], approve_: bool = True
         m = c.execute(select(db.mappings).where(db.mappings.c.mapping_id == mapping_id)).first()
         if not m or m.status != "in_review":
             raise MappingError("mapping is not awaiting approval")
+        _refuse_if_archived(c, m.source_id)
         if not set(roles) & {"onboarding_reviewer", "admin"}:
             raise MappingError("Onboarding reviewer role required to approve mappings")
         if actor in (m.created_by, m.reviewed_by):
@@ -418,6 +430,7 @@ def approve(mapping_id: str, actor: str, roles: list[str], approve_: bool = True
 
 def new_version(source_id: str, actor: str) -> dict:
     with db.get_engine().begin() as c:
+        _refuse_if_archived(c, source_id)
         # a discarded draft is not a base: build on the latest version that was not discarded
         latest = c.execute(select(db.mappings).where(db.mappings.c.source_id == source_id, db.mappings.c.status != "discarded")
                            .order_by(db.mappings.c.version.desc())).first()

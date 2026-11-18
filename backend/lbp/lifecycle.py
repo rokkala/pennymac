@@ -12,7 +12,8 @@ from sqlalchemy import func, select
 from .store import db
 
 MIN_REASON = 5
-BUSY_BATCH_STATUSES = ("running", "claimed", "pausing", "waiting", "queued", "staged", "paused")
+# blocked / out_of_order still resume and load data (drift override, apply-out-of-order); failed and completed do not
+BUSY_BATCH_STATUSES = ("running", "claimed", "pausing", "waiting", "queued", "staged", "paused", "blocked", "out_of_order")
 BUSY_SET_STATUSES = ("waiting", "ready")
 MEMBER_ROLES = ("onboarding", "onboarding_reviewer")
 
@@ -90,6 +91,11 @@ def archive_feed(source_id: str, actor: str, roles: list[str], reason: str) -> d
         if waiting:
             raise LifecycleError(f"this feed has {waiting} multi-file delivery(ies) still waiting for files; "
                                  "resolve or discard them before archiving")
+        reviewing = c.execute(select(func.count()).select_from(db.mappings).where(
+            db.mappings.c.source_id == source_id, db.mappings.c.status == "in_review")).scalar()
+        if reviewing:
+            raise LifecycleError("a mapping for this feed is awaiting review; the reviewer must approve or send it back "
+                                 "(or it must be withdrawn) before the feed can be archived")
         sched = db.delivery_schedules
         paused = [r[0] for r in c.execute(select(sched.c.schedule_id).where(sched.c.source_id == source_id, sched.c.status == "active"))]
         if paused:

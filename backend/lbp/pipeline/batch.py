@@ -215,12 +215,20 @@ SET_LOAD_TYPE_ERROR = ("multi-file (file-set) batches load as full in this phase
                        "are not supported for feeds with a layout")
 
 
+def _lock_source(c, source_id: str) -> None:
+    """Write-first lock on the feed row (no-op update; as multifile.fileset._lock_source and lifecycle._lock_feed):
+    serialises batch registration with archive/restore on PostgreSQL (row lock) and SQLite (database write lock)."""
+    s = db.sources
+    c.execute(s.update().where(s.c.source_id == source_id).values(source_id=s.c.source_id))
+
+
 def _register_batch(c, source_id: str, file_path, filename: str, actor: str, local: Path, digest: str, allow_duplicate: bool,
                     reason: str | None, load_type: str | None, strict: bool, file_set_id: str | None = None) -> str:
     """create_batch's body on an open connection (the caller owns the transaction). `file_set_id` links the
     batch to its multi-file set in the same insert, so a queued set batch is never visible unlinked."""
     from .delivery import LOAD_TYPES, DeliveryError, display_sequence, extract_sequence, file_action, profile_of
 
+    _lock_source(c, source_id)  # write-first row lock: an archive in flight either finishes first (seen below) or waits for us
     src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
     if not src:
         raise ValueError("unknown source")

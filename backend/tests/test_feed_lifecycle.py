@@ -479,3 +479,71 @@ def test_migration_0008_roundtrip(tmp_path, monkeypatch):
     command.upgrade(cfg, "head")
     db.reset_engine()
     config.reset_settings()
+
+
+# ------------------------------------------------------------------ review fixes
+def test_archive_refused_while_mapping_in_review(sample_files):
+    reg = _draft_feed(sample_files)
+    ms.accept_all(reg["mapping_id"], "analyst1", 0.0)
+    ms.submit(reg["mapping_id"], "analyst1")
+    with pytest.raises(LifecycleError, match="awaiting review"):
+        lifecycle.archive_feed(reg["source_id"], "ona", MEMBER, WHY)
+    assert _src(reg["source_id"]).status == "mapping" and not _audit("source.archive", reg["source_id"])
+
+
+def test_approve_refused_on_archived_feed_and_feed_stays_archived(sample_files):
+    reg = _draft_feed(sample_files)
+    sid = reg["source_id"]
+    lifecycle.archive_feed(sid, "ona", MEMBER, WHY)
+    ms.accept_all(reg["mapping_id"], "analyst1", 0.0)
+    with pytest.raises(FeedArchivedError, match="restore the feed first"):
+        ms.submit(reg["mapping_id"], "analyst1")
+    # a mapping that reached in_review some other way (e.g. before this fix) cannot be approved either
+    with db.get_engine().begin() as c:
+        c.execute(update(db.mappings).where(db.mappings.c.mapping_id == reg["mapping_id"]).values(status="in_review", reviewed_by="analyst1"))
+    with pytest.raises(FeedArchivedError, match="restore the feed first"):
+        ms.approve(reg["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"])
+    row = _src(sid)
+    assert row.status == "retired" and row.retired_reason == WHY and row.active_mapping_id is None
+    assert not _audit("mapping.approve", reg["mapping_id"])
+
+
+def test_new_version_refused_on_archived_feed(sample_files):
+    sid = _live_feed(sample_files)
+    lifecycle.archive_feed(sid, "rev", REVIEWER, WHY)
+    with pytest.raises(FeedArchivedError, match="restore the feed first"):
+        ms.new_version(sid, "ana")
+    lifecycle.restore_feed(sid, "rev", REVIEWER, "bring it back")
+    assert ms.new_version(sid, "ana")["status"] == "draft"
+
+
+@pytest.mark.parametrize("status", ["blocked", "out_of_order"])
+def test_archive_refused_while_batch_blocked_or_out_of_order(sample_files, status):
+    sid = _live_feed(sample_files)
+    _batch(sid, status)
+    with pytest.raises(LifecycleError, match="in progress"):
+        lifecycle.archive_feed(sid, "ona", REVIEWER, WHY)
+    assert _src(sid).status == "live"
+
+
+def test_create_batch_locks_feed_row_and_rechecks_archived_inside_transaction(sample_files, monkeypatch):
+    """The feed row is locked (write-first) before its status is read, so an archive that commits first is seen
+    and one that has not committed makes create_batch wait: no queued batch can slip into an archived feed."""
+    from lbp.pipeline import batch as batch_mod
+
+    sid = _live_feed(sample_files)
+    calls = []
+    real = batch_mod._lock_source
+
+    def spy(c, source_id):
+        calls.append(source_id)
+        # an archive committing just before the lock is taken (separate transaction) must be seen after it
+        lifecycle.archive_feed(sid, "rev", REVIEWER, WHY)
+        return real(c, source_id)
+
+    monkeypatch.setattr(batch_mod, "_lock_source", spy)
+    with pytest.raises(FeedArchivedError):
+        batch_mod.create_batch(sid, sample_files["pcg_retail"], "a.csv", "ops", strict=False)
+    assert calls == [sid]
+    with db.get_engine().connect() as c:
+        assert c.execute(select(db.batches)).first() is None
