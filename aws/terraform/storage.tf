@@ -1,7 +1,7 @@
 locals {
   zones = {
-    raw       = "Landing zone for source files (incoming/<source_id>/...)"
-    processed = "Chunks, processed Parquet, analytics extracts"
+    raw       = "Landing zone for source files"
+    processed = "Chunks processed Parquet and analytics extracts"
     athena    = "Athena query results"
     audit     = "CloudTrail and access logs"
   }
@@ -53,6 +53,13 @@ resource "aws_s3_bucket_lifecycle_configuration" "processed" {
     id     = "expire-chunks"
     status = "Enabled"
     filter { prefix = "chunks/" }
+    expiration { days = 14 }
+    abort_incomplete_multipart_upload { days_after_initiation = 2 }
+  }
+  rule {
+    id     = "expire-bulk-load"
+    status = "Enabled"
+    filter { prefix = "bulk-load/" }
     expiration { days = 14 }
     abort_incomplete_multipart_upload { days_after_initiation = 2 }
   }
@@ -240,11 +247,6 @@ resource "aws_dynamodb_table" "policy" {
 }
 
 # ---------------- RDS: platform tables + SSE staging
-resource "aws_db_subnet_group" "main" {
-  name       = local.name
-  subnet_ids = module.vpc.database_subnets
-}
-
 resource "aws_db_instance" "main" {
   identifier                      = local.name
   engine                          = var.db_engine
@@ -260,7 +262,7 @@ resource "aws_db_instance" "main" {
   port                            = local.db_port
   manage_master_user_password     = true
   master_user_secret_kms_key_id   = aws_kms_key.data.arn
-  db_subnet_group_name            = aws_db_subnet_group.main.name
+  db_subnet_group_name            = module.vpc.database_subnet_group_name
   vpc_security_group_ids          = [aws_security_group.db.id]
   multi_az                        = var.env == "prod"
   backup_retention_period         = 14
@@ -286,6 +288,45 @@ resource "aws_iam_role" "rds_monitoring" {
 resource "aws_iam_role_policy_attachment" "rds_monitoring" {
   role       = aws_iam_role.rds_monitoring.name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
+# RDS aws_s3.table_import_from_s3 — DB pulls CSV/text from processed bucket
+resource "aws_iam_role" "rds_s3_import" {
+  name = "${local.name}-rds-s3-import"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "rds.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "rds_s3_import" {
+  name = "s3-import"
+  role = aws_iam_role.rds_s3_import.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Resource = [aws_s3_bucket.zone["processed"].arn, "${aws_s3_bucket.zone["processed"].arn}/*"]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt", "kms:DescribeKey"]
+        Resource = [aws_kms_key.data.arn]
+      },
+    ]
+  })
+}
+
+resource "aws_db_instance_role_association" "s3_import" {
+  db_instance_identifier = aws_db_instance.main.identifier
+  feature_name           = "s3Import"
+  role_arn               = aws_iam_role.rds_s3_import.arn
 }
 
 # ---------------- OpenSearch Serverless: k-NN precedent index (exception RAG)

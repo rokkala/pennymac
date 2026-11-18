@@ -1,17 +1,19 @@
 // API client. In demo builds (VITE_DEMO=1) every call is served by the in-browser mock.
 export const DEMO = import.meta.env.VITE_DEMO === "1";
 
-export const PERSONAS = [
-  { id: "priya.analyst", label: "Priya · Data Analyst", roles: ["analyst"] },
-  { id: "dan.sme", label: "Dan · SME", roles: ["sme", "analyst"] },
-  { id: "maria.ops", label: "Maria · Boarding Ops", roles: ["ops"] },
-  { id: "lee.reviewer", label: "Lee · Exception Reviewer", roles: ["reviewer"] },
-  { id: "sam.checker", label: "Sam · Checker", roles: ["checker", "reviewer"] },
-  { id: "ana.compliance", label: "Ana · Compliance", roles: ["compliance", "checker"] },
-  { id: "admin", label: "Platform Admin", roles: ["admin", "analyst", "sme", "ops", "reviewer", "checker", "compliance"] },
+/** Fallback cast until GET /api/personas/cast loads (one Cognito group each). */
+export const FALLBACK_CAST = [
+  { id: "onboarding", label: "Onboarding", roles: ["onboarding"] },
+  { id: "onboarding.reviewer", label: "Onboarding · Reviewer", roles: ["onboarding_reviewer"] },
+  { id: "monitoring", label: "Monitoring", roles: ["monitoring"] },
+  { id: "monitoring.reviewer", label: "Monitoring · Reviewer", roles: ["monitoring_reviewer"] },
+  { id: "compliance.reviewer", label: "Compliance · Reviewer", roles: ["compliance_reviewer"] },
+  { id: "admin", label: "Platform Admin", roles: ["admin"] },
 ];
+/** @deprecated Prefer cast from /api/personas/cast; kept as FALLBACK_CAST alias. */
+export const PERSONAS = FALLBACK_CAST;
 
-let persona = PERSONAS[3];
+let persona = FALLBACK_CAST[2];
 export let SIGNED_IN = null; // set when Cognito sign-in is active (no persona switching)
 export const setSignedIn = (u) => { SIGNED_IN = u; persona = u; };
 export const setPersona = (p) => { persona = p; };
@@ -55,3 +57,101 @@ let vendorScope = (() => { try { return localStorage.getItem("lbp.vendor") || nu
 export const getVendorScope = () => vendorScope;
 export const setVendorScope = (id) => { vendorScope = id || null; try { id ? localStorage.setItem("lbp.vendor", id) : localStorage.removeItem("lbp.vendor"); } catch { /* storage unavailable */ } };
 export const scoped = (path) => (vendorScope ? `${path}${path.includes("?") ? "&" : "?"}vendor_id=${encodeURIComponent(vendorScope)}` : path);
+
+// ---- Multi-file feeds: layout, join preview, file sets ----
+const enc = encodeURIComponent;
+export const getLayout = (sourceId) => api(`/api/sources/${enc(sourceId)}/layout`);
+export const proposeLayout = (sourceId, layout, readiness) => api(`/api/sources/${enc(sourceId)}/layout`, { method: "PUT", body: { layout, readiness } });
+export const decideLayout = (sourceId, approve, comment) => api(`/api/sources/${enc(sourceId)}/layout/decide`, { method: "POST", body: { approve, comment } });
+export const archiveFeed = (sourceId, reason) => api(`/api/sources/${enc(sourceId)}/archive`, { method: "POST", body: { reason } });
+export const restoreFeed = (sourceId, reason) => api(`/api/sources/${enc(sourceId)}/restore`, { method: "POST", body: { reason } });
+export const discardMapping = (mappingId, reason) => api(`/api/mappings/${enc(mappingId)}/discard`, { method: "POST", body: { reason } });
+export const deleteFeed = (sourceId, reason) => api(`/api/sources/${enc(sourceId)}?reason=${enc(reason)}`, { method: "DELETE" });
+/** filesByRole: {role: File}. Dry run: nothing is stored. */
+export const previewJoin = (sourceId, layout, readiness, filesByRole) => {
+  const form = new FormData();
+  Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) form.append(role, file, file.name); });
+  form.append("layout", JSON.stringify(layout));
+  form.append("readiness", JSON.stringify(readiness || {}));
+  return api(`/api/sources/${enc(sourceId)}/layout/preview`, { method: "POST", form });
+};
+
+const roleForm = (filesByRole) => {
+  const form = new FormData();
+  Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) form.append(role, file, file.name); });
+  return form;
+};
+/** Sample files of a feed that does not exist yet. filesByRole: {role: File} → {role: {columns, rows_sampled, format}}. Nothing is stored. */
+export const inspectMultiFiles = (filesByRole) => api("/api/multi-file-feeds/inspect", { method: "POST", form: roleForm(filesByRole) });
+/** Dry-run join for a layout with no feed yet; problems come back as `errors` on a normal response. */
+export const previewMultiFiles = (layout, readiness, filesByRole) => {
+  const form = roleForm(filesByRole);
+  form.append("layout", JSON.stringify(layout));
+  form.append("readiness", JSON.stringify(readiness || {}));
+  return api("/api/multi-file-feeds/preview", { method: "POST", form });
+};
+/** Creates the feed, its vendor link and a draft mapping from the sample files; the layout waits for approval. */
+export const createMultiFileFeed = ({ name, description, vendorId, layout, readiness, filesByRole }) => {
+  const form = roleForm(filesByRole);
+  form.append("name", name);
+  form.append("description", description || "");
+  if (vendorId) form.append("vendor_id", vendorId);
+  form.append("layout", JSON.stringify(layout));
+  form.append("readiness", JSON.stringify(readiness || {}));
+  return api("/api/multi-file-feeds", { method: "POST", form });
+};
+export const listFileSets = (params = {}) => {
+  const q = Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${enc(v)}`).join("&");
+  return api(`/api/file-sets${q ? `?${q}` : ""}`);
+};
+export const overrideFileSet = (id, action, reason, targetKey) =>
+  api(`/api/file-sets/${enc(id)}/override`, { method: "POST", body: { action, reason, ...(targetKey ? { target_pairing_key: targetKey } : {}) } });
+/** filesByRole: {role: File}; sent as one multipart upload with a role manifest (file name per role). */
+export const uploadSet = (sourceId, filesByRole) => {
+  const form = new FormData();
+  form.append("source_id", sourceId);
+  const manifest = {};
+  Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) { form.append("files", file, file.name); manifest[role] = file.name; } });
+  form.append("manifest", JSON.stringify(manifest));
+  return api("/api/upload/set", { method: "POST", form });
+};
+
+/** One .zip for POST /api/upload/set (roles come from names inside or a manifest in the form). */
+export const uploadSetZip = (sourceId, zipFile, manifest) => {
+  const form = new FormData();
+  form.append("source_id", sourceId);
+  form.append("files", zipFile, zipFile.name);
+  if (manifest) form.append("manifest", JSON.stringify(manifest));
+  return api("/api/upload/set", { method: "POST", form });
+};
+
+const EXT_TYPE = { ".csv": "text/csv", ".txt": "text/plain", ".dat": "text/plain", ".psv": "text/plain",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" };
+
+export const presignUpload = (sourceId, filename, role) => {
+  const q = new URLSearchParams({ source_id: sourceId, filename });
+  if (role) q.set("role", role);
+  return api(`/api/upload/presign?${q}`, { method: "POST" });
+};
+
+export async function putPresigned(url, file) {
+  const ext = (file.name || "").slice(file.name.lastIndexOf(".")).toLowerCase();
+  const r = await fetch(url, { method: "PUT", body: file, headers: { "Content-Type": EXT_TYPE[ext] || "application/octet-stream" } });
+  if (!r.ok) throw new Error(`Direct upload failed (${r.status})`);
+}
+
+/** AWS: browser → raw S3; local/demo: POST /api/upload through the API. */
+export async function uploadOneFile(sourceId, file, { role, loadType, autoStart = true } = {}) {
+  if (DEMO) {
+    const form = new FormData();
+    form.append("source_id", sourceId);
+    form.append("file", file);
+    form.append("auto_start", autoStart ? "true" : "false");
+    if (loadType) form.append("load_type", loadType);
+    if (role) form.append("role", role);
+    return api("/api/upload", { method: "POST", form });
+  }
+  const { url, key } = await presignUpload(sourceId, file.name, role);
+  await putPresigned(url, file);
+  return { status: "submitted", presigned: true, key };
+}

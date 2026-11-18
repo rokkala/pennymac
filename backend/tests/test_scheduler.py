@@ -140,7 +140,7 @@ def test_schedule_validation_and_change_control(onboarded, clock, monkeypatch):
     with pytest.raises(svc.ScheduleError, match="cron"):
         svc.create_schedule(sid, "x", {**CFG, "cron": "0 25 * * *"}, "ops1", ["ops"])
     with pytest.raises(svc.ScheduleError, match="requires"):
-        svc.create_schedule(sid, "x", CFG, "rev1", ["reviewer"])
+        svc.create_schedule(sid, "x", CFG, "comp1", ["compliance"])
     with pytest.raises(svc.ScheduleError, match="miss_after"):
         svc.create_schedule(sid, "x", {**CFG, "grace_minutes": 300, "miss_after_minutes": 60}, "ops1", ["ops"])
     # pull configs: host allow-list, pinned host key, secret prefix

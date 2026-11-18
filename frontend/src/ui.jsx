@@ -1,5 +1,7 @@
 import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, createContext, useContext } from "react";
+import { createPortal } from "react-dom";
 import { api } from "./api.js";
+import { helpTipFixedPos } from "./helpTipPos.js";
 
 export const fmt = (n, d = 0) => (n === null || n === undefined || Number.isNaN(n) ? "—" : Number(n).toLocaleString("en-US", { maximumFractionDigits: d, minimumFractionDigits: d }));
 export const fmtCompact = (n) => (n === null || n === undefined ? "—" : Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(n));
@@ -30,7 +32,8 @@ export const useToast = () => useContext(ToastCtx);
 export function useApi(path, deps = [], { poll } = {}) {
   const [state, setState] = useState({ data: null, error: null, loading: true });
   const load = useCallback(async () => {
-    if (!path) return;
+    if (!path) { setState({ data: null, error: null, loading: false }); return; }
+    setState((s) => ({ ...s, loading: true, error: null }));
     try { const data = await api(path); setState({ data, error: null, loading: false }); }
     catch (e) { setState((s) => ({ ...s, error: e.message, loading: false })); }
   }, [path]);
@@ -71,14 +74,14 @@ export const Kpis = ({ items }) => (
 );
 
 const STATUS_CLASS = { PASS: "pass", completed: "pass", resolved: "pass", approved: "pass", active: "pass", live: "pass", accepted: "pass", auto_applied: "pass",
-  WARN: "warn", running: "accent", in_review: "warn", pending_checker: "warn", needs_review: "warn", canary: "accent", shadow: "accent", overridden: "accent", suggested: "accent", mapping: "warn", draft: "", paused: "warn",
+  WARN: "warn", running: "accent", pausing: "warn", in_review: "warn", pending_checker: "warn", needs_review: "warn", canary: "accent", shadow: "accent", overridden: "accent", suggested: "accent", mapping: "warn", draft: "", paused: "warn",
   FAIL: "fail", failed: "fail", rejected: "fail", escalated: "fail", open: "warn", pending_review: "warn", retired: "", blocked: "fail", superseded: "",
   pass: "pass", warn: "warn", block: "fail", claimed: "accent", queued: "",
   expected: "", received: "pass", received_late: "warn", late: "warn", missed: "fail", waived: "", pending_approval: "warn",
   waiting: "warn", out_of_order: "fail", discarded: "", UNCHANGED: "" };
 export const Status = ({ s }) => <span className={`pill ${STATUS_CLASS[s] ?? ""}`}>{human(s)}</span>;
 export const Tier = ({ t }) => <span className={`tier ${t}`} title={TIER_NAMES[t]}>{t}</span>;
-export const TIER_NAMES = { T1: "Auto-Apply", T2: "Suggest", T3: "Mandatory Review", T4: "Dual Control", T5: "Block & Escalate" };
+export const TIER_NAMES = { T1: "Already applied", T2: "Suggest a fix", T3: "Review", T4: "Needs a second person", T5: "Holds" };
 
 export const Conf = ({ v }) => {
   if (v === null || v === undefined) return <span className="faint">—</span>;
@@ -217,17 +220,136 @@ export const Field = ({ id, label, hint, children }) => (
   <label className="stack" style={{ gap: 4 }} htmlFor={id}><span className="eyebrow">{label}</span>{children}{hint && <span className="faint" style={{ fontSize: ".76rem" }}>{hint}</span>}</label>
 );
 
+/** Compact “?” help control: click toggles a popup; Escape / outside click closes.
+ *  Popup is portaled to document.body so tab overflow:auto cannot clip it. */
+export function HelpTip({ label, title, who, children }) {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState(null);
+  const btnWrap = useRef(null);
+  const popRef = useRef(null);
+  useLayoutEffect(() => {
+    if (!open || !btnWrap.current) { setPos(null); return undefined; }
+    const place = () => setPos(helpTipFixedPos(btnWrap.current.getBoundingClientRect()));
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [open]);
+  useEffect(() => {
+    if (!open) return undefined;
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    const onDoc = (e) => {
+      if (btnWrap.current?.contains(e.target) || popRef.current?.contains(e.target)) return;
+      setOpen(false);
+    };
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onDoc);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onDoc);
+    };
+  }, [open]);
+  return (
+    <span className="help-tip" ref={btnWrap}>
+      <button
+        type="button"
+        className="help-tip-btn"
+        aria-label={`Help: ${label}`}
+        aria-expanded={open}
+        aria-haspopup="dialog"
+        onClick={(e) => { e.stopPropagation(); setOpen((o) => !o); }}
+      >
+        ?
+      </button>
+      {open && pos && createPortal(
+        <div
+          ref={popRef}
+          className="help-tip-pop"
+          role="dialog"
+          aria-label={title}
+          style={{ position: "fixed", top: pos.top, left: pos.left }}
+        >
+          <b className="help-tip-title">{title}</b>
+          <p className="help-tip-body">{children}</p>
+          {who && <p className="help-tip-who"><span className="eyebrow">Who acts</span>{who}</p>}
+        </div>,
+        document.body,
+      )}
+    </span>
+  );
+}
+
 export const Tabs = ({ tabs, value, onChange }) => (
   <div className="tabs" role="tablist">
     {tabs.map((t) => (
-      <button key={t.id} role="tab" aria-selected={value === t.id} className={`tab ${value === t.id ? "on" : ""}`} onClick={() => onChange(t.id)}>
-        {t.label}{t.count !== undefined && <span className="c">{t.count}</span>}
-      </button>
+      <div key={t.id} className="tab-wrap">
+        <button type="button" role="tab" aria-selected={value === t.id} className={`tab ${value === t.id ? "on" : ""}`} onClick={() => onChange(t.id)}>
+          {t.label}{t.count !== undefined && <span className="c">{t.count}</span>}
+        </button>
+        {t.help && (
+          <HelpTip label={t.label} title={t.help.title} who={t.help.who}>{t.help.body}</HelpTip>
+        )}
+      </div>
     ))}
   </div>
 );
 
 export const Loading = ({ error }) => <div className="empty">{error ? `Could not load: ${error}` : "Loading…"}</div>;
+
+/** Page chrome: eyebrow + title + sub + primary/secondary actions + optional guide link. */
+export function PageHeader({ eyebrow, title, sub, primary, secondary, guideHref }) {
+  return (
+    <div className="page-head">
+      <div>
+        {eyebrow && <span className="eyebrow">{eyebrow}</span>}
+        <h1>{title}</h1>
+        {sub && <p className="sub">{sub}</p>}
+        {guideHref && <a className="guide-link" href={guideHref}>Why this step</a>}
+      </div>
+      {(primary || secondary) && (
+        <div className="row page-head-actions">
+          {secondary}
+          {primary}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** One primary action, then quieter secondary actions. */
+export function ActionBar({ primary, children }) {
+  return (
+    <div className="action-bar row">
+      {primary}
+      {children}
+    </div>
+  );
+}
+
+export function EmptyState({ title, body, action }) {
+  return (
+    <div className="empty-state">
+      <h2>{title}</h2>
+      {body && <p className="muted">{body}</p>}
+      {action}
+    </div>
+  );
+}
+
+export function QueueCard({ title, detail, cta, onClick }) {
+  return (
+    <button type="button" className="queue-card" onClick={onClick}>
+      <span className="stack" style={{ gap: 4, textAlign: "left" }}>
+        <span className="queue-card-title">{title}</span>
+        <span className="muted" style={{ fontSize: ".85rem" }}>{detail}</span>
+      </span>
+      <span className="queue-card-cta">{cta}</span>
+    </button>
+  );
+}
 
 export const Transform = ({ steps }) => (
   <span className="row" style={{ gap: 4 }}>

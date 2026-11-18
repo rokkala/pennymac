@@ -1,0 +1,139 @@
+"""Analytics grain: vendor and file-load."""
+
+from datetime import timedelta
+
+
+def test_import_status_includes_exception_counts_per_batch(client, onboarded, sample_files):
+    from lbp.pipeline.batch import create_batch, run_batch
+
+    src = onboarded["correspondent"]
+    bid = create_batch(src["source_id"], sample_files["correspondent"], "correspondent_sample.csv", "ops")
+    run_batch(bid, workers=1)
+
+    data = client.get("/api/analytics/import-status").json()
+    row = next(b for b in data["batches"] if b["batch_id"] == bid)
+    assert "exceptions" in row
+    assert "open_exceptions" in row
+    assert row["exceptions"] >= row["open_exceptions"] >= 0
+    # boarding the sample file always raises exceptions in this fixture set
+    assert row["exceptions"] > 0
+    assert row["vendor_name"]
+    assert row["filename"]
+
+
+def test_import_status_filters_status_days_and_q(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch, run_batch
+    from lbp.store import db
+
+    src = onboarded["correspondent"]
+    done = create_batch(src["source_id"], sample_files["correspondent"], "correspondent_sample.csv", "ops")
+    run_batch(done, workers=1)
+    fail = create_batch(src["source_id"], sample_files["correspondent"], "fail_tape.csv", "ops",
+                        allow_duplicate=True, reason="test duplicate for filters")
+    with db.get_engine().begin() as c:
+        c.execute(db.batches.update().where(db.batches.c.batch_id == fail).values(status="failed", error="test"))
+
+    since = db.now() - timedelta(days=30)
+    data = import_status(limit=50, statuses=["completed"], since=since, q="correspondent_sample")
+    assert "attention" in data
+    assert data["batches"]
+    assert all(b["status"] == "completed" for b in data["batches"])
+    assert all("correspondent_sample" in b["filename"] for b in data["batches"])
+
+
+def test_attention_not_capped_by_limit(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch
+    from lbp.store import db
+
+    src = onboarded["correspondent"]
+    a = create_batch(src["source_id"], sample_files["correspondent"], "attn_a.csv", "ops",
+                     allow_duplicate=True, reason="attention fixture a")
+    b = create_batch(src["source_id"], sample_files["correspondent"], "attn_b.csv", "ops",
+                     allow_duplicate=True, reason="attention fixture b")
+    with db.get_engine().begin() as c:
+        c.execute(db.batches.update().where(db.batches.c.batch_id.in_((a, b))).values(status="failed", error="test"))
+
+    data = import_status(limit=1, since=db.now() - timedelta(days=30))
+    assert data["attention"] >= 2
+    assert len(data["batches"]) == 1
+
+
+def test_running_not_capped_by_limit(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch
+    from lbp.store import db
+
+    src = onboarded["correspondent"]
+    a = create_batch(src["source_id"], sample_files["correspondent"], "run_a.csv", "ops",
+                     allow_duplicate=True, reason="running fixture a")
+    b = create_batch(src["source_id"], sample_files["correspondent"], "run_b.csv", "ops",
+                     allow_duplicate=True, reason="running fixture b")
+    with db.get_engine().begin() as c:
+        c.execute(db.batches.update().where(db.batches.c.batch_id.in_((a, b)))
+                  .values(status="running", throughput_lps=10.0))
+
+    data = import_status(limit=1, since=db.now() - timedelta(days=30))
+    assert data["running"] >= 2
+    assert len(data["batches"]) == 1
+    assert data["current_throughput_lps"] >= 20.0
+
+
+def test_import_status_q_escapes_like_wildcards(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch
+
+    src = onboarded["correspondent"]
+    create_batch(src["source_id"], sample_files["correspondent"], "plain.csv", "ops",
+                 allow_duplicate=True, reason="wildcard plain")
+    create_batch(src["source_id"], sample_files["correspondent"], "has%percent.csv", "ops",
+                 allow_duplicate=True, reason="wildcard percent")
+    with_pct = import_status(limit=50, q="has%percent")
+    assert [b["filename"] for b in with_pct["batches"]] == ["has%percent.csv"]
+    # bare "%" must not act as "match everything" — only rows whose name contains %
+    bare = import_status(limit=50, q="%")
+    assert all("%" in b["filename"] for b in bare["batches"])
+    assert not any(b["filename"] == "plain.csv" for b in bare["batches"])
+
+
+def test_import_status_q_respects_vendor_scope(onboarded, sample_files):
+    from lbp.analytics.service import import_status
+    from lbp.pipeline.batch import create_batch
+    from lbp.store import db
+
+    a = onboarded["correspondent"]
+    b = onboarded["sub_servicing"]
+    create_batch(a["source_id"], sample_files["correspondent"], "scoped_pcg.csv", "ops",
+                 allow_duplicate=True, reason="scope fixture")
+    data = import_status(limit=50, source_ids=[b["source_id"]], q="scoped_pcg")
+    assert data["batches"] == []
+
+
+def test_batches_bad_days_returns_400(client):
+    assert client.get("/api/batches?days=99").status_code == 400
+
+
+def test_batches_since_after_until_returns_400(client):
+    r = client.get("/api/batches?since=2026-11-07T00:00:00Z&until=2026-11-01T00:00:00Z")
+    assert r.status_code == 400
+
+
+def test_batches_days_with_aware_until_does_not_500(client):
+    """days uses naive UTC now; until may arrive as Z — must not TypeError on compare."""
+    r = client.get("/api/batches?days=7&until=2026-11-07T00:00:00Z&limit=1")
+    assert r.status_code == 200
+    assert "batches" in r.json()
+
+
+def test_batches_http_filters_status_and_days(client, onboarded, sample_files):
+    from lbp.pipeline.batch import create_batch, run_batch
+
+    src = onboarded["correspondent"]
+    bid = create_batch(src["source_id"], sample_files["correspondent"], "http_filter.csv", "ops",
+                       allow_duplicate=True, reason="http filter")
+    run_batch(bid, workers=1)
+    data = client.get("/api/batches?status=completed&days=30&limit=50&q=http_filter").json()
+    assert "attention" in data
+    assert data["batches"]
+    assert all(b["status"] == "completed" for b in data["batches"])

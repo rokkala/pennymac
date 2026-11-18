@@ -48,6 +48,25 @@ def on_file_arrival(event, _ctx):
     source_id = parts[1]
     head = s3.head_object(Bucket=bucket, Key=key)
     meta = head.get("Metadata", {})
+    from lbp.lifecycle import FeedArchivedError, assert_not_archived
+
+    try:
+        assert_not_archived(source_id)
+    except FeedArchivedError:  # an archived feed accepts nothing: alerted, never queued
+        from lbp.scheduling.alerts import notify
+
+        msg = f"{Path(key).name} was refused: feed {source_id} is archived"
+        notify("file_rejected", msg, {"source_id": source_id, "key": key})
+        return {"rejected": msg, "key": key}
+    from lbp.config_store import ConfigError
+    from lbp.multifile.fileset import feed_layout
+
+    try:
+        layout = feed_layout(source_id)
+    except ConfigError as e:  # a multi-file feed whose published configuration cannot be read
+        return _reject_arrival(source_id, key, e)
+    if layout:
+        return _attach_arrival(source_id, bucket, key, meta)
     try:
         # strict=False: a file that cannot be sequenced (or a suspended vendor's file) is recorded as a failed batch, not dropped
         batch_id = create_batch(source_id, f"s3://{bucket}/{key}", Path(key).name, meta.get("submitted-by", "s3-auto-arrival"),
@@ -64,6 +83,43 @@ def on_file_arrival(event, _ctx):
     return {"batch_id": batch_id, "execution_arn": None if status == "failed" else dispatch(batch_id)}
 
 
+def _reject_arrival(source_id: str, key: str, e: Exception) -> dict:
+    """Alert on a multi-file arrival that cannot be attached (never dropped silently; no message text that may
+    carry data values)."""
+    from lbp.multifile.fileset import safe_message
+    from lbp.scheduling.alerts import notify
+
+    msg = f"{Path(key).name} for feed {source_id} could not be attached to a file set: {safe_message(e)}"
+    notify("file_set_rejected", msg, {"source_id": source_id, "key": key})
+    return {"rejected": msg, "key": key}
+
+
+def _attach_arrival(source_id: str, bucket: str, key: str, meta: dict) -> dict:
+    """A file of a multi-file feed: attach it to its file set (role from the object's `role` metadata, else by
+    name). Unattended (strict=False): a set batch that cannot be sequenced is recorded as failed; a file that
+    cannot be attached at all is alerted, never dropped silently. Messages carry names and ids, never contents."""
+    from sqlalchemy import select
+
+    from lbp.dispatch import dispatch
+    from lbp.multifile.fileset import attach_file
+    from lbp.pipeline.batch import DuplicateFileError
+    from lbp.store import db
+
+    try:
+        r = attach_file(source_id, Path(key).name, f"s3://{bucket}/{key}", meta.get("submitted-by", "s3-auto-arrival"),
+                        role=meta.get("role") or None, strict=False)
+    except DuplicateFileError as e:
+        log.warning("duplicate file set ignored: %s", e)
+        return {"duplicate_of": e.batch_id, "key": key}
+    except ValueError as e:
+        return _reject_arrival(source_id, key, e)
+    if not r["batch_id"]:
+        return {**r, "execution_arn": None}
+    with db.get_engine().connect() as c:
+        status = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == r["batch_id"])).scalar()
+    return {**r, "execution_arn": None if status == "failed" else dispatch(r["batch_id"])}
+
+
 # ---------------------------------------------------------------- 2. route
 def route_batch(event, _ctx):
     """Choose the Glue job. Spark only pays off for very large full tapes in a splittable format;
@@ -75,9 +131,11 @@ def route_batch(event, _ctx):
     batch_id = event["batch_id"]
     with db.get_engine().connect() as c:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        if not b:
+            raise ValueError(f"unknown batch {batch_id}")
         fmt = c.execute(select(db.sources.c.format).where(db.sources.c.source_id == b.source_id)).scalar()
     spark = (b.load_type or "full") == "full" and fmt in ("csv", "txt", "psv", "dat") and (b.total_rows or 0) > SPARK_THRESHOLD_ROWS \
-        and (b.checkpoint or 0) == 0
+        and (b.checkpoint or 0) == 0 and not b.file_set_id  # multi-file sets: standard engine only (join stage)
     job = GLUE_SPARK_JOB if spark else GLUE_FEED_JOB
     return {**event, "job_name": job, "engine": "spark" if spark else "standard", "total_rows": b.total_rows,
             "load_type": b.load_type or "full"}
@@ -94,6 +152,8 @@ def finalize_batch(event, _ctx):
     batch_id = event["batch_id"]
     with db.get_engine().connect() as c:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        if not b:
+            raise ValueError(f"unknown batch {batch_id}")
         follow = [r[0] for r in c.execute(select(db.batches.c.batch_id).where(
             db.batches.c.source_id == b.source_id, db.batches.c.status == "queued", db.batches.c.batch_id != batch_id,
             db.batches.c.load_type != "full").order_by(db.batches.c.sequence))] if b.status == "completed" else []
@@ -105,24 +165,52 @@ def finalize_batch(event, _ctx):
 
 
 def mark_failed(event, _ctx):
+    from sqlalchemy import not_, or_
+
     from lbp.store import db
 
     batch_id = event.get("batch_id")
     err = json.dumps(event.get("error", {}))[:2000]
+    # force=true: reopen a completed batch for re-persist tests (also resets checkpoint).
+    force = bool(event.get("force"))
+    values = {"status": "failed", "error": err, "worker_id": None}
+    if force:
+        values["checkpoint"] = 0
+        values["finished_at"] = None
     with db.get_engine().begin() as c:
-        c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status != "completed")
-                  .values(status="failed", error=err, worker_id=None))
-        db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err})
-    return {"batch_id": batch_id, "status": "failed"}
+        q = db.batches.update().where(db.batches.c.batch_id == batch_id)
+        if not force:
+            # Never clobber an active worker (e.g. duplicate SFN for the same batch hit BatchBusyError).
+            q = q.where(db.batches.c.status.notin_(("completed", "running", "pausing")))
+            # run_batch already failed it because its feed is archived: keep that plain reason, not the Glue error
+            q = q.where(or_(db.batches.c.error.is_(None), not_(db.batches.c.error.startswith("feed archived"))))
+        c.execute(q.values(**values))
+        db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err, "force": force})
+    return {"batch_id": batch_id, "status": "failed", "force": force}
 
 
 # ---------------------------------------------------------------- 4. delivery scheduler
 def scheduler_tick(_event, _ctx):
     """EventBridge Scheduler (rate 5 minutes): delivery windows and late/missed alerts. Due pulls start the
-    lbp-vendor-pull Glue job; pulled files land in the raw zone and arrive like any other file."""
+    lbp-vendor-pull Glue job; pulled files land in the raw zone and arrive like any other file. Batches the
+    tick queued (multi-file sets released by the file-set sweep) are started here."""
+    from sqlalchemy import select
+
+    from lbp.dispatch import dispatch
     from lbp.scheduling.service import tick
+    from lbp.store import db
 
     res = tick()
+    # batches the tick queued itself (file sets made ready by a timeout or retried by the sweep) start here, like
+    # the local scheduler thread does; pulled files in AWS land in the raw zone and are started by on_file_arrival
+    for bid in res.get("batches", []):
+        try:  # one batch failing to start never skips the others (it stays queued)
+            with db.get_engine().connect() as c:
+                status = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == bid)).scalar()
+            if status != "failed":
+                dispatch(bid)
+        except Exception as e:  # noqa: BLE001 - logged by batch id and error class only (no text that may carry data)
+            log.warning("scheduler tick: could not start batch %s (%s)", bid, e.__class__.__name__)
     out = {k: (len(v) if isinstance(v, list) else v) for k, v in res.items()}
     log.info("scheduler tick: %s", json.dumps(out, default=str))
     return out
@@ -144,6 +232,35 @@ def migrate(_event, _ctx):
     if code:
         raise RuntimeError(f"migration failed: {out}")
     return out
+
+
+def demo_setup(event, _ctx):
+    """Load the compact demo scenario into RDS. Invoked directly; not exposed on the API."""
+    import os
+
+    os.environ["LBP_DATA_DIR"] = "/tmp/lbp-data"
+    from lbp import config
+    from lbp.demo_setup import DemoSetupConflict, run_demo_setup
+    from lbp.store import db
+
+    config.reset_settings()
+    db.reset_engine()
+    event = event or {}
+    if event.get("reset"):
+        from sqlalchemy import text
+
+        with db.get_engine().begin() as conn:
+            names = [r[0] for r in conn.execute(text(
+                "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'alembic_version'"
+            ))]
+            if names:
+                conn.execute(text("TRUNCATE " + ", ".join(f'"{n}"' for n in names) + " RESTART IDENTITY CASCADE"))
+        db.reset_engine()
+    try:
+        result = run_demo_setup(scale=event.get("scale") or "compact", force=bool(event.get("force")))
+    except DemoSetupConflict as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, **result.to_dict()}
 
 
 # ---------------------------------------------------------------- API (control plane)

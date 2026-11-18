@@ -48,7 +48,7 @@ variable "sse_throttle_rps" {
 }
 
 variable "glue_threshold_rows" {
-  description = "Full tapes above this many rows run on the Spark job (lbp-feed-spark); everything else on lbp-feed"
+  description = "Full tapes above this many rows run on the Spark job (lbp-feed-spark); everything else on lbp-feed. Raise above the tape size (e.g. 2e6) for a 1M-row standard-path A/B."
   type        = number
   default     = 500000
 }

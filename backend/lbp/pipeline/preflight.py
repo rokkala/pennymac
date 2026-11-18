@@ -60,10 +60,14 @@ def _rename_guess(missing: str, candidates: list[str], old_prof: dict | None, ne
 
 
 def check_file(file_path: Path, parse_options: dict | None, source_profile: dict | None, fields: list[dict], n: int = 500,
-               sparse: bool = False, delivery: dict | None = None) -> dict:
+               sparse: bool = False, delivery: dict | None = None, joined_columns: list[str] | None = None) -> dict:
     """sparse=True for incremental change files: vendors may send only the loan number plus changed
     columns, so a missing non-key column is informational and blank rates are expected to be high.
-    The loan-number column (and the action column, when actions come from a column) still block."""
+    The loan-number column (and the action column, when actions come from a column) still block.
+
+    joined_columns (multi-file feeds, checking the joined file against the master's profile): the detail
+    `role.col` columns and aggregate outputs the join added. They are reported under `joined_columns`, never
+    as new columns, and never block by themselves; a mapped one that is missing still counts as missing."""
     meta, rows = read_sample(Path(file_path), n, ParseOptions(**(parse_options or {})))
     new_profile = profile_rows(meta.columns, rows) if rows else {"columns": []}
     new_cols = {c["name"]: c for c in new_profile["columns"]}
@@ -71,7 +75,8 @@ def check_file(file_path: Path, parse_options: dict | None, source_profile: dict
     feeds = _feeds(fields)
     actual = set(meta.columns)
 
-    unknown_new = [c for c in meta.columns if c not in old_cols]
+    joined = set(joined_columns or [])
+    unknown_new = [c for c in meta.columns if c not in old_cols and c not in joined]
     missing = []
     for col, targets in feeds.items():
         if col in actual:
@@ -127,11 +132,14 @@ def check_file(file_path: Path, parse_options: dict | None, source_profile: dict
         new_columns = [nc for nc in new_columns if nc["column"] in unknown_new]
     issues = len([m for m in missing if not m.get("sparse_ok")]) + len(type_drift) + len(null_spikes) + len([c for c in unknown_new if c not in renamed_targets])
     decision = "block" if blocking else ("warn" if issues else "pass")
-    return {
+    out = {
         "decision": decision, "rows_sampled": len(rows), "columns_in_file": len(meta.columns), "columns_expected": len(feeds),
         "missing_columns": missing, "new_columns": new_columns, "type_drift": type_drift, "null_spikes": null_spikes,
         "summary": _summary(decision, missing, type_drift, null_spikes, new_columns),
     }
+    if joined_columns is not None:
+        out["joined_columns"] = [c for c in meta.columns if c in joined]
+    return out
 
 
 def _summary(decision, missing, type_drift, null_spikes, new_columns) -> str:

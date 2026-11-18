@@ -222,7 +222,9 @@ def propose_profile(source_id: str, profile: dict, actor: str, roles: list[str])
 
     from ..store import db
 
-    if not set(roles) & {"analyst", "sme", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"onboarding", "onboarding_reviewer", "admin"}:
         raise DeliveryError("Analyst or SME role required")
     with db.get_engine().begin() as c:
         src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
@@ -243,7 +245,9 @@ def decide_profile(source_id: str, actor: str, roles: list[str], approve: bool, 
 
     from ..store import db
 
-    if not set(roles) & {"sme", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"onboarding_reviewer", "admin"}:
         raise DeliveryError("SME role required")
     with db.get_engine().begin() as c:
         src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id).with_for_update()).first()

@@ -1,0 +1,111 @@
+{
+  "description": "Half the masters have a detail and half the details have a master. min_match_rate applies to the master-side rate, and also to the detail side when on_orphan_detail is exception. Below the threshold the join still completes and reports blocked; 0.4 passes.",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "variants": [
+    {
+      "id": "strict_exception",
+      "relation": {
+        "min_match_rate": 0.9,
+        "on_orphan_detail": "exception"
+      },
+      "expected_rows": "expected.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 2
+        },
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 4
+        }
+      ],
+      "expected_blocked": "relation details->master: master match rate 50.0% is below min_match_rate 90.0%; relation details->master: details match rate 50.0% is below min_match_rate 90.0%"
+    },
+    {
+      "id": "strict_drop",
+      "relation": {
+        "min_match_rate": 0.9,
+        "on_orphan_detail": "drop"
+      },
+      "expected_rows": "expected.csv",
+      "expected_exceptions": [],
+      "expected_blocked": "relation details->master: master match rate 50.0% is below min_match_rate 90.0%"
+    },
+    {
+      "id": "lenient",
+      "relation": {
+        "min_match_rate": 0.4,
+        "on_orphan_detail": "exception"
+      },
+      "expected_rows": "expected.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 2
+        },
+        {
+          "code": "JOIN01",
+          "role": "details",
+          "row_number": 4
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 4,
+          "matched": 2,
+          "orphaned": 0,
+          "rejected": 0
+        },
+        "details": {
+          "rows_in": 4,
+          "matched": 2,
+          "orphaned": 2,
+          "rejected": 0
+        }
+      }
+    }
+  ]
+}

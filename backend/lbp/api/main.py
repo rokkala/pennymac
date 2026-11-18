@@ -32,10 +32,11 @@ from sqlalchemy import func, select, text
 from .. import samples
 from ..analytics import service as analytics
 from ..config import get_settings
-from ..dispatch import aws_mode, dispatch, start_glue
+from ..dispatch import aws_mode, dispatch, dispatchable, start_glue
 from ..exceptions.manager import ExceptionActionError, ExceptionManager
 from ..exceptions.policy import DEFAULT_POLICY, TIER_LABELS, PolicyError, get_policy, set_policy
 from ..ingestion.parser import read_sample
+from ..lifecycle import FeedArchivedError
 from ..ingestion.profiler import profile_rows
 from ..mapping import service as mapping_svc
 from ..mapping.engine import suggest_mappings
@@ -47,7 +48,8 @@ from ..rules.jsonlogic import apply as jl_apply
 from ..rules.jsonlogic import validate as jl_validate
 from ..rules.registry import RuleError, RuleRegistry, run_tests
 from ..rules.shapes import ShapeError, catalog as shape_catalog
-from ..rules.shapes import compile_tree, decompile, fields_payload, templates as rule_templates
+from ..rules.shapes import compile_tree, decompile, fields_payload, pattern_presets
+from ..rules import template_store as rule_tpl
 from ..schema.sse_target import as_dicts
 from ..security import Principal, current_principal
 from ..store import db
@@ -55,8 +57,12 @@ from ..store import db
 log = logging.getLogger("lbp.api")
 
 PUBLIC = {("GET", "/api/health"), ("GET", "/api/ready"), ("GET", "/api/config")}
-EDIT_MAPPING = ("analyst", "sme")
-WORK_EXCEPTIONS = ("reviewer", "checker", "compliance")
+# Member roles; *_reviewer principals also carry the member role via expand_roles().
+EDIT_MAPPING = ("onboarding",)
+WORK_EXCEPTIONS = ("monitoring", "compliance")
+ONBOARDING_REVIEW = ("onboarding_reviewer",)
+MONITORING_REVIEW = ("monitoring_reviewer",)
+COMPLIANCE_REVIEW = ("compliance_reviewer",)
 ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/ai-map"): EDIT_MAPPING,
     ("POST", "/api/sources"): EDIT_MAPPING,
@@ -69,67 +75,92 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/mappings/{mapping_id}/fields/{target}/inspect"): EDIT_MAPPING,
     ("POST", "/api/mappings/{mapping_id}/accept-all"): EDIT_MAPPING,
     ("POST", "/api/mappings/{mapping_id}/submit"): EDIT_MAPPING,
-    ("POST", "/api/mappings/{mapping_id}/approve"): ("sme",),
-    ("POST", "/api/upload"): ("ops",),
-    ("POST", "/api/upload/presign"): ("ops",),
-    ("POST", "/api/batches/{batch_id}/pause"): ("ops",),
-    ("POST", "/api/batches/{batch_id}/resume"): ("ops", "sme"),
-    ("POST", "/api/batches/{batch_id}/override-preflight"): ("sme", "compliance"),
+    ("POST", "/api/mappings/{mapping_id}/approve"): ONBOARDING_REVIEW,
+    ("POST", "/api/upload"): ("monitoring",),
+    ("POST", "/api/upload/presign"): ("monitoring",),
+    ("POST", "/api/upload/set"): ("monitoring",),
+    ("POST", "/api/batches/{batch_id}/pause"): ("monitoring",),
+    ("POST", "/api/batches/{batch_id}/resume"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/batches/{batch_id}/override-preflight"): ("onboarding_reviewer", "compliance_reviewer"),
     ("POST", "/api/batches/{batch_id}/remap"): EDIT_MAPPING,
-    ("POST", "/api/batches/{batch_id}/replay"): ("ops", "sme"),
+    ("POST", "/api/batches/{batch_id}/replay"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/exceptions/{exception_id}/resolve"): WORK_EXCEPTIONS,
-    ("POST", "/api/exceptions/{exception_id}/checker"): ("checker", "compliance"),
+    ("POST", "/api/exceptions/{exception_id}/checker"): MONITORING_REVIEW,
     ("POST", "/api/exceptions/{exception_id}/reject"): WORK_EXCEPTIONS,
+    ("POST", "/api/exceptions/{exception_id}/acknowledge"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/escalate"): WORK_EXCEPTIONS,
-    ("POST", "/api/exceptions/{exception_id}/compliance-clear"): ("compliance",),
-    ("POST", "/api/exceptions/{exception_id}/rollback"): ("reviewer", "checker"),
+    ("POST", "/api/exceptions/{exception_id}/compliance-clear"): COMPLIANCE_REVIEW,
+    ("POST", "/api/exceptions/{exception_id}/rollback"): ("monitoring", "monitoring_reviewer"),
     ("POST", "/api/exceptions/{exception_id}/qa"): WORK_EXCEPTIONS,
     ("POST", "/api/exceptions/{exception_id}/ai-suggest"): WORK_EXCEPTIONS,
-    ("POST", "/api/exceptions/bulk-resolve"): ("reviewer", "checker"),
-    ("POST", "/api/rules"): ("sme", "compliance"),
-    ("PUT", "/api/rules/{rule_id}/{version}"): ("sme", "compliance"),
-    ("POST", "/api/rules/{rule_id}/{version}/transition"): ("sme", "compliance"),
-    ("POST", "/api/rules/author"): ("sme", "compliance", "analyst"),
-    ("POST", "/api/rules/compose"): ("sme", "compliance", "analyst"),
-    ("POST", "/api/rules/test"): ("sme", "compliance", "analyst"),
-    ("GET", "/api/rules/fields"): ("sme", "compliance", "analyst", "ops", "reviewer"),
-    ("GET", "/api/rules/shapes"): ("sme", "compliance", "analyst", "ops", "reviewer"),
-    ("GET", "/api/rules/templates"): ("sme", "compliance", "analyst", "ops", "reviewer"),
-    ("PUT", "/api/policy"): ("compliance",),
-    ("POST", "/api/analytics/ask"): ("analyst", "sme", "ops", "reviewer", "checker", "compliance"),
+    ("POST", "/api/exceptions/bulk-resolve"): ("monitoring", "monitoring_reviewer"),
+    ("POST", "/api/rules"): ("onboarding", "compliance_reviewer"),
+    ("PUT", "/api/rules/{rule_id}/{version}"): ("onboarding", "compliance_reviewer"),
+    ("POST", "/api/rules/{rule_id}/{version}/transition"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("DELETE", "/api/rules/{rule_id}"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/rules/author"): EDIT_MAPPING,
+    ("POST", "/api/rules/compose"): EDIT_MAPPING,
+    ("POST", "/api/rules/test"): EDIT_MAPPING,
+    ("GET", "/api/rules/fields"): ("onboarding", "monitoring", "compliance"),
+    ("GET", "/api/rules/shapes"): ("onboarding", "monitoring", "compliance"),
+    ("GET", "/api/rules/templates"): ("onboarding", "monitoring", "compliance"),
+    ("POST", "/api/maintenance/rule-templates"): ("onboarding_reviewer", "admin"),
+    ("PUT", "/api/maintenance/rule-templates/{template_id}"): ("onboarding_reviewer", "admin"),
+    ("POST", "/api/maintenance/rule-templates/{template_id}/hide"): ("onboarding_reviewer", "admin"),
+    ("POST", "/api/maintenance/rule-templates/{template_id}/unhide"): ("onboarding_reviewer", "admin"),
+    ("DELETE", "/api/maintenance/rule-templates/{template_id}"): ("onboarding_reviewer", "admin"),
+    ("PUT", "/api/policy"): COMPLIANCE_REVIEW,
+    ("POST", "/api/analytics/ask"): ("onboarding", "monitoring", "compliance"),
     ("POST", "/api/demo/seed"): ("admin",),
     ("POST", "/api/demo/setup"): ("admin",),
-    ("POST", "/api/admin/retention/purge"): ("compliance",),
+    ("POST", "/api/admin/retention/purge"): COMPLIANCE_REVIEW,
     # vendors
     ("POST", "/api/vendors"): EDIT_MAPPING,
-    ("PUT", "/api/vendors/{vendor_id}"): EDIT_MAPPING + ("compliance",),
-    ("POST", "/api/sources/{source_id}/vendor"): ("sme",),
-    ("POST", "/api/sources/{source_id}/publish"): ("sme",),
+    ("PUT", "/api/vendors/{vendor_id}"): EDIT_MAPPING + COMPLIANCE_REVIEW,
+    ("POST", "/api/sources/{source_id}/vendor"): ONBOARDING_REVIEW,
+    ("POST", "/api/sources/{source_id}/publish"): ONBOARDING_REVIEW,
+    # feed lifecycle (a live feed needs the reviewer role: enforced in lbp.lifecycle)
+    ("POST", "/api/sources/{source_id}/archive"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/restore"): EDIT_MAPPING,
+    ("POST", "/api/mappings/{mapping_id}/discard"): EDIT_MAPPING,
+    ("DELETE", "/api/sources/{source_id}"): ("admin",),
     # incremental loads, sequencing, delivery scheduler
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
-    ("POST", "/api/sources/{source_id}/delivery/approve"): ("sme",),
-    ("POST", "/api/batches/{batch_id}/skip-gap"): ("ops", "sme"),
-    ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("sme", "compliance"),
-    ("POST", "/api/batches/{batch_id}/discard"): ("ops", "sme"),
-    ("POST", "/api/batches/{batch_id}/snapshot-reviews"): ("sme",),
-    ("POST", "/api/schedules"): ("ops", "sme"),
-    ("PUT", "/api/schedules/{schedule_id}"): ("ops", "sme"),
-    ("POST", "/api/schedules/{schedule_id}/approve"): ("sme", "compliance"),
-    ("POST", "/api/schedules/{schedule_id}/status"): ("ops", "sme"),
-    ("POST", "/api/schedules/{schedule_id}/pull-now"): ("ops", "sme"),
-    ("POST", "/api/deliveries/{delivery_id}/waive"): ("ops", "sme"),
-    ("POST", "/api/scheduler/tick"): ("ops",),
+    ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
+    ("PUT", "/api/sources/{source_id}/layout"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/layout/preview"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds/inspect"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds/preview"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/layout/decide"): ONBOARDING_REVIEW,
+    ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/batches/{batch_id}/discard"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/file-sets/{set_id}/override"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/batches/{batch_id}/snapshot-reviews"): ONBOARDING_REVIEW,
+    ("POST", "/api/schedules"): ("monitoring", "onboarding"),
+    ("PUT", "/api/schedules/{schedule_id}"): ("monitoring", "onboarding"),
+    ("POST", "/api/schedules/{schedule_id}/approve"): ("onboarding_reviewer", "compliance_reviewer"),
+    ("POST", "/api/schedules/{schedule_id}/status"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/schedules/{schedule_id}/pull-now"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/deliveries/{delivery_id}/waive"): ("monitoring", "onboarding_reviewer"),
+    ("POST", "/api/scheduler/tick"): ("monitoring",),
     # personas (Cognito-native user admin + screen matrix; matrix writes are admin-only)
     ("PUT", "/api/personas/screens"): ("admin",),
     ("POST", "/api/personas/users"): ("admin",),
     ("PUT", "/api/personas/users/{username}"): ("admin",),
     ("POST", "/api/personas/users/{username}/reset-password"): ("admin",),
+    # any authenticated user (empty need → authorize skips role check)
+    ("POST", "/api/notifications/{notif_id}/read"): (),
+    ("POST", "/api/notifications/read-all"): (),
 }
 READ_RESTRICTED: dict[str, tuple[str, ...]] = {
-    "/api/audit": ("compliance", "sme"),
-    "/api/audit/verify": ("compliance",),
-    "/api/maintenance/artifacts": ("sme", "admin"),
-    "/api/maintenance/artifacts/{artifact_id}": ("sme", "admin"),
+    "/api/audit": ("compliance_reviewer", "onboarding_reviewer"),
+    "/api/audit/verify": COMPLIANCE_REVIEW,
+    "/api/maintenance/artifacts": ("onboarding_reviewer", "admin"),
+    "/api/maintenance/artifacts/{artifact_id}": ("onboarding_reviewer", "admin"),
+    "/api/maintenance/rule-templates": ("onboarding_reviewer", "admin"),
+    "/api/maintenance/rule-templates/{template_id}": ("onboarding_reviewer", "admin"),
     "/api/personas/screens": ("admin",),
     "/api/personas/users": ("admin",),
     # /api/personas/me/screens is any authenticated user (not listed → open to all roles)
@@ -166,6 +197,16 @@ async def lifespan(_app):
     n = RuleRegistry().seed_defaults()
     if n:
         log.info("seeded %d default rules", n)
+    nt = rule_tpl.seed_builtins()
+    if nt:
+        log.info("seeded %d rule templates", nt)
+    if s.env == "local":
+        try:
+            from ..personas import ensure_demo_cast
+
+            ensure_demo_cast(actor="system")
+        except Exception:  # noqa: BLE001 - local cast seed is best-effort
+            log.exception("demo cast seed failed")
     stop = None
     if s.scheduler_enabled and s.env == "local":
         stop = _start_local_scheduler()
@@ -186,7 +227,7 @@ def _start_local_scheduler():
     def loop():
         while not stop.wait(60):
             try:
-                for bid in sched.tick().get("batches", []):
+                for bid in dispatchable(sched.tick().get("batches", [])):
                     dispatch(bid)
             except Exception:  # noqa: BLE001 - keep ticking
                 log.exception("scheduler tick failed")
@@ -197,9 +238,17 @@ def _start_local_scheduler():
 
 app = FastAPI(title="PennyMac Loan Boarding Platform", version="1.0.0", lifespan=lifespan, dependencies=[Depends(authorize)],
               description="Mapping, validation, exception management and analytics for SSE loan boarding.")
+
+
+@app.exception_handler(FeedArchivedError)
+async def _archived_feed(_request: Request, e: FeedArchivedError):
+    """Any intake path that reaches an archived feed answers 409 (never queued, never a 500)."""
+    return JSONResponse(status_code=409, content={"detail": str(e)})
+
+
 _origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
 if _origins:
-    app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET", "POST", "PUT"],
+    app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET", "POST", "PUT", "DELETE"],
                        allow_headers=["authorization", "content-type", "x-user", "x-roles", "x-request-id"])
 
 access_log = logging.getLogger("lbp.access")
@@ -258,7 +307,9 @@ def _scope(vendor_id: str | None) -> list[str] | None:
 
 
 def _err(e: Exception, code: int = 400):
-    raise HTTPException(status_code=code, detail=str(e))
+    from ..lifecycle import FeedArchivedError
+
+    raise HTTPException(status_code=409 if isinstance(e, FeedArchivedError) else code, detail=str(e))
 
 
 def upload_dir() -> Path:
@@ -287,6 +338,12 @@ def _save_upload(f: UploadFile) -> Path:
                 dest.unlink(missing_ok=True)
                 raise HTTPException(413, f"file exceeds the {get_settings().max_upload_mb} MB limit")
             out.write(chunk)
+    _check_upload_content(dest, ext, limit)
+    return dest
+
+
+def _check_upload_content(dest: Path, ext: str, limit: int) -> None:
+    """Content checks on a saved upload (removed when refused): Excel must be a sane workbook, text not binary."""
     head = dest.open("rb").read(8192)
     if ext in (".xlsx", ".xlsm"):
         if head[:2] != b"PK":
@@ -304,7 +361,87 @@ def _save_upload(f: UploadFile) -> Path:
     elif b"\x00" in head or head[:2] in (b"MZ", b"\x7fE"):
         dest.unlink(missing_ok=True)
         raise HTTPException(415, "binary content is not a delimited text file")
-    return dest
+
+
+ZIP_MAX_MEMBERS = 20
+ZIP_TOTAL_FACTOR = 20  # total uncompressed size of an archive: at most this many upload limits (as for workbooks)
+
+
+def _extract_zip(f: UploadFile) -> list[tuple[str, Path]]:
+    """Save an uploaded zip (size-capped) and extract its members to the upload dir under sanitized names.
+    Refused: path traversal, absolute or nested names, folders, links, encrypted or duplicate members, types
+    not allowed for upload, more than ZIP_MAX_MEMBERS members, a member (as declared and as actually
+    decompressed) over the upload limit, a total over ZIP_TOTAL_FACTOR limits. Nothing is left on refusal."""
+    import stat
+    import zipfile
+    import zlib
+
+    mb = get_settings().max_upload_mb
+    limit = mb * 1024 * 1024
+    archive = upload_dir() / f"{uuid.uuid4().hex[:12]}_set.zip"
+    out: list[tuple[str, Path]] = []
+    try:
+        size = 0
+        with archive.open("wb") as w:
+            while chunk := f.file.read(1 << 20):
+                size += len(chunk)
+                if size > limit:
+                    raise HTTPException(413, f"file exceeds the {mb} MB limit")
+                w.write(chunk)
+        try:
+            z = zipfile.ZipFile(archive)
+        except zipfile.BadZipFile:
+            raise HTTPException(400, "not a valid zip archive") from None
+        with z:
+            infos = z.infolist()
+            if not infos:
+                raise HTTPException(400, "the zip archive is empty")
+            if len(infos) > ZIP_MAX_MEMBERS:
+                raise HTTPException(400, f"the zip archive has {len(infos)} members; at most {ZIP_MAX_MEMBERS} are accepted")
+            seen, total = set(), 0
+            for i in infos:
+                n = i.filename
+                if n.startswith(("/", "\\")) or "/" in n or "\\" in n or ":" in n or ".." in n:
+                    raise HTTPException(400, f"zip member '{n}' is not a plain file name (folders, absolute paths and '..' are refused)")
+                if i.is_dir() or stat.S_ISLNK(i.external_attr >> 16) or i.flag_bits & 0x1:
+                    raise HTTPException(400, f"zip member '{n}' is not a regular file (links and encrypted members are refused)")
+                ext = Path(n).suffix.lower()
+                if n.startswith(".") or ext not in ALLOWED_UPLOADS:
+                    raise HTTPException(400, f"zip member '{n}': unsupported file type {ext or '(none)'}; "
+                                             f"allowed: {', '.join(sorted(ALLOWED_UPLOADS))}")
+                if n in seen:
+                    raise HTTPException(400, f"zip member '{n}' appears twice")
+                seen.add(n)
+                if i.file_size > limit:
+                    raise HTTPException(413, f"zip member '{n}' exceeds the {mb} MB limit")
+                total += i.file_size
+            if total > limit * ZIP_TOTAL_FACTOR:
+                raise HTTPException(413, "the zip archive expands beyond the allowed size")
+            for i in infos:
+                safe = Path(i.filename).name.replace("..", "_")
+                dest = upload_dir() / f"{uuid.uuid4().hex[:12]}_{safe}"
+                out.append((i.filename, dest))
+                written = 0
+                try:
+                    with z.open(i) as src, dest.open("wb") as w:
+                        while chunk := src.read(1 << 20):
+                            written += len(chunk)
+                            if written > limit or written > i.file_size:
+                                raise HTTPException(413, f"zip member '{i.filename}' expands beyond its declared size "
+                                                         f"or the {mb} MB limit")
+                            w.write(chunk)
+                except (zipfile.BadZipFile, zlib.error, EOFError):
+                    raise HTTPException(400, f"zip member '{i.filename}' is corrupt") from None
+                except NotImplementedError:
+                    raise HTTPException(400, f"zip member '{i.filename}' uses an unsupported compression method") from None
+                _check_upload_content(dest, Path(safe).suffix.lower(), limit)
+    except BaseException:
+        for _, p in out:
+            p.unlink(missing_ok=True)
+        raise
+    finally:
+        archive.unlink(missing_ok=True)
+    return out
 
 
 # ------------------------------------------------------------------ meta
@@ -446,12 +583,13 @@ def create_source(name: str = Form(...), description: str = Form(""), file: Uplo
 
 
 @app.get("/api/sources")
-def list_sources(vendor_id: str | None = None):
+def list_sources(vendor_id: str | None = None, include_archived: bool = False):
     ids = _scope(vendor_id)
     with db.get_engine().connect() as c:
         rows = c.execute(select(db.sources.c.source_id, db.sources.c.name, db.sources.c.format, db.sources.c.status,
                                 db.sources.c.active_mapping_id, db.sources.c.created_by, db.sources.c.created_at, db.sources.c.delivery,
-                                db.sources.c.delivery_draft, db.sources.c.last_sequence, db.sources.c.vendor_id)
+                                db.sources.c.delivery_draft, db.sources.c.last_sequence, db.sources.c.vendor_id,
+                                db.sources.c.retired_at, db.sources.c.retired_reason)
                          .order_by(db.sources.c.created_at.desc())).all()
         vnames = dict(c.execute(select(db.vendors.c.vendor_id, db.vendors.c.name)).all())
         nsched = dict(c.execute(select(db.delivery_schedules.c.source_id, func.count()).where(
@@ -467,6 +605,8 @@ def list_sources(vendor_id: str | None = None):
     out = []
     for r in rows:
         if ids is not None and r.source_id not in ids:
+            continue
+        if r.status == "retired" and not include_archived:
             continue
         d = {k: v for k, v in db.row_to_dict(r).items() if k not in ("delivery", "delivery_draft", "last_sequence")}
         d["vendor_name"] = vnames.get(r.vendor_id)
@@ -492,6 +632,47 @@ def new_mapping_version(source_id: str, user: User = Depends(current_user)):
         return mapping_svc.new_version(source_id, user.name)
     except mapping_svc.MappingError as e:
         _err(e)
+
+
+class LifecycleReason(BaseModel):
+    reason: str
+
+
+def _lifecycle_call(fn, *a):
+    from ..lifecycle import LifecycleError
+
+    try:
+        return fn(*a)
+    except LifecycleError as e:
+        _err(e, 404 if "not found" in str(e) else 400)
+
+
+@app.post("/api/sources/{source_id}/archive")
+def archive_source(source_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.archive_feed, source_id, user.name, user.roles, body.reason)
+
+
+@app.post("/api/sources/{source_id}/restore")
+def restore_source(source_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.restore_feed, source_id, user.name, user.roles, body.reason)
+
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: str, reason: str = "", user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.delete_feed, source_id, user.name, user.roles, reason)
+
+
+@app.post("/api/mappings/{mapping_id}/discard")
+def discard_mapping(mapping_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.discard_mapping, mapping_id, user.name, user.roles, body.reason)
 
 
 @app.get("/api/mappings/{mapping_id}")
@@ -670,13 +851,61 @@ def approve_mapping(mapping_id: str, body: Decision, user: User = Depends(curren
 
 
 # ------------------------------------------------------------------ upload & batches (Workflow 2)
+def _feed_layout(source_id: str) -> dict | None:
+    """The feed's published multi-file layout (None: a single-file feed)."""
+    from ..config_store import ConfigError
+    from ..multifile.fileset import feed_layout
+
+    try:
+        return feed_layout(source_id)
+    except ConfigError as e:
+        _err(e)
+
+
+def _attach_uploads(source_id: str, items: list[tuple[str, Path, str | None]], user: User, auto_start: bool) -> list[dict]:
+    """Attach saved uploads to the feed's file sets (strict: the API reports errors, it never records them as
+    failed batches). Batches queued before an error are still started; the error is then raised."""
+    from ..multifile import fileset
+    from ..storage import persist_upload
+
+    out: list[dict] = []
+    try:
+        for name, local, role in items:
+            digest = pipeline.file_sha256(local)
+            # uploads/ (not incoming/) in AWS: the API attaches the file itself, the S3 arrival rule must not do it again
+            uri = persist_upload(local, f"{'uploads' if aws_mode() else 'incoming'}/{source_id}/{digest[:12]}")
+            out.append(fileset.attach_file(source_id, name, uri, user.name, role=role or None, strict=True))
+    except pipeline.DuplicateFileError as e:
+        raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
+    except ValueError as e:  # _err maps an archived feed to 409
+        _err(e)
+    finally:
+        if auto_start:
+            for r in out:
+                if r["batch_id"]:
+                    dispatch(r["batch_id"])
+    return out
+
+
 @app.post("/api/upload")
 def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start: bool = Form(True),
            allow_duplicate: bool = Form(False), reason: str | None = Form(None), load_type: str | None = Form(None),
-           user: User = Depends(current_user)):
+           role: str | None = Form(None), user: User = Depends(current_user)):
+    """One file. A feed with a multi-file layout attaches it to its file set (optional `role`, else routed by
+    name) and returns {set_id, role, status, batch_id}; a single-file feed registers a batch as before."""
+    from ..lifecycle import assert_not_archived
     from ..storage import persist_upload
 
+    assert_not_archived(source_id)  # 409 before the file is read or saved
+    layout = _feed_layout(source_id)
+    if layout:
+        given = [n for n, v in (("allow_duplicate", allow_duplicate), ("reason", reason), ("load_type", load_type)) if v]
+        if given:  # refused, never silently dropped
+            raise HTTPException(400, f"{', '.join(given)} cannot be used for a multi-file feed: its file sets always load as full "
+                                     "and a set identical to a live one is refused as a duplicate")
     local = _save_upload(file)
+    if layout:
+        return _attach_uploads(source_id, [(file.filename or local.name, local, role)], user, auto_start)[0]
     try:
         digest = pipeline.file_sha256(local)
         # uploads/ (not incoming/): the API registers this batch itself, so the S3 arrival rule must not register it twice
@@ -691,24 +920,111 @@ def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start:
     return {"batch_id": bid, "status": "submitted" if auto_start else "queued"}
 
 
+@app.post("/api/upload/set")
+def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), manifest: str | None = Form(None),
+               auto_start: bool = Form(True), user: User = Depends(current_user)):
+    """The files of one multi-file delivery: several `files` parts, or one .zip. An optional `manifest`
+    (JSON {role: filename}) assigns roles; other files are routed by the layout's name patterns. All or
+    nothing: a file that routes nowhere (or any other problem found before attaching) attaches no file.
+    Returns the per-file results [{set_id, role, status, batch_id}], the master last."""
+    from ..config_store import load
+    from ..lifecycle import assert_not_archived
+    from ..multifile.fileset import FileSetError, plan_files
+
+    assert_not_archived(source_id)  # 409 before any part is read or saved
+    layout = _feed_layout(source_id)
+    if not layout:
+        raise HTTPException(400, "this feed has no multi-file layout; upload its file with POST /api/upload")
+    roles = None
+    if manifest:
+        try:
+            roles = json.loads(manifest)
+        except ValueError:
+            raise HTTPException(400, "manifest must be JSON: {role: filename}") from None
+        if not isinstance(roles, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in roles.items()):
+            raise HTTPException(400, "manifest must be JSON: {role: filename}")
+    saved: list[tuple[str, Path]] = []
+    try:
+        if any(Path(f.filename or "").suffix.lower() == ".zip" for f in files):
+            if len(files) != 1:
+                raise HTTPException(400, "send one .zip, or several files, not both")
+            saved = _extract_zip(files[0])
+        else:
+            cap = min(len([f for f in layout.get("files") or [] if f.get("role")]), ZIP_MAX_MEMBERS)
+            if len(files) > cap:  # refused before any part is saved
+                raise HTTPException(400, f"this upload has {len(files)} files; the feed layout accepts at most {cap}")
+            for f in files:
+                name = Path(f.filename or "upload").name
+                if name in {n for n, _ in saved}:
+                    raise HTTPException(400, f"'{name}' appears twice in this upload")
+                saved.append((name, _save_upload(f)))
+        try:
+            plan = plan_files(layout, load(source_id).readiness or {}, [n for n, _ in saved], roles)
+        except FileSetError as e:
+            _err(e)
+    except BaseException:
+        for _, p in saved:
+            p.unlink(missing_ok=True)
+        raise
+    local = dict(saved)
+    # Not transactional across files: an error while attaching (e.g. a 409 on the last file) leaves the files
+    # attached before it in their sets; routing, manifest and pairing problems are all refused above, before any.
+    return _attach_uploads(source_id, [(n, local[n], role) for n, role in plan], user, auto_start)
+
+
 @app.post("/api/upload/presign")
-def presign(source_id: str, filename: str, user: User = Depends(current_user)):
-    """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline."""
+def presign(source_id: str, filename: str, role: str | None = None, user: User = Depends(current_user)):
+    """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline.
+    `role` (a multi-file feed) is passed to the arrival handler as object metadata."""
+    from ..lifecycle import assert_not_archived
+
     s = get_settings()
     if s.env != "aws" or not s.raw_bucket:
         raise HTTPException(400, "presigned upload is only available in AWS mode; use POST /api/upload locally")
+    assert_not_archived(source_id)
     import boto3
 
     key = f"incoming/{source_id}/{uuid.uuid4().hex[:8]}_{Path(filename).name}"
     url = boto3.client("s3").generate_presigned_url("put_object", Params={"Bucket": s.raw_bucket, "Key": key,
-                                                                         "Metadata": {"source-id": source_id, "submitted-by": user.name}},
+                                                                         "Metadata": {"source-id": source_id, "submitted-by": user.name,
+                                                                                      **({"role": role} if role else {})}},
                                                     ExpiresIn=900)
     return {"url": url, "bucket": s.raw_bucket, "key": key}
 
 
+def _parse_batch_instant(raw: str, label: str):
+    from datetime import UTC, datetime
+
+    try:
+        text = raw.strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            return dt  # treat bare naive as already-UTC platform time
+        return dt.astimezone(UTC).replace(tzinfo=None)
+    except ValueError as e:
+        raise HTTPException(400, f"invalid {label}: {raw}") from e
+
+
 @app.get("/api/batches")
-def list_batches(limit: int = 25, vendor_id: str | None = None):
-    return analytics.import_status(limit, _scope(vendor_id))
+def list_batches(limit: int = Query(50, ge=1, le=200), vendor_id: str | None = None,
+                 status: str | None = None, days: int | None = None,
+                 since: str | None = None, until: str | None = None, q: str | None = None):
+    from datetime import timedelta
+
+    statuses = [s.strip() for s in (status or "").split(",") if s.strip()] or None
+    since_dt = until_dt = None
+    if days is not None:
+        if days not in (1, 7, 30):
+            raise HTTPException(400, "days must be 1, 7, or 30")
+        since_dt = db.now() - timedelta(days=days)
+    if since:
+        since_dt = _parse_batch_instant(since, "since")
+    if until:
+        until_dt = _parse_batch_instant(until, "until")
+    if since_dt is not None and until_dt is not None and since_dt > until_dt:
+        raise HTTPException(400, "since must be before until")
+    return analytics.import_status(limit, _scope(vendor_id), statuses=statuses,
+                                   since=since_dt, until=until_dt, q=q or None)
 
 
 @app.get("/api/batches/{batch_id}")
@@ -720,6 +1036,13 @@ def get_batch(batch_id: str):
     with db.get_engine().connect() as c:
         row = c.execute(select(db.batches.c.micro_batches).where(db.batches.c.batch_id == batch_id)).first()
     b["micro_batch_log"] = row[0] if row else []
+    # List endpoint skips SF traces for terminal batches; detail always loads the one execution.
+    if "pipeline" not in b:
+        from ..pipeline.trace import fetch_traces
+
+        trace = fetch_traces([batch_id]).get(batch_id)
+        if trace:
+            b["pipeline"] = trace
     return b
 
 
@@ -729,8 +1052,19 @@ def pause_batch(batch_id: str, user: User = Depends(current_user)):
     return {"batch_id": batch_id, "status": "pausing"}
 
 
+def _refuse_archived_batch(batch_id: str) -> None:
+    """409 when the batch belongs to an archived feed: nothing of a retired feed is resumed, replayed or released."""
+    from ..lifecycle import assert_not_archived
+
+    with db.get_engine().connect() as c:
+        sid = c.execute(select(db.batches.c.source_id).where(db.batches.c.batch_id == batch_id)).scalar()
+    if sid:
+        assert_not_archived(sid)
+
+
 @app.post("/api/batches/{batch_id}/resume")
 def resume_batch(batch_id: str, user: User = Depends(current_user)):
+    _refuse_archived_batch(batch_id)
     with db.get_engine().begin() as c:
         st = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == batch_id)).scalar()
         if st not in ("paused", "failed", "queued", "blocked", "waiting"):
@@ -746,6 +1080,7 @@ class Override(BaseModel):
 
 @app.post("/api/batches/{batch_id}/override-preflight")
 def override_preflight(batch_id: str, body: Override, user: User = Depends(current_user)):
+    _refuse_archived_batch(batch_id)
     try:
         pipeline.override_preflight(batch_id, user.name, user.roles, body.reason)
     except ValueError as e:
@@ -777,8 +1112,9 @@ def replay(batch_id: str, dry_run: bool = True, user: User = Depends(current_use
     """Re-run held loans through the source's current mapping and rules (dry_run previews the outcome)."""
     from ..pipeline.replay import replay_batch
 
-    if not dry_run and not set(user.roles) & {"ops", "sme", "admin"}:
-        raise HTTPException(403, "Ops or SME role required to replay a batch")
+    if not dry_run and not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
+        raise HTTPException(403, "Monitoring or Onboarding reviewer role required to replay a batch")
+    _refuse_archived_batch(batch_id)  # before the dry-run / Glue branch: an archived feed replays nothing
     if not dry_run and aws_mode():
         run_id = start_glue(get_settings().glue_feed_job, {"mode": "replay", "batch_id": batch_id, "actor": user.name})
         with db.get_engine().begin() as c:
@@ -853,6 +1189,233 @@ def approve_delivery(source_id: str, body: Decision, user: User = Depends(curren
         _err(e)
 
 
+class LayoutIn(BaseModel):
+    layout: dict
+    readiness: dict = {}
+
+
+@app.get("/api/sources/{source_id}/layout")
+def get_layout(source_id: str):
+    with db.get_engine().connect() as c:
+        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise HTTPException(404, "source not found")
+    return {"source_id": source_id, "layout": src.layout, "readiness": src.readiness, "configured": bool(src.layout),
+            "draft": src.layout_draft, "readiness_draft": src.readiness_draft, "proposed_by": src.layout_proposed_by}
+
+
+@app.put("/api/sources/{source_id}/layout")
+def put_layout(source_id: str, body: LayoutIn, user: User = Depends(current_user)):
+    from ..multifile.service import LayoutServiceError, propose_layout
+
+    try:
+        return propose_layout(source_id, body.layout, body.readiness, user.name, user.roles)
+    except LayoutServiceError as e:
+        _err(e)
+
+
+@app.post("/api/sources/{source_id}/layout/preview")
+async def preview_layout(source_id: str, request: Request):
+    """Dry-run join of sample files (multipart: one part per layout role, named by the role) with the `layout` and
+    `readiness` JSON form fields (omitted: the feed's live layout). Read-only: nothing is stored or audited, and
+    the uploads are deleted. Invalid layouts and join errors come back as 200 with `errors`."""
+    from types import SimpleNamespace
+
+    from starlette.concurrency import run_in_threadpool
+
+    from .. import config_store
+    from ..multifile import stage
+    from ..multifile.preview import preview_join
+
+    with db.get_engine().connect() as c:
+        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise HTTPException(404, "source not found")
+    form = await request.form()
+
+    def _json(name: str, default):
+        raw = form.get(name)
+        if raw in (None, ""):
+            return default
+        try:
+            return json.loads(raw)
+        except (TypeError, ValueError):
+            raise HTTPException(400, f"{name} must be JSON") from None
+
+    layout = _json("layout", src.layout)
+    if not layout:
+        raise HTTPException(400, "send a layout, or configure one for this feed first")
+    readiness = _json("readiness", src.readiness if "layout" not in form else {})
+    parts = [(k, v) for k, v in form.multi_items() if hasattr(v, "filename") and hasattr(v, "file")]
+    from ..multifile.layout import role_name_error
+
+    bad = next((role_name_error(k) for k, _ in parts if role_name_error(k)), None)
+    if bad:
+        raise HTTPException(400, bad)
+    roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
+        if isinstance(layout, dict) else set()
+    if len(parts) > len(roles):
+        raise HTTPException(400, f"this preview has {len(parts)} files; the layout has {len(roles)} roles")
+    names = [k for k, _ in parts]
+    if len(set(names)) != len(names) or any(k not in roles for k in names):
+        raise HTTPException(400, f"send one file per layout role, as a part named by the role ({sorted(roles)})")
+    saved: list[Path] = []
+    samples: dict[str, tuple[bytes, str]] = {}
+    try:
+        for role, f in parts:
+            p = _save_upload(f)
+            saved.append(p)
+            samples[role] = (p.read_bytes(), f.filename or p.name)
+    finally:
+        for p in saved:
+            p.unlink(missing_ok=True)
+    try:
+        cfg = config_store.load(source_id)
+    except config_store.ConfigError:
+        cfg = SimpleNamespace(profile=src.profile or {}, fields=[], parse_options=src.parse_options or {})
+    try:
+        opts = stage._parse_overrides(layout, cfg)
+    except (AttributeError, TypeError):  # a malformed layout: preview_join reports it as errors
+        opts = {}
+    return await run_in_threadpool(preview_join, layout, readiness, samples, opts, 10, cfg)
+
+
+_MULTIFILE_FIELDS = {"name", "description", "vendor_id", "layout", "readiness"}
+
+
+async def _multifile_form(request: Request):
+    """(form fields, role -> saved upload path). Every file part is a role, named by the role; the caller deletes
+    the saved files."""
+    from ..multifile.layout import role_name_error
+
+    form = await request.form()
+    saved: dict[str, Path] = {}
+    try:
+        for k, v in form.multi_items():
+            if hasattr(v, "filename") and hasattr(v, "file"):
+                if role_name_error(k):
+                    raise HTTPException(400, role_name_error(k))
+                if k in saved:
+                    raise HTTPException(400, f"more than one file was sent for the {k} role")
+                saved[k] = _save_upload(v)
+    except BaseException:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+        raise
+    return form, saved
+
+
+def _form_json(form, name: str, default=None):
+    raw = form.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{name} must be JSON") from None
+
+
+@app.post("/api/multi-file-feeds/inspect")
+async def inspect_multifile(request: Request):
+    """Columns of each sample file (multipart: one part per role, named by the role). Nothing is stored."""
+    from starlette.concurrency import run_in_threadpool
+
+    from ..multifile.onboard import OnboardError, inspect_files
+
+    _form, saved = await _multifile_form(request)
+    try:
+        files = {r: (p.read_bytes(), p.name) for r, p in saved.items()}
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+    try:
+        return await run_in_threadpool(inspect_files, files)
+    except OnboardError as e:
+        _err(e)
+
+
+@app.post("/api/multi-file-feeds/preview")
+async def preview_multifile(request: Request):
+    """Dry-run join of sample files for a layout that has no feed yet (multipart: role parts plus `layout` and
+    `readiness` JSON fields). Read-only and masked like the feed-level preview; problems come back as 200 with
+    `errors`."""
+    from types import SimpleNamespace
+
+    from starlette.concurrency import run_in_threadpool
+
+    from ..ingestion.parser import read_bytes_sample
+    from ..multifile import stage
+    from ..multifile.preview import preview_join
+
+    form, saved = await _multifile_form(request)
+    try:
+        samples_in = {r: (p.read_bytes(), p.name) for r, p in saved.items()}
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+    layout = _form_json(form, "layout")
+    if not isinstance(layout, dict) or not layout:
+        raise HTTPException(400, "send a layout")
+    readiness = _form_json(form, "readiness", {})
+    roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
+        if isinstance(layout.get("files"), list) else set()
+    # as the feed preview: one part per layout role, nothing else (a layout with no roles at all is reported as
+    # layout errors by preview_join, which writes nothing before the layout is valid)
+    if roles and any(r not in roles for r in samples_in):
+        raise HTTPException(400, f"send one file per layout role, as a part named by the role ({sorted(map(str, roles))})")
+    profile: dict = {}
+    if "master" in samples_in:  # no feed yet: profile the master sample so its PII columns are masked
+        try:
+            meta, rows = read_bytes_sample(*samples_in["master"], 500)
+            profile = profile_rows(meta.columns, rows) if meta.columns and rows else {}
+        except Exception:  # noqa: BLE001 - preview_join reports an unreadable master itself
+            profile = {}
+    cfg = SimpleNamespace(profile=profile, fields=[], parse_options={})
+    try:
+        opts = stage._parse_overrides(layout, cfg)
+    except (AttributeError, TypeError):
+        opts = {}
+    return await run_in_threadpool(preview_join, layout, readiness, samples_in, opts, 10, cfg)
+
+
+@app.post("/api/multi-file-feeds")
+async def create_multifile_feed(request: Request, user: User = Depends(current_user)):
+    """Create a feed from sample files (multipart: `name`, `description`, `vendor_id`, `layout`, `readiness`, and one
+    file part per role). The draft mapping comes from the joined sample; the layout waits for approval."""
+    from starlette.concurrency import run_in_threadpool
+
+    from ..mapping.service import MappingError
+    from ..multifile.layout import LayoutError
+    from ..multifile.onboard import OnboardError, register_multifile_source
+    from ..multifile.service import LayoutServiceError
+
+    form, saved = await _multifile_form(request)
+    try:
+        layout = _form_json(form, "layout")
+        readiness = _form_json(form, "readiness", {})
+        try:
+            return await run_in_threadpool(
+                register_multifile_source, (form.get("name") or "").strip(), saved, layout, readiness, user.name, user.roles,
+                form.get("description") or "", form.get("vendor_id") or None)
+        except (OnboardError, LayoutError, LayoutServiceError, MappingError) as e:
+            _err(e)
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+
+
+@app.post("/api/sources/{source_id}/layout/decide")
+def decide_layout_endpoint(source_id: str, body: Decision, user: User = Depends(current_user)):
+    from ..multifile.service import LayoutPublishError, LayoutServiceError, decide_layout
+
+    try:
+        return decide_layout(source_id, user.name, user.roles, body.approve, body.comment)
+    except LayoutPublishError as e:  # the approval is saved; the publish must be retried
+        _err(e, 502)
+    except LayoutServiceError as e:
+        _err(e)
+
+
 @app.get("/api/sources/{source_id}/delivery/test")
 def test_filename(source_id: str, filename: str, draft: bool = False):
     """How a file named like this would be treated: load type, file-level action, sequence."""
@@ -913,6 +1476,7 @@ def feed_publish(source_id: str, body: ReasonIn, user: User = Depends(current_us
 def batch_skip_gap(batch_id: str, body: ReasonIn, user: User = Depends(current_user)):
     from ..pipeline import sequencing
 
+    _refuse_archived_batch(batch_id)
     try:
         sequencing.skip_gap(batch_id, user.name, user.roles, body.reason)
     except sequencing.SequenceActionError as e:
@@ -925,6 +1489,7 @@ def batch_skip_gap(batch_id: str, body: ReasonIn, user: User = Depends(current_u
 def batch_apply_ooo(batch_id: str, body: ReasonIn, user: User = Depends(current_user)):
     from ..pipeline import sequencing
 
+    _refuse_archived_batch(batch_id)
     try:
         sequencing.apply_out_of_order(batch_id, user.name, user.roles, body.reason)
     except sequencing.SequenceActionError as e:
@@ -944,6 +1509,57 @@ def batch_discard(batch_id: str, body: ReasonIn, user: User = Depends(current_us
     for b in released:
         dispatch(b)
     return {"batch_id": batch_id, "status": "discarded", "released": released}
+
+
+@app.get("/api/file-sets")
+def list_file_sets(source_id: str | None = None, status: str | None = None, limit: int = Query(100, ge=1, le=500)):
+    """File sets of multi-file feeds with their members (role, filename, row count; never contents or paths)."""
+    from sqlalchemy import select
+
+    fs, bf = db.file_sets, db.batch_files
+    q = select(fs).order_by(fs.c.opened_at.desc()).limit(limit)
+    if source_id:
+        q = q.where(fs.c.source_id == source_id)
+    if status:
+        q = q.where(fs.c.status.in_([x.strip() for x in status.split(",") if x.strip()]))
+    with db.get_engine().connect() as c:
+        sets = c.execute(q).all()
+        members: dict[str, list] = {}
+        if sets:
+            for m in c.execute(select(bf).where(bf.c.set_id.in_([s.set_id for s in sets])).order_by(bf.c.id)):
+                members.setdefault(m.set_id, []).append({"role": m.role, "filename": m.filename, "row_count": m.row_count,
+                                                         "sha256": m.file_sha256, "received_at": m.received_at})
+    out = []
+    for s in sets:
+        ov = s.override or {}
+        out.append({"set_id": s.set_id, "source_id": s.source_id, "pairing_key": s.pairing_key, "status": s.status,
+                    "opened_at": s.opened_at, "ready_at": s.ready_at, "expires_at": s.expires_at, "batch_id": s.batch_id,
+                    "members": members.get(s.set_id, []),
+                    "override": {"timeout": ov.get("timeout"), "duplicate_of": ov.get("duplicate_of"),
+                                 "error": (ov.get("error") or {}).get("message"), "overrides": ov.get("overrides") or []}})
+    return out
+
+
+class FileSetOverrideIn(BaseModel):
+    action: str
+    reason: str = ""
+    target_pairing_key: str | None = None
+    member_role: str | None = None
+
+
+@app.post("/api/file-sets/{set_id}/override")
+def file_set_override(set_id: str, body: FileSetOverrideIn, user: User = Depends(current_user)):
+    from ..multifile import fileset
+
+    try:
+        out = fileset.override_set(set_id, body.action, user.name, user.roles, body.reason, body.target_pairing_key, body.member_role)
+    except pipeline.DuplicateFileError as e:
+        raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
+    except ValueError as e:
+        _err(e)
+    if out.get("batch_id") and out.get("status", out.get("target_status")) == "consumed":
+        dispatch(out["batch_id"])
+    return out
 
 
 @app.post("/api/batches/{batch_id}/snapshot-reviews")
@@ -1018,11 +1634,12 @@ class StatusIn(BaseModel):
 
 
 def _sched_call(fn, *a, **kw):
+    from ..lifecycle import FeedArchivedError
     from ..scheduling.service import ScheduleError
 
     try:
         return fn(*a, **kw)
-    except ScheduleError as e:
+    except (ScheduleError, FeedArchivedError) as e:
         _err(e)
 
 
@@ -1068,14 +1685,23 @@ def schedules_pull(schedule_id: str, user: User = Depends(current_user)):
     from ..scheduling import service as sched
 
     if aws_mode():
-        if not set(user.roles) & {"ops", "sme", "admin"}:
-            raise HTTPException(403, "requires one of: ops, sme")
+        if not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
+            raise HTTPException(403, "requires one of: monitoring, onboarding_reviewer")
+        from ..lifecycle import assert_not_archived
+
+        with db.get_engine().connect() as c:
+            sid = c.execute(select(db.delivery_schedules.c.source_id).where(db.delivery_schedules.c.schedule_id == schedule_id)).scalar()
+        if sid:
+            try:
+                assert_not_archived(sid)
+            except ValueError as e:
+                _err(e)
         run_id = start_glue(get_settings().glue_pull_job, {"schedule_id": schedule_id})
         with db.get_engine().begin() as c:
             db.audit(c, user.name, "schedule.pull_submitted", "schedule", schedule_id, {"glue_run_id": run_id})
         return {"schedule_id": schedule_id, "submitted": True, "glue_run_id": run_id, "fetched": [], "batches": []}
     out = _sched_call(sched.pull_now, schedule_id, user.name, user.roles)
-    for bid in out.get("batches", []):
+    for bid in dispatchable(out.get("batches", [])):
         dispatch(bid)
     return out
 
@@ -1112,7 +1738,7 @@ def scheduler_tick(user: User = Depends(current_user)):
     from ..scheduling import service as sched
 
     out = sched.tick()
-    for bid in out.get("batches", []):
+    for bid in dispatchable(out.get("batches", [])):
         dispatch(bid)
     return out
 
@@ -1131,8 +1757,14 @@ def analytics_vendors(vendor_id: str | None = None):
 @app.get("/api/exceptions")
 def list_exceptions(status: str | None = "open", tier: str | None = None, queue: str | None = None, batch_id: str | None = None,
                     rule_id: str | None = None, source_id: str | None = None, q: str | None = None,
-                    limit: int = Query(100, le=1000), offset: int = 0, vendor_id: str | None = None):
-    return exceptions_mgr.list(status, tier, queue, batch_id, rule_id, source_id, q, limit, offset, _scope(vendor_id))
+                    loaded_on: str | None = None, limit: int = Query(100, le=1000), offset: int = 0, vendor_id: str | None = None):
+    return exceptions_mgr.list(status, tier, queue, batch_id, rule_id, source_id, q, limit, offset, _scope(vendor_id), loaded_on)
+
+
+@app.get("/api/exceptions/loads")
+def exceptions_loads(status: str | None = "open", vendor_id: str | None = None, tier: str | None = None):
+    """File loads that have exceptions — for vendor / file / date filters."""
+    return exceptions_mgr.loads(status, _scope(vendor_id), vendor_id, tier=tier)
 
 
 @app.get("/api/exceptions/summary")
@@ -1197,6 +1829,15 @@ def reject(exception_id: str, body: Reason, user: User = Depends(current_user)):
         _err(e)
 
 
+@app.post("/api/exceptions/{exception_id}/acknowledge")
+def acknowledge(exception_id: str, body: Reason, user: User = Depends(current_user)):
+    """Close a join exception with a reason (join exceptions have no staged loan to resolve or reject)."""
+    try:
+        return exceptions_mgr.acknowledge(exception_id, user.name, user.roles, body.reason)
+    except ExceptionActionError as e:
+        _err(e)
+
+
 @app.post("/api/exceptions/{exception_id}/escalate")
 def escalate(exception_id: str, body: Reason, user: User = Depends(current_user)):
     return exceptions_mgr.escalate(exception_id, user.name, user.roles, body.reason)
@@ -1252,10 +1893,41 @@ def bulk_resolve(body: Bulk, user: User = Depends(current_user)):
     return exceptions_mgr.bulk_resolve(user.name, user.roles, body.rule_id, body.original_value, body.value, body.use_proposal, body.batch_id)
 
 
+# ------------------------------------------------------------------ notifications (in-app review inbox)
+@app.get("/api/notifications")
+def list_notifications(unread: bool = False, user: User = Depends(current_user)):
+    from .. import notifications as ntf
+
+    items = ntf.list_for(user.name, unread_only=unread)
+    return {"notifications": items, "unread": ntf.unread_count(user.name)}
+
+
+@app.post("/api/notifications/{notif_id}/read")
+def read_notification(notif_id: str, user: User = Depends(current_user)):
+    from .. import notifications as ntf
+
+    row = ntf.mark_read(notif_id, user.name)
+    if not row:
+        raise HTTPException(404, "notification not found")
+    return row
+
+
+@app.post("/api/notifications/read-all")
+def read_all_notifications(user: User = Depends(current_user)):
+    from .. import notifications as ntf
+
+    return {"ok": True, "updated": ntf.mark_all_read(user.name)}
+
+
 # ------------------------------------------------------------------ rules (Pillar 3.A)
 @app.get("/api/rules")
-def list_rules(status: str | None = None):
+def list_rules(status: str | None = None, queue: str | None = None, user: User = Depends(current_user)):
+    """queue=awaiting_review → in_review where caller is not the author; queue=my_drafts → drafts by caller."""
     rules = registry.list(status)
+    if queue == "awaiting_review":
+        rules = [r for r in rules if r.get("status") == "in_review" and r.get("author") != user.name]
+    elif queue == "my_drafts":
+        rules = [r for r in rules if r.get("status") == "draft" and r.get("author") == user.name]
     latest: dict[str, dict] = {}
     for r in rules:
         cur = latest.get(r["rule_id"])
@@ -1276,12 +1948,12 @@ def list_rule_fields():
 
 @app.get("/api/rules/shapes")
 def list_rule_shapes():
-    return {"shapes": shape_catalog()}
+    return {"shapes": shape_catalog(), "pattern_presets": pattern_presets()}
 
 
 @app.get("/api/rules/templates")
 def list_rule_templates():
-    return {"templates": rule_templates()}
+    return {"templates": rule_tpl.list_templates(include_hidden=False)}
 
 
 class ComposeReq(BaseModel):
@@ -1388,6 +2060,14 @@ def transition_rule(rule_id: str, version: int, body: Transition, user: User = D
         _err(e)
 
 
+@app.delete("/api/rules/{rule_id}")
+def delete_rule(rule_id: str, reason: str | None = None, user: User = Depends(current_user)):
+    try:
+        return registry.delete_rule(rule_id, user.name, reason)
+    except RuleError as e:
+        _err(e, 404 if "not found" in str(e).lower() else 400)
+
+
 class AuthorReq(BaseModel):
     text: str
 
@@ -1475,8 +2155,8 @@ def update_policy(body: PolicyChange, user: User = Depends(current_user)):
 
 # ------------------------------------------------------------------ analytics (Pillar 2)
 @app.get("/api/analytics/import-status")
-def a_import(vendor_id: str | None = None):
-    return analytics.import_status(25, _scope(vendor_id))
+def a_import(limit: int = 25, vendor_id: str | None = None):
+    return analytics.import_status(min(max(limit, 1), 500), _scope(vendor_id))
 
 
 @app.get("/api/analytics/exceptions")
@@ -1565,10 +2245,10 @@ def demo_seed(rows_per_source: int = 2000, user: User = Depends(current_user)):
     results = []
     for key, path in files.items():
         label = samples.SOURCES[key][0]
-        reg = mapping_svc.register_source(label, path, "analyst.demo", f"Synthetic {label} loan tape")
-        mapping_svc.accept_all(reg["mapping_id"], "analyst.demo", 0.0)
-        mapping_svc.submit(reg["mapping_id"], "analyst.demo")
-        mapping_svc.approve(reg["mapping_id"], "sme.demo", ["sme"], True, "Demo approval")
+        reg = mapping_svc.register_source(label, path, "onboarding", f"Synthetic {label} loan tape")
+        mapping_svc.accept_all(reg["mapping_id"], "onboarding", 0.0)
+        mapping_svc.submit(reg["mapping_id"], "onboarding")
+        mapping_svc.approve(reg["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"], True, "Demo approval")
         bid = pipeline.create_batch(reg["source_id"], path, path.name, user.name)
         results.append(pipeline.run_batch(bid))
     return {"seeded": results}
@@ -1590,7 +2270,7 @@ def demo_setup(body: DemoSetupIn, user: User = Depends(current_user)):
                                   "hint": "pass force=true after confirm"}) from e
 
 
-# ------------------------------------------------------------------ maintenance (Glue artifacts, read-only)
+# ------------------------------------------------------------------ maintenance (Glue artifacts + rule templates)
 @app.get("/api/maintenance/artifacts")
 def maintenance_artifacts():
     from ..maintenance import list_artifacts
@@ -1608,12 +2288,74 @@ def maintenance_artifact(artifact_id: str):
         raise HTTPException(404, str(e)) from None
 
 
+@app.get("/api/maintenance/rule-templates")
+def maintenance_rule_templates():
+    return {"templates": rule_tpl.list_templates(include_hidden=True)}
+
+
+class RuleTemplateBody(BaseModel):
+    id: str | None = None
+    name: str
+    description: str = ""
+    tree: Any
+
+
+@app.post("/api/maintenance/rule-templates")
+def maintenance_create_rule_template(body: RuleTemplateBody, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.create_template(body.model_dump(exclude_none=True), user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@app.put("/api/maintenance/rule-templates/{template_id}")
+def maintenance_update_rule_template(template_id: str, body: dict, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.update_template(template_id, body, user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(400 if "not found" not in str(e).lower() else 404, str(e)) from e
+
+
+@app.post("/api/maintenance/rule-templates/{template_id}/hide")
+def maintenance_hide_rule_template(template_id: str, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.set_hidden(template_id, True, user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.post("/api/maintenance/rule-templates/{template_id}/unhide")
+def maintenance_unhide_rule_template(template_id: str, user: User = Depends(current_user)):
+    try:
+        return rule_tpl.set_hidden(template_id, False, user.name)
+    except rule_tpl.TemplateError as e:
+        raise HTTPException(404, str(e)) from e
+
+
+@app.delete("/api/maintenance/rule-templates/{template_id}")
+def maintenance_delete_rule_template(template_id: str, user: User = Depends(current_user)):
+    try:
+        rule_tpl.delete_template(template_id, user.name)
+        return {"ok": True, "id": template_id}
+    except rule_tpl.TemplateError as e:
+        code = 400 if "built-in" in str(e).lower() else 404
+        raise HTTPException(code, str(e)) from e
+
+
 # ------------------------------------------------------------------ personas (user admin + restrict-only screen nav matrix)
 @app.get("/api/personas/me/screens")
 def personas_my_screens(user: User = Depends(current_user)):
     from ..personas import visible_screens
 
     return {"screens": visible_screens(user.roles)}
+
+
+@app.get("/api/personas/cast")
+def personas_cast():
+    """Signed-in-as switcher people (local demo cast + enabled directory). Open to any auth user."""
+    from ..personas import cast_for_switcher
+
+    return {"cast": cast_for_switcher()}
 
 
 @app.get("/api/personas/screens")

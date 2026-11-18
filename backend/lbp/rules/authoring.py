@@ -68,6 +68,8 @@ def _heuristic(text: str) -> dict | None:
         (r"^(.+?)\s+(?:is required|must be (?:populated|present|provided)|must not be (?:blank|empty|missing)|cannot be (?:blank|empty))", "required"),
         (r"^(.+?)\s+must be (?:one of|in|either)\s*:?\s*(.+)$", "in"),
         (r"^(.+?)\s+must be (?:exactly\s+)?(\d+)\s+digits", "digits"),
+        (r"^(.+?)\s+must match (?:pattern |regex )?['\"]?(.+?)['\"]?$", "pattern"),
+        (r"^(.+?)\s+must (?:look like|be formatted as|match format)\s+(.+)$", "pattern"),
         (rf"^(.+?)\s+must (?:not exceed|be (?:less than or equal to|at most|<=|no more than))\s+{NUM}\s*%?$", "le_num"),
         (rf"^(.+?)\s+must be (?:greater than or equal to|at least|>=|no less than)\s+{NUM}\s*%?$", "ge_num"),
         (rf"^(.+?)\s+must be (?:less than|below|under|<)\s+{NUM}\s*%?$", "lt_num"),
@@ -101,6 +103,18 @@ def _heuristic(text: str) -> dict | None:
             n = int(m.group(2))
             expr = {"matches": [v, f"\\d{{{n}}}"]}
             tests = [(_base_with(f, "1" * n), True), (_base_with(f, "1" * (n - 1)), False)]
+        elif kind == "pattern":
+            from .shapes import compile_tree
+
+            pat = m.group(2).strip().strip("'\"")
+            # Special-case the common loan-number wording used in defaults / demos.
+            if "loan" in low and "number" in low and "between" not in low:
+                pat = pat if re.search(r"[\\\[\{]", pat) else "[A-Z0-9-]{6,20}"
+            try:
+                drafted = compile_tree({"shape": "pattern", "field": f, "pattern": pat})
+            except Exception:
+                return None
+            return {**drafted, "name": s[:120], "description": s, "severity": severity, "field_confidence": round(conf, 2)}
         elif kind.endswith("_num"):
             x = float(m.group(2))
             op = {"le_num": "<=", "ge_num": ">=", "lt_num": "<", "gt_num": ">"}[kind]

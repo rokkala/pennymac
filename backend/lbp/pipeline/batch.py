@@ -14,7 +14,9 @@ worker, orchestrated by Step Functions (see aws/).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -26,7 +28,7 @@ from sqlalchemy import func, or_, select
 from ..config import get_settings
 from ..exceptions.manager import Triage, _str
 from ..ingestion.parser import ParseOptions, estimate_rows, iter_rows, read_sample
-from ..ingestion.pii import TARGET_PII_TYPES, mask_value
+from ..ingestion.pii import DETECT_PII, TARGET_PII_TYPES, detect_value_pii, mask_value
 from ..mapping.transforms import compile_mapping
 from ..rules.executor import RuleExecutor
 from ..rules.registry import RuleRegistry
@@ -167,7 +169,17 @@ def _chunks(it, size):
 
 
 def _mask_raw(raw: dict, pii_cols: dict[str, str]) -> dict:
-    return {k: (mask_value(v, pii_cols[k]) if k in pii_cols and v else v) for k, v in raw.items()}
+    """Mask the PII columns of a raw row. A DETECT_PII column (joined batches: a detail or aggregate column of
+    unknown type) is masked only when its value looks like PII."""
+    if DETECT_PII not in pii_cols.values():
+        return {k: (mask_value(v, pii_cols[k]) if k in pii_cols and v else v) for k, v in raw.items()}
+    out = {}
+    for k, v in raw.items():
+        kind = pii_cols.get(k)
+        if kind == DETECT_PII:
+            kind = detect_value_pii(v) if v else None
+        out[k] = mask_value(v, kind) if kind and v else v
+    return out
 
 
 class DuplicateFileError(ValueError):
@@ -192,63 +204,90 @@ def create_batch(source_id: str, file_path: Path, filename: str, actor: str, all
     """Register an arriving file. With strict=False (unattended S3/scheduler arrivals) a file that cannot be
     sequenced is still recorded, as a failed batch with the reason, so nothing disappears silently."""
     from ..storage import local_path
-    from .delivery import LOAD_TYPES, DeliveryError, display_sequence, extract_sequence, file_action, profile_of
 
     local = local_path(file_path)
     digest = file_sha256(local)
     with db.get_engine().begin() as c:
-        src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
-        if not src:
-            raise ValueError("unknown source")
-        if not src.active_mapping_id:
-            raise ValueError("source has no approved mapping; complete onboarding first")
-        prior = c.execute(select(db.batches.c.batch_id, db.batches.c.created_at).where(
-            db.batches.c.source_id == source_id, db.batches.c.file_sha256 == digest,
-            db.batches.c.status.not_in(("failed", "discarded")))).first()
-        if prior and not allow_duplicate:
-            raise DuplicateFileError(prior.batch_id, prior.created_at)
-        if prior and not reason:
-            raise ValueError("a reason is required to re-submit an identical file")
-        prof = profile_of(src.delivery)
-        lt = load_type or prof["load_type"]
-        problem, seq = None, None
-        vstatus = c.execute(select(db.vendors.c.status, db.vendors.c.name).where(db.vendors.c.vendor_id == src.vendor_id)).first()
-        try:
-            if vstatus and vstatus.status in ("suspended", "offboarded"):
-                raise DeliveryError(f"vendor {vstatus.name} is {vstatus.status}; its files are recorded but not processed")
-            if lt not in LOAD_TYPES:
-                raise DeliveryError(f"load_type must be one of {', '.join(LOAD_TYPES)}")
-            if lt == "incremental" and prof["action"].get("mode") == "filename" and not file_action(prof, filename):
-                raise DeliveryError(f"'{filename}' does not match any add/update/close filename pattern for this vendor")
-            if lt != "full":
-                first = None
-                if prof["sequence"].get("source") == "column":
-                    _, rows = read_sample(local, 1, ParseOptions(**(src.parse_options or {})))
-                    first = rows[0] if rows else None
-                seq = extract_sequence(prof, filename, first)
-                if seq is not None:
-                    clash = c.execute(select(db.batches.c.batch_id).where(
-                        db.batches.c.source_id == source_id, db.batches.c.sequence == seq, db.batches.c.load_type != "full",
-                        db.batches.c.status.not_in(("failed", "discarded", "completed")))).first()
-                    if clash:
-                        raise DeliveryError(f"a file with sequence {display_sequence(seq)} is already pending as batch {clash.batch_id}; "
-                                            "discard it first if this file replaces it")
-        except DeliveryError as e:
-            if strict:
-                raise
-            problem = str(e)
-        bid = db.new_id("bat")
-        c.execute(db.batches.insert().values(batch_id=bid, source_id=source_id, mapping_id=src.active_mapping_id, filename=filename,
-                                             file_path=str(file_path), status="failed" if problem else "queued", submitted_by=actor,
-                                             micro_batches=[], file_sha256=digest, total_rows=estimate_rows(local),
-                                             load_type=lt if lt in LOAD_TYPES else "full", sequence=seq, error=problem))
-        from ..scheduling.service import match_arrival
+        return _register_batch(c, source_id, file_path, filename, actor, local, digest, allow_duplicate, reason, load_type, strict)
 
-        delivery_id = match_arrival(c, source_id, bid, filename)
-        db.audit(c, actor, "batch.create", "batch", bid, {"file": filename, "source_id": source_id, "sha256": digest, "load_type": lt,
-                                                           "sequence": display_sequence(seq), "delivery_id": delivery_id,
-                                                           **({"rejected": problem} if problem else {}),
-                                                           **({"duplicate_of": prior.batch_id, "reason": reason} if prior else {})})
+
+SET_LOAD_TYPE_ERROR = ("multi-file (file-set) batches load as full in this phase; snapshot and incremental load types "
+                       "are not supported for feeds with a layout")
+
+
+def _lock_source(c, source_id: str) -> None:
+    """Write-first lock on the feed row (no-op update; as multifile.fileset._lock_source and lifecycle._lock_feed):
+    serialises batch registration with archive/restore on PostgreSQL (row lock) and SQLite (database write lock)."""
+    s = db.sources
+    c.execute(s.update().where(s.c.source_id == source_id).values(source_id=s.c.source_id))
+
+
+def _register_batch(c, source_id: str, file_path, filename: str, actor: str, local: Path, digest: str, allow_duplicate: bool,
+                    reason: str | None, load_type: str | None, strict: bool, file_set_id: str | None = None) -> str:
+    """create_batch's body on an open connection (the caller owns the transaction). `file_set_id` links the
+    batch to its multi-file set in the same insert, so a queued set batch is never visible unlinked."""
+    from .delivery import LOAD_TYPES, DeliveryError, display_sequence, extract_sequence, file_action, profile_of
+
+    _lock_source(c, source_id)  # write-first row lock: an archive in flight either finishes first (seen below) or waits for us
+    src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
+    if not src:
+        raise ValueError("unknown source")
+    if src.status == "retired":
+        from ..lifecycle import FeedArchivedError
+
+        raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before sending it files")
+    if not src.active_mapping_id:
+        raise ValueError("source has no approved mapping; complete onboarding first")
+    prior = c.execute(select(db.batches.c.batch_id, db.batches.c.created_at).where(
+        db.batches.c.source_id == source_id, db.batches.c.file_sha256 == digest,
+        db.batches.c.status.not_in(("failed", "discarded")))).first()
+    if prior and not allow_duplicate:
+        raise DuplicateFileError(prior.batch_id, prior.created_at)
+    if prior and not reason:
+        raise ValueError("a reason is required to re-submit an identical file")
+    prof = profile_of(src.delivery)
+    lt = load_type or prof["load_type"]
+    problem, seq = None, None
+    vstatus = c.execute(select(db.vendors.c.status, db.vendors.c.name).where(db.vendors.c.vendor_id == src.vendor_id)).first()
+    try:
+        if vstatus and vstatus.status in ("suspended", "offboarded"):
+            raise DeliveryError(f"vendor {vstatus.name} is {vstatus.status}; its files are recorded but not processed")
+        if lt not in LOAD_TYPES:
+            raise DeliveryError(f"load_type must be one of {', '.join(LOAD_TYPES)}")
+        if file_set_id and lt != "full":  # join-excluded masters would look absent from a snapshot (Phase 1)
+            raise DeliveryError(SET_LOAD_TYPE_ERROR)
+        if lt == "incremental" and prof["action"].get("mode") == "filename" and not file_action(prof, filename):
+            raise DeliveryError(f"'{filename}' does not match any add/update/close filename pattern for this vendor")
+        if lt != "full":
+            first = None
+            if prof["sequence"].get("source") == "column":
+                _, rows = read_sample(local, 1, ParseOptions(**(src.parse_options or {})))
+                first = rows[0] if rows else None
+            seq = extract_sequence(prof, filename, first)
+            if seq is not None:
+                clash = c.execute(select(db.batches.c.batch_id).where(
+                    db.batches.c.source_id == source_id, db.batches.c.sequence == seq, db.batches.c.load_type != "full",
+                    db.batches.c.status.not_in(("failed", "discarded", "completed")))).first()
+                if clash:
+                    raise DeliveryError(f"a file with sequence {display_sequence(seq)} is already pending as batch {clash.batch_id}; "
+                                        "discard it first if this file replaces it")
+    except DeliveryError as e:
+        if strict:
+            raise
+        problem = str(e)
+    bid = db.new_id("bat")
+    c.execute(db.batches.insert().values(batch_id=bid, source_id=source_id, mapping_id=src.active_mapping_id, filename=filename,
+                                         file_path=str(file_path), status="failed" if problem else "queued", submitted_by=actor,
+                                         micro_batches=[], file_sha256=digest, total_rows=estimate_rows(local),
+                                         load_type=lt if lt in LOAD_TYPES else "full", sequence=seq, error=problem,
+                                         **({"file_set_id": file_set_id} if file_set_id else {})))
+    from ..scheduling.service import match_arrival
+
+    delivery_id = match_arrival(c, source_id, bid, filename)
+    db.audit(c, actor, "batch.create", "batch", bid, {"file": filename, "source_id": source_id, "sha256": digest, "load_type": lt,
+                                                       "sequence": display_sequence(seq), "delivery_id": delivery_id,
+                                                       **({"rejected": problem} if problem else {}),
+                                                       **({"duplicate_of": prior.batch_id, "reason": reason} if prior else {})})
     return bid
 
 
@@ -256,7 +295,7 @@ class BatchBusyError(RuntimeError):
     pass
 
 
-LEASE_FROM = ("queued", "claimed", "paused", "failed", "blocked")
+LEASE_FROM = ("queued", "claimed", "paused", "failed", "blocked", "staged")
 STALE_AFTER_MINUTES = 10
 
 
@@ -286,7 +325,9 @@ def recover_stale(minutes: int = STALE_AFTER_MINUTES) -> list[str]:
 
 def override_preflight(batch_id: str, actor: str, roles: list[str], reason: str) -> None:
     """An SME/Compliance user accepts the drift risk and lets a blocked batch run on the current mapping."""
-    if not set(roles) & {"sme", "compliance", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"onboarding_reviewer", "compliance_reviewer", "admin"}:
         raise ValueError("SME or Compliance role required to override a drift block")
     if not reason:
         raise ValueError("a reason is required")
@@ -331,6 +372,46 @@ def _safe_error(e: Exception) -> str:
     return f"{e.__class__.__name__}: {msg}"[:1000]
 
 
+JOIN_HEARTBEAT_SECONDS = 60
+
+
+def _join_stage(batch_id: str, cfg, worker_id: str) -> dict:
+    """Multi-file batches only (the caller holds the lease): materialize the joined file. A block sets the batch
+    `blocked` (resumable through override_preflight); a failure sets it `failed` and re-raises. The error text
+    keeps only our own messages (roles, columns, counts); any other error is reduced to its class name."""
+    from ..multifile import stage
+    from ..multifile.layout import LayoutError
+
+    eng = db.get_engine()
+    stop = threading.Event()
+
+    def beat():  # a long join must not look like a dead worker to recover_stale
+        while not stop.wait(JOIN_HEARTBEAT_SECONDS):
+            with contextlib.suppress(Exception), eng.begin() as c:  # only this worker's own lease
+                c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status == "running",
+                                                    db.batches.c.worker_id == worker_id).values(heartbeat_at=db.now()))
+
+    hb = threading.Thread(target=beat, daemon=True, name=f"join-heartbeat-{batch_id}")
+    hb.start()
+    try:
+        res = stage.materialize_join(batch_id, cfg)
+    except Exception as e:
+        msg = (f"join: {(str(e).splitlines() or [''])[0]}"[:1000] if isinstance(e, stage.StageError | LayoutError)
+               else f"join: {e.__class__.__name__} (details withheld: may contain data values)")
+        log.error("batch %s join stage failed: %s", batch_id, e.__class__.__name__)
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="failed", error=msg, worker_id=None))
+            db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": msg[:500], "stage": "join"})
+        raise
+    finally:
+        stop.set()
+        hb.join(timeout=5)
+    if res["status"] == "blocked":  # materialize_join has already set the batch blocked in the same write
+        return res
+    return {**res, "parse_options": dict(stage.JOINED_PARSE_OPTIONS),
+            "pii_cols": stage.joined_pii_cols(cfg, res["summary"].get("columns") or [])}
+
+
 def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int | None = None) -> dict:
     s = get_settings()
     workers = workers or s.workers
@@ -343,7 +424,19 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
         if b is None:
             raise ValueError("unknown batch")
-        active = c.execute(select(db.sources.c.active_mapping_id).where(db.sources.c.source_id == b.source_id)).scalar()
+        src = c.execute(select(db.sources.c.active_mapping_id, db.sources.c.status, db.sources.c.name)
+                        .where(db.sources.c.source_id == b.source_id)).first()
+        active = src.active_mapping_id if src else None
+    if src is not None and src.status == "retired":
+        # backstop for every runner (local thread, worker, Glue/Step Functions): a retired feed loads nothing
+        from ..lifecycle import FeedArchivedError
+
+        msg = "feed archived: restore the feed before running its files"
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status.notin_(("completed", "running")))
+                      .values(status="failed", error=msg, worker_id=None))
+            db.audit(c, "pipeline", "batch.feed_archived", "batch", batch_id, {"source_id": b.source_id})
+        raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before running its files")
     # The data plane reads only the feed's published (approved, signed) configuration, never the live tables.
     try:
         cfg = load_config(b.source_id)
@@ -354,6 +447,11 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
             c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="failed", error=f"configuration: {e}"))
             db.audit(c, "pipeline", "batch.config_rejected", "batch", batch_id, {"error": str(e)})
         raise
+    if b.file_set_id and (b.load_type or "full") != "full":  # refused at registration; never run (Phase 1)
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="failed", error=SET_LOAD_TYPE_ERROR))
+            db.audit(c, "pipeline", "batch.load_type_rejected", "batch", batch_id, {"load_type": b.load_type})
+        raise ValueError(SET_LOAD_TYPE_ERROR)
     if cfg.mapping_id != b.mapping_id:
         # resuming a drift-blocked batch (or one queued before a new version) runs on the newest published mapping
         with eng.begin() as c:
@@ -372,15 +470,25 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         if g and g["decision"] != "go":
             return {"batch_id": batch_id, "status": "waiting" if g["decision"] == "wait" else "out_of_order", "sequence": g}
         raise BatchBusyError(f"batch {batch_id} is already being processed")
+    from ..storage import local_path
+
+    src_path, src_opts, pf_extra, pf_keep, join = b.file_path, cfg.parse_options, {}, {}, None
+    if b.file_set_id:  # multi-file set: join once, then read the joined file in place of the master
+        join = _join_stage(batch_id, cfg, worker_id)
+        if join["status"] == "blocked":
+            return {"batch_id": batch_id, "status": "blocked", "join": {k: join[k] for k in ("stage", "message")}}
+        with eng.connect() as c:
+            b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
+        src_path, src_opts, pf_extra = join["joined_path"], join["parse_options"], {"joined_columns": join["extra_columns"]}
+        pf_keep = {k: v for k, v in (b.preflight or {}).items() if k == "join_overrides"}  # survives the drift re-check
     # ---- schema-drift pre-flight (first run, or the mapping changed since the last check)
     pf = b.preflight or {}
     if (b.checkpoint or 0) == 0 and not pf.get("override") and (pf.get("mapping_id") != cfg.mapping_id or pf.get("decision") == "block"):
-        from ..storage import local_path
         from .preflight import check_file
 
-        pf = {**check_file(local_path(b.file_path), cfg.parse_options, cfg.profile, cfg.fields, sparse=(b.load_type == "incremental"),
-                           delivery=cfg.delivery), "mapping_id": cfg.mapping_id, "mapping_version": cfg.mapping_version,
-              "config_version": cfg.version, "checked_at": db.now().isoformat()}
+        pf = {**check_file(local_path(src_path), src_opts, cfg.profile, cfg.fields, sparse=(b.load_type == "incremental"),
+                           delivery=cfg.delivery, **pf_extra), "mapping_id": cfg.mapping_id, "mapping_version": cfg.mapping_version,
+              "config_version": cfg.version, "checked_at": db.now().isoformat(), **pf_keep}
         with eng.begin() as c:
             c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(preflight=pf))
             db.audit(c, "pipeline", f"batch.preflight_{pf['decision']}", "batch", batch_id, {"summary": pf["summary"]})
@@ -395,7 +503,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
     fields = cfg.fields
     runtime_set = cfg.runtime_set
     fields_key = f"{cfg.mapping_id}:{cfg.mapping_version}|{cfg.rules_key}"
-    pii_cols = cfg.pii_cols
+    pii_cols = join["pii_cols"] if join else cfg.pii_cols
     triage = Triage()
     triage.runtime_set = runtime_set
     checkpoint = b.checkpoint or 0
@@ -404,7 +512,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
                 "loaded": b.loaded or 0}
     t_start = time.monotonic()
     rows_this_run = 0
-    opts = ParseOptions(**(cfg.parse_options or {}))
+    opts = ParseOptions(**(src_opts or {}))
     incremental = (b.load_type or "full") != "full"
     change_acc = dict(b.change_summary or {}) if incremental else None
     incr_base, key_mapper = incremental_context(b, cfg) if incremental else (None, None)
@@ -412,9 +520,7 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(
             sequence_detail={**(b.sequence_detail or {}), "config": {"version": cfg.version, "sha256": cfg.sha256[:16]}}))
     try:
-        from ..storage import local_path
-
-        _, it = iter_rows(local_path(b.file_path), opts)
+        _, it = iter_rows(local_path(src_path), opts)
         # skip already-checkpointed rows
         for _ in range(checkpoint):
             next(it, None)
@@ -478,6 +584,10 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
                 c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(status="paused", worker_id=None))
             else:
                 rec = reconcile(c, batch_id, counters["processed"])
+                if join:
+                    from ..multifile import stage
+
+                    rec = stage.join_reconciliation(rec, join["summary"])
                 c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id).values(
                     status="completed", total_rows=counters["processed"], finished_at=db.now(), reconciliation=rec, worker_id=None,
                     **({"change_summary": dict(change_acc)} if change_acc is not None else {})))
@@ -678,9 +788,12 @@ def _record_load_rejections(c, batch_id, source_id, rejected, staging_rows, ids,
 def _persist_chunk(batch_id, source_id, results, triage: Triage, pii_cols, counters, progress=None, change_acc: dict | None = None) -> dict:
     from .changes import apply_closes, apply_updates, conflict_failures
 
+    # ponytail: LBP_SLIM_STAGING drops PASS/WARN JSON from staging (loan still lands in sse_loans). Needed for 10M POC on small RDS; remove when storage is sized for full audit rows.
+    slim = os.environ.get("LBP_SLIM_STAGING", "").lower() in ("1", "true", "yes")
     dups = detect_duplicates(batch_id, results)
     staged, ex_rows_by_idx, st = _triage_results(results, triage)
     staging_rows = []
+    adds: list[tuple[dict, str]] = []
     for r, rec, status in staged:
         action = "unchanged" if status == "UNCHANGED" else r.get("action")
         changes = None
@@ -694,15 +807,18 @@ def _persist_chunk(batch_id, source_id, results, triage: Triage, pii_cols, count
                                  "status": status, "record": {}, "raw": None, "transform_errors": {}, "boarded": False,
                                  "action": "unchanged", "changes": None, "base_version": r.get("base_version")})
             continue
+        boarded = status in ("PASS", "WARN")
+        if boarded and action in (None, "add"):
+            adds.append((rec, status))
+        store_rec = {} if slim and boarded and action in (None, "add") else rec
         staging_rows.append({"batch_id": batch_id, "row_number": r["row"], "loan_number": _str(rec.get("loan_number")),
-                             "status": status, "record": rec, "raw": _mask_raw(r["raw"], pii_cols), "transform_errors": r["terrs"],
-                             "boarded": status in ("PASS", "WARN"), "action": action, "changes": changes,
+                             "status": status, "record": store_rec, "raw": None if slim else _mask_raw(r["raw"], pii_cols),
+                             "transform_errors": r["terrs"], "boarded": boarded, "action": action, "changes": changes,
                              "base_version": r.get("base_version")})
     with db.get_engine().begin() as c:
         ids = [row[0] for row in c.execute(db.loans_staging.insert().returning(db.loans_staging.c.id), staging_rows)] if staging_rows else []
         _insert_exceptions(c, _exception_rows(batch_id, source_id, ex_rows_by_idx, [s["loan_number"] for s in staging_rows], ids))
         rejected: list = []
-        adds = [(s["record"], s["status"]) for s in staging_rows if s["boarded"] and s["action"] in (None, "add")]
         loaded = load_records(c, adds, batch_id, rejected, source_id=source_id)
         if rejected:
             _record_load_rejections(c, batch_id, source_id, rejected, staging_rows, ids, triage)
@@ -874,7 +990,8 @@ def reconcile(conn, batch_id: str, source_rows: int) -> dict:
     out = {
         "source_rows": source_rows, "staged": staged, "boarded": boarded, "held_in_exceptions": held, "rejected": rejected,
         "unchanged": unchanged, "in_sse": in_sse, "duplicate_loan_numbers": dup, "exceptions_by_status": by_status,
-        "balanced": source_rows == staged == boarded + held + rejected + unchanged and in_sse <= adds_boarded,
+        # in_sse must match boarded adds for this batch — missing dirty loans.jsonl rows used to slip through with <=.
+        "balanced": source_rows == staged == boarded + held + rejected + unchanged and in_sse == adds_boarded,
     }
     changed_boarded = n(st.c.boarded.is_(True), st.c.action.in_(("update", "close")))
     if changed_boarded or unchanged:

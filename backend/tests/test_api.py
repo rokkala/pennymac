@@ -79,7 +79,9 @@ def test_incremental_and_scheduler_api(client, onboarded, tmp_path):
     pv = client.get("/api/schedules/preview?cron=0%206%20*%20*%20MON-FRI&timezone=America/New_York").json()
     assert pv["valid"] and pv["describe"] == "Business days at 06:00"
     cfg = {"cron": "0 6 * * MON-FRI", "timezone": "America/New_York", "calendar": "us_federal"}
-    assert client.post("/api/schedules", json={"source_id": sid, "name": "PCG daily", "config": cfg}, headers=an).status_code == 403
+    # compliance (member) cannot create schedules; onboarding/monitoring can
+    assert client.post("/api/schedules", json={"source_id": sid, "name": "PCG daily", "config": cfg},
+                       headers={"X-User": "comp", "X-Roles": "compliance"}).status_code == 403
     s = client.post("/api/schedules", json={"source_id": sid, "name": "PCG daily", "config": cfg}, headers=ops).json()
     assert s["status"] == "pending_approval"
     assert client.post(f"/api/schedules/{s['schedule_id']}/approve", json={"approve": True}, headers=ops).status_code == 403

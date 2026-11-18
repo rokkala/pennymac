@@ -48,7 +48,10 @@ def get_policy() -> dict:
 
 
 def set_policy(changes: dict, requested_by: str, approved_by: str, approver_roles: list[str], reason: str | None = None) -> dict:
-    if "compliance" not in (approver_roles or []):
+    from ..security import expand_roles
+
+    roles = set(expand_roles(approver_roles or []))
+    if "compliance_reviewer" not in roles and "admin" not in roles:
         raise PolicyError("policy changes require Compliance approval")
     emergency_off = changes == {"t1_enabled": False}
     if requested_by == approved_by and not emergency_off:  # switching auto-apply OFF is the safe direction: one person may do it

@@ -1,9 +1,12 @@
-import React, { useState } from "react";
-import { api, scoped } from "../api.js";
+import React, { useRef, useState } from "react";
+import { api, scoped, archiveFeed, restoreFeed, deleteFeed, inspectMultiFiles, previewMultiFiles, createMultiFileFeed } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field } from "../ui.jsx";
+import { canArchive, canRestore, canDelete, splitFeeds, archivedLine, RESTORE_NOTE } from "../lifecycleModel.js";
+import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field, PageHeader, ActionBar, useDialog } from "../ui.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { BatchModal } from "./Imports.jsx";
+import { LayoutEditor, PreviewResult } from "./FeedLayout.jsx";
+import { emptyReadiness, starterLayout, validateLayoutForm, roleNameOk, rolesWithoutSample, filesToSend, stripClientIds, ensureColumnIds, checkSignature } from "../layoutModel.js";
 
 export const VENDOR_TYPES = { correspondent: "Correspondent", bulk_seller: "Bulk seller", sub_servicer: "Sub-servicer", retail: "Retail channel", other: "Other" };
 const LT = { full: "full tapes", incremental: "change files", snapshot: "snapshots" };
@@ -40,7 +43,7 @@ export function VendorModal({ initial, onClose, onSaved }) {
   );
 }
 
-export function FeedModal({ vendor, onClose, onCreated }) {
+function OneFileFeed({ vendor, onClose, onCreated, modeSwitch }) {
   const [name, setName] = useState("");
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -54,6 +57,7 @@ export function FeedModal({ vendor, onClose, onCreated }) {
   };
   return (
     <Modal title={`Add a feed for ${vendor.name}`} onClose={onClose} footer={<button className="btn primary" disabled={!name || !file || busy} onClick={go}>{busy ? "Profiling…" : "Profile and suggest mappings"}</button>}>
+      {modeSwitch}
       <p className="muted">A feed is one file layout this vendor sends (for example a boarding tape, a daily change file or a monthly snapshot). Each feed has its own mapping, delivery profile and schedule. Upload a sample: IntelliMap profiles every column, flags PII and proposes the mapping to SSE.</p>
       <label className="stack" style={{ gap: 4 }} htmlFor="fd-name"><span className="eyebrow">Feed name</span>
         <input id="fd-name" className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Boarding tape, Daily changes" /></label>
@@ -63,6 +67,129 @@ export function FeedModal({ vendor, onClose, onCreated }) {
   );
 }
 
+
+const nextRole = (taken) => { for (let i = 1; ; i++) { const r = i === 1 ? "details" : `details${i}`; if (!taken.includes(r)) return r; } };
+const SAMPLE_ACCEPT = ".csv,.txt,.xlsx,.dat,.psv";
+
+function ModeSwitch({ mode, setMode }) {
+  return (
+    <div className="row" role="group" aria-label="How many files does this feed have" style={{ gap: 4 }}>
+      {[["one", "One file"], ["several", "Several files"]].map(([k, t]) => <button key={k} type="button" className={`btn sm ${mode === k ? "primary" : ""}`} aria-pressed={mode === k} onClick={() => setMode(k)}>{t}</button>)}
+    </div>
+  );
+}
+
+/** Add a feed from sample files: one main file plus detail files, joined before anything loads. */
+function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
+  const [name, setName] = useState("");
+  const [slots, setSlots] = useState([{ id: 1, role: "master", file: null, info: null, err: "" }, { id: 2, role: "details", file: null, info: null, err: "" }]);
+  const [layout, setLayoutState] = useState(null);
+  const [ready, setReady] = useState(emptyReadiness());
+  const [check, setCheck] = useState(null);
+  const [busy, setBusy] = useState("");
+  const [created, setCreated] = useState(false);
+  const act = useAction();
+  const fileRef = useRef({}); // latest picked file per slot, to drop a late inspect answer
+  const setLayout = (u) => { setLayoutState((l) => ensureColumnIds(typeof u === "function" ? u(l) : u)); setCheck(null); };
+  const patch = (id, p) => setSlots((xs) => xs.map((x) => (x.id === id ? { ...x, ...p } : x)));
+  const resetLayout = () => { setLayoutState(null); setCheck(null); };
+  const pick = async (slot, file) => {
+    resetLayout();
+    if (!file) { fileRef.current[slot.id] = null; patch(slot.id, { file: null, info: null, err: "" }); return; }
+    patch(slot.id, { file, info: null, err: "" });
+    fileRef.current[slot.id] = file;
+    try {
+      const r = await inspectMultiFiles({ [slot.role || "file"]: file });
+      if (fileRef.current[slot.id] === file) patch(slot.id, { info: Object.values(r)[0] || null });
+    } catch (e) { if (fileRef.current[slot.id] === file) patch(slot.id, { err: e.message }); }
+  };
+  const setRole = (slot, v) => { resetLayout(); patch(slot.id, { role: v.trim() }); };
+  const addSlot = () => setSlots((xs) => [...xs, { id: Math.max(...xs.map((x) => x.id)) + 1, role: nextRole(xs.map((x) => x.role)), file: null, info: null, err: "" }]);
+  const removeSlot = (id) => { resetLayout(); setSlots((xs) => xs.filter((x) => x.id !== id)); };
+  const roles = slots.map((x) => x.role);
+  const slotProblems = [
+    ...roles.filter((r, i) => r && roles.indexOf(r) !== i).map((r) => `Two files are called ${r}.`),
+    ...slots.filter((x) => x.role !== "master" && !roleNameOk(x.role)).map((x) => `The file name ${x.role || "(empty)"} is not allowed: use lowercase letters, digits and underscores, starting with a letter.`),
+  ];
+  const filesReady = slots.length >= 2 && slots.every((x) => x.file && x.info) && !slotProblems.length;
+  const columnsByRole = Object.fromEntries(slots.filter((x) => x.info).map((x) => [x.role, x.info.columns]));
+  const setUp = () => {
+    const l = starterLayout(slots.map((x) => ({ role: x.role, filename: x.file.name, columns: x.info.columns })), "master");
+    for (const r of l.relations) if (!r.on.length) r.on = [{ parent: "", detail: "" }]; // no shared column name: show an empty pair to fill in
+    setLayoutState(ensureColumnIds(l)); setCheck(null);
+  };
+  const filesByRole = filesToSend(layout || { files: [] }, Object.fromEntries(slots.map((x) => [x.role, x.file])));
+  const problems = layout ? [
+    ...validateLayoutForm(layout, ready, columnsByRole),
+    ...rolesWithoutSample(layout, filesByRole).map((r) => `The layout has a file called ${r} but no sample file was picked for it. Add it above as a detail file, then set up the join again.`),
+  ] : [];
+  const sig = layout ? checkSignature(layout, ready, filesByRole) : "";
+  const sigRef = useRef(sig);
+  sigRef.current = sig;
+  const runCheck = async () => {
+    const started = sig;
+    setBusy("check");
+    const r = await act(() => previewMultiFiles(stripClientIds(layout), ready, filesByRole));
+    setBusy("");
+    if (r && sigRef.current === started) setCheck(r); // an edit made while joining makes this result stale
+  };
+  const checked = !!check && !check.errors?.length;
+  const create = async () => {
+    setBusy("create");
+    const r = await act(() => createMultiFileFeed({ name: name.trim(), vendorId: vendor.vendor_id, layout: stripClientIds(layout), readiness: ready, filesByRole }),
+      "Feed created. The layout needs a second person's approval before files use it.");
+    setBusy("");
+    if (r) { setCreated(true); onCreated(r.mapping_id); }
+  };
+  const minRate = Math.max(0, ...(layout?.relations || []).map((r) => Number(r.min_match_rate) || 0));
+  return (
+    <Modal title={`Add a feed for ${vendor.name}`} onClose={onClose} size="lg"
+      footer={<>
+        <button type="button" className="btn" onClick={onClose}>Cancel</button>
+        {layout && <button type="button" className="btn" disabled={!!busy || created || !!problems.length} onClick={runCheck}>{busy === "check" ? "Joining…" : "Check the join"}</button>}
+        {layout && <button type="button" className="btn primary" disabled={!name.trim() || !checked || !!busy || created || !!problems.length} onClick={create}>{busy === "create" ? "Creating…" : "Create feed and draft mapping"}</button>}
+      </>}>
+      {modeSwitch}
+      <p className="muted">One main file plus detail files, joined into one table before anything loads. Pick one small sample of each. Nothing is stored until you create the feed, and the layout then waits for a second person's approval.</p>
+      <label className="stack" style={{ gap: 4 }} htmlFor="mf-name"><span className="eyebrow">Feed name</span>
+        <input id="mf-name" className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Boarding tape with loan details" /></label>
+      <div className="stack">
+        {slots.map((x) => (
+          <div key={x.id} className="callout stack" style={{ gap: 6 }}>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+              {x.role === "master"
+                ? <><b className="mono">master</b><span className="pill accent">main file</span></>
+                : <><input aria-label="Detail file role" disabled={busy === "check"} className="input mono" style={{ width: 160 }} value={x.role} onChange={(e) => setRole(x, e.target.value)} placeholder="role name" /><span className="pill">detail file</span></>}
+              <input aria-label={x.role === "master" ? "Main sample file" : `${x.role || "Detail"} sample file`} type="file" accept={SAMPLE_ACCEPT} disabled={busy === "check"} onChange={(e) => pick(x, e.target.files[0] || null)} />
+              {x.role !== "master" && slots.length > 2 && <button type="button" className="btn sm" style={{ marginLeft: "auto" }} disabled={busy === "check"} onClick={() => removeSlot(x.id)}>Remove</button>}
+            </div>
+            {x.err && <div style={{ color: "var(--fail)", fontSize: ".82rem" }}>{x.err}</div>}
+            {x.info && <div className="row" style={{ gap: 4, flexWrap: "wrap" }}><span className="faint" style={{ fontSize: ".78rem" }}>{x.info.columns.length} columns found:</span>
+              {x.info.columns.map((c) => <span key={c} className="chip mono">{c}</span>)}</div>}
+          </div>))}
+        <div><button type="button" className="btn sm" disabled={busy === "check"} onClick={addSlot}>+ Add a detail file</button></div>
+        {slotProblems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><ul style={{ margin: "0 0 0 18px" }}>{slotProblems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
+        {!layout && <div className="row"><button type="button" className="btn primary" disabled={!filesReady} onClick={setUp}>Set up the join</button>
+          {!filesReady && <span className="faint" style={{ fontSize: ".8rem" }}>Choose a sample for every file first.</span>}</div>}
+      </div>
+      {layout && <>
+        <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={(r) => { setReady(r); setCheck(null); }} disabled={created || busy === "check"} columnsByRole={columnsByRole} fixedFiles />
+        {problems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><b>Fix before checking the join</b>
+          <ul style={{ margin: "6px 0 0 18px" }}>{problems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
+        {!check && !problems.length && <span className="faint" style={{ fontSize: ".82rem" }}>Run "Check the join" to see how the samples join. You can create the feed once it runs without errors.</span>}
+        <PreviewResult res={check} minRate={minRate} />
+      </>}
+    </Modal>
+  );
+}
+
+export function FeedModal({ vendor, onClose, onCreated }) {
+  const [mode, setMode] = useState("one");
+  const sw = <ModeSwitch mode={mode} setMode={setMode} />;
+  return mode === "one" ? <OneFileFeed vendor={vendor} onClose={onClose} onCreated={onCreated} modeSwitch={sw} />
+    : <SeveralFilesFeed vendor={vendor} onClose={onClose} onCreated={onCreated} modeSwitch={sw} />;
+}
+
 export function VendorList({ persona, onOpen, onCreated }) {
   const v = useApi("/api/vendors");
   const [create, setCreate] = useState(false);
@@ -70,11 +197,13 @@ export function VendorList({ persona, onOpen, onCreated }) {
   const list = v.data.vendors;
   return (
     <>
-      <div className="page-head">
-        <div><span className="eyebrow">Workflow 1 · vendor onboarding</span><h1>Vendors & Mapping</h1>
-          <p className="sub">Each vendor owns one or more feeds: a boarding tape, change files, snapshots. Every feed has its own mapping versions, delivery profile and schedule. A new vendor or feed is configuration, not a code change.</p></div>
-        {canCap(persona, "editVendors") && <button className="btn primary" onClick={() => setCreate(true)}>Onboard vendor</button>}
-      </div>
+      <PageHeader
+        eyebrow="Setup"
+        title="Vendors"
+        sub="Set up a seller's files and how their columns map."
+        guideHref="#guide?path=setup&step=vendor"
+        primary={canCap(persona, "editVendors") ? <button type="button" className="btn primary" onClick={() => setCreate(true)}>Onboard vendor</button> : null}
+      />
       <Kpis items={[
         { label: "Vendors", value: list.length, detail: `${list.filter((x) => x.status === "active").length} active · ${list.filter((x) => x.status === "onboarding").length} onboarding` },
         { label: "Feeds", value: list.reduce((a, x) => a + x.feeds, 0), detail: `${list.reduce((a, x) => a + x.live_feeds, 0)} live` },
@@ -104,7 +233,7 @@ export function VendorList({ persona, onOpen, onCreated }) {
   );
 }
 
-function FeedCard({ f, onOpenMapping, onDelivery, go, onMove, persona }) {
+function FeedCard({ f, onOpenMapping, onDelivery, go, onMove, onArchive, persona }) {
   const latest = f.mappings[f.mappings.length - 1];
   const live = f.mappings.find((m) => m.mapping_id === f.active_mapping_id);
   return (
@@ -128,8 +257,55 @@ function FeedCard({ f, onOpenMapping, onDelivery, go, onMove, persona }) {
         <button className="btn sm" onClick={() => go("imports")}>Files</button>
         <span className="spacer" />
         {canCap(persona, "moveFeed") && <button className="btn sm" onClick={() => onMove(f)}>Move…</button>}
+        {canArchive(persona, f) && <button className="btn sm" onClick={() => onArchive(f)}>Archive…</button>}
       </div>
     </div>
+  );
+}
+
+function ArchivedFeeds({ feeds, persona, onRestore, onDelete }) {
+  if (!feeds.length) return null;
+  return (
+    <Panel title={`Archived feeds (${feeds.length})`} sub="Kept for history. No files are accepted and nothing is scheduled while a feed is archived." pad={false}>
+      <div className="tbl-wrap"><table className="tbl">
+        <thead><tr><th>Feed</th><th>Archived</th><th>Why</th><th /></tr></thead>
+        <tbody>{feeds.map((f) => (
+          <tr key={f.source_id}>
+            <td><b>{f.name}</b> <span className="pill">Archived</span></td>
+            <td className="faint">{f.retired_at ? ago(f.retired_at) : "—"}{f.retired_by ? ` · ${f.retired_by}` : ""}</td>
+            <td>{archivedLine({ retired_reason: f.retired_reason }) || <span className="faint">no reason recorded</span>}</td>
+            <td className="r"><span className="row" style={{ gap: 4, justifyContent: "flex-end" }}>
+              {canRestore(persona, f) && <button type="button" className="btn sm" onClick={() => onRestore(f)}>Restore…</button>}
+              {canDelete(persona, f) && <button type="button" className="btn sm danger" onClick={() => onDelete(f)}>Delete permanently…</button>}
+            </span></td>
+          </tr>))}</tbody>
+      </table></div>
+    </Panel>
+  );
+}
+
+function DeleteFeedModal({ feed, onClose, onDone }) {
+  const [reason, setReason] = useState("");
+  const [sure, setSure] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const act = useAction();
+  const go = async () => {
+    setBusy(true);
+    const r = await act(() => deleteFeed(feed.source_id, reason.trim()), `${feed.name} deleted`);
+    setBusy(false);
+    if (r) onDone();
+  };
+  return (
+    <Modal title={`Delete ${feed.name} permanently`} size="sm" onClose={onClose} busy={busy}
+      footer={<><button className="btn" onClick={onClose} disabled={busy}>Cancel</button>
+        <button className="btn danger" disabled={reason.trim().length < 5 || !sure || busy} onClick={go}>{busy ? "Working…" : "Delete permanently"}</button></>}>
+      <div className="stack">
+        <div className="callout t5"><b>This cannot be undone.</b> The feed, its mappings and its schedules are removed. This only works for a feed that never received a file; the server refuses otherwise, and archiving is the way to retire a used feed. The audit trail is kept.</div>
+        <Field id="df-r" label="Reason (audited)"><textarea id="df-r" className="input" rows={2} data-autofocus value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Created by mistake, never used" /></Field>
+        <span className="faint" style={{ fontSize: ".74rem" }}>At least 5 characters.</span>
+        <label className="row" style={{ gap: 6 }}><input type="checkbox" checked={sure} onChange={(e) => setSure(e.target.checked)} />I understand this cannot be undone</label>
+      </div>
+    </Modal>
   );
 }
 
@@ -200,36 +376,54 @@ export function VendorWorkspace({ vendorId, persona, go, onBack, onOpenMapping, 
   const v = useApi(`/api/vendors/${vendorId}`, [vendorId]);
   const all = useApi("/api/vendors");
   const [tab, setTab] = useState("feeds");
-  const [modal, setModal] = useState(null); // "feed" | "edit" | "status" | {move: feed}
+  const [modal, setModal] = useState(null); // "feed" | "edit" | "status" | {move: feed} | {del: feed}
+  const [dialog, ask] = useDialog();
+  const act = useAction();
   if (!v.data) return <Loading error={v.error} />;
   const x = v.data;
   const reload = () => { v.reload(); reloadVendors && reloadVendors(); };
+  const { active, archived } = splitFeeds(x.feeds);
+  const archive = (f) => ask({ kind: "reason", title: `Archive ${f.name}`, confirmLabel: "Archive feed", danger: true, required: true, minLength: 5,
+    help: `${f.name} stops accepting files and its schedules are paused. Its mappings, files and history are kept, and you can restore it later.${f.status === "live" ? " This feed is live; archiving it needs a reviewer." : ""}`,
+    placeholder: "e.g. Vendor no longer sends this file",
+    onSubmit: (reason) => act(() => archiveFeed(f.source_id, reason), `${f.name} archived`).then((r) => { if (r) reload(); return r; }) });
+  const restore = (f) => ask({ kind: "reason", title: `Restore ${f.name}`, confirmLabel: "Restore feed", required: true, minLength: 5,
+    help: RESTORE_NOTE, placeholder: "e.g. Vendor resumed sending this file",
+    onSubmit: (reason) => act(() => restoreFeed(f.source_id, reason), `${f.name} restored. Its schedules are still paused.`).then((r) => { if (r) reload(); return r; }) });
   return (
     <>
-      <div className="page-head">
-        <div><div className="crumbs">{onBack && <><a onClick={onBack}>All vendors</a><span className="faint">›</span></>}<span>{x.name}</span></div>
-          <h1 style={{ marginTop: 6 }}>{x.name}</h1>
-          <p className="sub">{VENDOR_TYPES[x.vendor_type] || human(x.vendor_type)} · <Status s={x.status} />{x.external_ref ? ` · ${x.external_ref}` : ""}{x.legal_name ? ` · ${x.legal_name}` : ""}
-            {x.contact?.email && <> · contact <a href={`mailto:${x.contact.email}`}>{x.contact.name || x.contact.email}</a></>}</p></div>
-        <div className="row">
-          <button className="btn" onClick={() => { pickVendor(vendorId); }} title="Scope every page to this vendor">Focus on this vendor</button>
-          {canCap(persona, "vendorLifecycle") && <button className="btn" onClick={() => setModal("status")}>Change status…</button>}
-          {canCap(persona, "editVendors") && <button className="btn primary" onClick={() => setModal("feed")}>Add feed</button>}</div>
-      </div>
+      <PageHeader
+        eyebrow={<span className="crumbs">{onBack && <><a onClick={onBack}>All vendors</a><span className="faint">›</span></>}<span>{x.name}</span></span>}
+        title={x.name}
+        sub={<>{VENDOR_TYPES[x.vendor_type] || human(x.vendor_type)} · <Status s={x.status} />{x.external_ref ? ` · ${x.external_ref}` : ""}{x.legal_name ? ` · ${x.legal_name}` : ""}
+          {x.contact?.email && <> · contact <a href={`mailto:${x.contact.email}`}>{x.contact.name || x.contact.email}</a></>}</>}
+        guideHref="#guide?path=setup&step=feed"
+        primary={canCap(persona, "editVendors") ? <button type="button" className="btn primary" onClick={() => setModal("feed")}>Add feed</button> : null}
+        secondary={(
+          <ActionBar>
+            <button type="button" className="btn" onClick={() => { pickVendor(vendorId); }} title="Scope every page to this vendor">Focus on this vendor</button>
+            {canCap(persona, "vendorLifecycle") && <button type="button" className="btn" onClick={() => setModal("status")}>Change status…</button>}
+          </ActionBar>
+        )}
+      />
       {x.status === "suspended" && <div className="callout t5" style={{ marginBottom: 12 }}><b>Suspended.</b> Files from this vendor are recorded but not processed.</div>}
       <Kpis items={[
-        { label: "Feeds", value: x.feeds.length, detail: `${x.live_feeds || 0} live` },
+        { label: "Feeds", value: active.length, detail: `${x.live_feeds || 0} live` },
         { label: "Active loans", value: fmt(x.active_loans) },
         { label: "Open exceptions", value: fmt(x.open_exceptions) },
         { label: "On time (30 d)", value: x.on_time_pct === null || x.on_time_pct === undefined ? "—" : `${x.on_time_pct}%`, detail: x.late_or_missed ? `${x.late_or_missed} late or missed` : "no late files" },
         { label: "Last file", value: ago(x.last_file) },
       ]} />
-      <Tabs value={tab} onChange={setTab} tabs={[{ id: "feeds", label: "Feeds & mappings", count: x.feeds.length }, { id: "deliveries", label: "Deliveries & schedules" },
+      <Tabs value={tab} onChange={setTab} tabs={[{ id: "feeds", label: "Feeds & mappings", count: active.length }, { id: "deliveries", label: "Deliveries & schedules" },
         { id: "files", label: "Files" }, { id: "exceptions", label: "Exceptions", count: x.open_exceptions }, { id: "profile", label: "Vendor profile" }]} />
-      {tab === "feeds" && (x.feeds.length ? <div className="feeds">{x.feeds.map((f) => <FeedCard key={f.source_id} f={f} go={(p) => { pickVendor(vendorId); go(p); }}
-        persona={persona} onMove={(feed) => setModal({ move: feed })}
-        onOpenMapping={(mid) => onOpenMapping(mid, "fields")} onDelivery={(mid) => onOpenMapping(mid, "delivery")} />)}</div>
-        : <Panel><div className="empty">No feeds yet. Add the vendor's first feed from a sample file.</div></Panel>)}
+      {tab === "feeds" && (
+        <div className="stack">
+          {active.length ? <div className="feeds">{active.map((f) => <FeedCard key={f.source_id} f={f} go={(p) => { pickVendor(vendorId); go(p); }}
+            persona={persona} onMove={(feed) => setModal({ move: feed })} onArchive={archive}
+            onOpenMapping={(mid) => onOpenMapping(mid, "fields")} onDelivery={(mid) => onOpenMapping(mid, "delivery")} />)}</div>
+            : <Panel><div className="empty">{archived.length ? "No active feeds. Restore an archived feed below or add a new one." : "No feeds yet. Add the vendor's first feed from a sample file."}</div></Panel>}
+          <ArchivedFeeds feeds={archived} persona={persona} onRestore={restore} onDelete={(f) => setModal({ del: f })} />
+        </div>)}
       {tab === "deliveries" && <VendorDeliveries vendorId={vendorId} />}
       {tab === "files" && <VendorFiles vendorId={vendorId} persona={persona} go={go} />}
       {tab === "exceptions" && <VendorExceptions vendorId={vendorId} go={go} pickVendor={pickVendor} />}
@@ -245,6 +439,8 @@ export function VendorWorkspace({ vendorId, persona, go, onBack, onOpenMapping, 
       {modal === "feed" && <FeedModal vendor={x} onClose={() => setModal(null)} onCreated={(mid) => { setModal(null); reload(); onOpenMapping(mid, "fields"); }} />}
       {modal === "edit" && <VendorModal initial={x} onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />}
       {modal === "status" && <VendorStatusModal vendor={x} onClose={() => setModal(null)} onDone={() => { setModal(null); reload(); }} />}
+      {dialog}
+      {modal?.del && <DeleteFeedModal feed={modal.del} onClose={() => setModal(null)} onDone={() => { setModal(null); reload(); }} />}
       {modal?.move && <MoveFeedModal feed={modal.move} vendor={x} vendors={(all.data?.vendors || []).filter((o) => o.vendor_id !== vendorId)} onClose={() => setModal(null)} onDone={() => { setModal(null); reload(); }} />}
     </>
   );

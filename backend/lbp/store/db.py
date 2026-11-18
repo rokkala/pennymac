@@ -45,7 +45,8 @@ def now() -> datetime:
 
 
 def new_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+    # Full uuid4 hex — [:12] birthday-collides under parallel 10M exception inserts.
+    return f"{prefix}_{uuid.uuid4().hex}"
 
 
 # A vendor (seller, correspondent, sub-servicer, bulk seller, internal channel) owns one or more feeds.
@@ -83,6 +84,17 @@ sources = Table(
     Column("delivery_proposed_by", String(80)),
     Column("last_sequence", String(40)),   # highest file sequence applied (per-vendor ordering cursor)
     Column("seq_lock_at", DateTime),       # write-first row lock that serialises the sequencing gate
+    # Multi-file layout (roles, join, readiness) with the same maker-checker draft as delivery
+    Column("layout", JSON),
+    Column("readiness", JSON),
+    Column("layout_draft", JSON),
+    Column("readiness_draft", JSON),
+    Column("layout_proposed_by", String(80)),
+    # Archive (status "retired"): who/when/why, and the status to restore to
+    Column("retired_at", DateTime),
+    Column("retired_by", String(80)),
+    Column("retired_reason", Text),
+    Column("retired_from_status", String(20)),
     Column("created_by", String(80)),
     Column("created_at", DateTime, default=now),
 )
@@ -92,9 +104,10 @@ mappings = Table(
     Column("mapping_id", String(40), primary_key=True),
     Column("source_id", String(40), index=True),
     Column("version", Integer, default=1),
-    Column("status", String(20), default="draft"),  # draft | in_review | approved | superseded | rejected
+    Column("status", String(20), default="draft"),  # draft | in_review | approved | superseded | rejected | discarded
     Column("fields", JSON),
     Column("stats", JSON),
+    Column("entity", String(40), nullable=False, default="loan", server_default="loan"),
     Column("created_by", String(80)),
     Column("reviewed_by", String(80)),
     Column("approved_by", String(80)),
@@ -110,7 +123,7 @@ batches = Table(
     Column("mapping_id", String(40)),
     Column("filename", String(300)),
     Column("file_path", String(500)),
-    Column("status", String(20), default="queued"),  # queued | running | paused | completed | failed
+    Column("status", String(20), default="queued"),  # queued | claimed | running | staged | paused | completed | failed | blocked
     Column("total_rows", Integer, default=0),
     Column("processed", Integer, default=0),
     Column("passed", Integer, default=0),
@@ -130,6 +143,9 @@ batches = Table(
     Column("sequence_detail", JSON),                    # gate decision, overrides
     Column("change_summary", JSON),                     # adds / updates / closes / unchanged / conflicts
     Column("delivery_id", String(40), index=True),      # scheduled delivery this file satisfied
+    Column("file_set_id", String(40), index=True),      # multi-file delivery this batch was joined from
+    Column("joined_path", String(500)),
+    Column("join_summary", JSON),
     Column("throughput_lps", Float, default=0.0),
     Column("error", Text),
     Column("submitted_by", String(80)),
@@ -296,8 +312,37 @@ exceptions = Table(
     Column("maker", String(80)),
     Column("checker", String(80)),
     Column("qa_sample", Boolean, default=False),
+    Column("role", String(40)),  # file role the exception came from (multi-file feeds)
     Column("created_at", DateTime, default=now),
     Column("resolved_at", DateTime),
+)
+
+file_sets = Table(
+    "file_sets", metadata,
+    Column("set_id", String(40), primary_key=True),
+    Column("source_id", String(40), index=True),
+    Column("pairing_key", String(120), index=True),
+    Column("status", String(16), index=True),  # waiting | ready | expired | overridden | consumed | discarded
+    Column("opened_at", DateTime),
+    Column("ready_at", DateTime),
+    Column("expires_at", DateTime),
+    Column("batch_id", String(40)),
+    Column("members_sha", String(64), index=True),
+    Column("override", JSON),
+)
+
+batch_files = Table(
+    "batch_files", metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("set_id", String(40), index=True),
+    Column("batch_id", String(40), index=True),
+    Column("role", String(40)),
+    Column("filename", String(300)),
+    Column("file_path", String(500)),
+    Column("file_sha256", String(64), index=True),
+    Column("row_count", Integer),
+    Column("received_at", DateTime),
+    UniqueConstraint("set_id", "role", name="uq_batch_file_role"),
 )
 
 rules = Table(
@@ -308,6 +353,32 @@ rules = Table(
     Column("body", JSON),
     Column("created_at", DateTime, default=now),
     Column("updated_at", DateTime, default=now),
+)
+
+rule_templates = Table(
+    "rule_templates", metadata,
+    Column("id", String(80), primary_key=True),
+    Column("name", String(200), nullable=False),
+    Column("description", Text, default=""),
+    Column("tree", JSON, nullable=False),
+    Column("builtin", Boolean, default=False),
+    Column("hidden", Boolean, default=False),
+    Column("version", Integer, default=1),
+    Column("updated_by", String(80)),
+    Column("updated_at", DateTime, default=now),
+)
+
+notifications = Table(
+    "notifications", metadata,
+    Column("id", String(40), primary_key=True),
+    Column("user_id", String(80), nullable=False, index=True),
+    Column("kind", String(60), nullable=False),
+    Column("title", String(200), nullable=False),
+    Column("body", Text, default=""),
+    Column("entity_type", String(30), default="rule"),
+    Column("entity_id", String(80), index=True),
+    Column("read_at", DateTime),
+    Column("created_at", DateTime, default=now, index=True),
 )
 
 policy = Table(
@@ -487,7 +558,7 @@ def row_to_dict(row) -> dict:
 
 
 __all__ = [
-    "metadata", "vendors", "sources", "mappings", "batches", "loans_staging", "sse_loans", "exceptions", "rules", "policy", "mapping_memory",
-    "precedents", "loan_changes", "delivery_schedules", "deliveries", "pulled_files", "scheduler_state", "config_publications", "audit_log", "audit_chain", "verify_audit_chain", "check_schema_current", "get_engine", "reset_engine", "audit", "row_to_dict", "now", "new_id", "select",
+    "metadata", "vendors", "sources", "mappings", "batches", "loans_staging", "sse_loans", "exceptions", "rules", "rule_templates", "policy", "mapping_memory",
+    "precedents", "loan_changes", "delivery_schedules", "deliveries", "pulled_files", "scheduler_state", "config_publications", "file_sets", "batch_files", "audit_log", "audit_chain", "verify_audit_chain", "check_schema_current", "get_engine", "reset_engine", "audit", "row_to_dict", "now", "new_id", "select",
     "insert", "update",
 ]

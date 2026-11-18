@@ -21,35 +21,51 @@ from .store import db
 SCREENS: dict[str, str] = {
     "overview": "Overview",
     "guide": "How it works",
-    "imports": "Import Monitor",
-    "deliveries": "Vendor Deliveries",
-    "sources": "Vendors & Mapping",
-    "exceptions": "Exception Manager",
-    "rules": "Rule Engine",
+    "monitor": "Monitor",
+    "imports": "File loads",
+    "deliveries": "Delivery schedule",
+    "sources": "Vendors",
+    "exceptions": "Loans to fix",
+    "rules": "Rules",
     "analytics": "Analytics",
-    "governance": "Policy & Audit",
+    "governance": "Policy",
     "maintenance": "Maintenance",
     "personas": "Personas",
 }
 
+# Onboarding sets up feeds. Run screens belong to Monitoring and Compliance.
+_RUN_ROLES = ("monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin")
+
 # Baseline visibility per screen (roles that may see it). Admin always sees all via bypass.
 DEFAULT_ACCESS: dict[str, tuple[str, ...]] = {
-    "overview": ROLES,
+    "overview": _RUN_ROLES,
     "guide": ROLES,
-    "imports": ("ops", "sme", "admin"),
-    "deliveries": ("ops", "sme", "analyst", "admin"),
-    "sources": ("analyst", "sme", "admin"),
-    "exceptions": ("reviewer", "checker", "compliance", "admin"),
-    "rules": ("sme", "compliance", "analyst", "admin"),
-    "analytics": ("analyst", "sme", "ops", "reviewer", "checker", "compliance", "admin"),
-    "governance": ("compliance", "sme", "admin"),
-    "maintenance": ("sme", "admin"),
+    "monitor": ("monitoring", "monitoring_reviewer", "admin"),
+    "imports": ("monitoring", "monitoring_reviewer", "admin"),
+    "deliveries": ("monitoring", "monitoring_reviewer", "onboarding", "onboarding_reviewer", "admin"),
+    "sources": ("onboarding", "onboarding_reviewer", "admin"),
+    "exceptions": ("monitoring", "monitoring_reviewer", "compliance", "compliance_reviewer", "admin"),
+    "rules": ("onboarding", "onboarding_reviewer", "compliance", "compliance_reviewer", "admin"),
+    "analytics": _RUN_ROLES,
+    "governance": ("compliance", "compliance_reviewer", "onboarding_reviewer", "admin"),
+    "maintenance": ("onboarding_reviewer", "admin"),
     "personas": ("admin",),
 }
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _MATRIX_KEY = "screen_matrix"
 _USERS_KEY = "persona_users"
+
+# Demo / local training cast — one Cognito group each; also listed on Personas → Users.
+# Dual-control: mapping approve = onboarding_reviewer ≠ preparer; T4 checker = monitoring_reviewer ≠ maker.
+DEMO_CAST: tuple[dict[str, str], ...] = (
+    {"id": "onboarding", "email": "onboarding@demo.lbp.local", "label": "Onboarding", "role": "onboarding"},
+    {"id": "onboarding.reviewer", "email": "onboarding.reviewer@demo.lbp.local", "label": "Onboarding · Reviewer", "role": "onboarding_reviewer"},
+    {"id": "monitoring", "email": "monitoring@demo.lbp.local", "label": "Monitoring", "role": "monitoring"},
+    {"id": "monitoring.reviewer", "email": "monitoring.reviewer@demo.lbp.local", "label": "Monitoring · Reviewer", "role": "monitoring_reviewer"},
+    {"id": "compliance.reviewer", "email": "compliance.reviewer@demo.lbp.local", "label": "Compliance · Reviewer", "role": "compliance_reviewer"},
+    {"id": "admin", "email": "admin@demo.lbp.local", "label": "Platform Admin", "role": "admin"},
+)
 
 
 class PersonaError(ValueError):
@@ -177,6 +193,66 @@ def list_users() -> list[dict]:
     if _use_cognito():
         return _cognito_list()
     return sorted(_load_local(), key=lambda u: u.get("email") or "")
+
+
+def ensure_demo_cast(*, actor: str = "system") -> list[dict]:
+    """Upsert DEMO_CAST into the local user directory (no-op under Cognito)."""
+    if _use_cognito():
+        return []
+    users = _load_local()
+    by_user = {u.get("username"): u for u in users}
+    by_email = {u.get("email"): u for u in users}
+    changed = False
+    for row in DEMO_CAST:
+        uid, email, label, role = row["id"], row["email"], row["label"], row["role"]
+        existing = by_user.get(uid) or by_email.get(email)
+        if existing:
+            if existing.get("label") != label or existing.get("role") != role or not existing.get("enabled", True):
+                existing["label"] = label
+                existing["role"] = role
+                existing["enabled"] = True
+                existing.setdefault("status", "CONFIRMED")
+                changed = True
+            continue
+        users.append({
+            "username": uid,
+            "email": email,
+            "label": label,
+            "role": role,
+            "enabled": True,
+            "status": "CONFIRMED",
+            "demo_cast": True,
+        })
+        changed = True
+    if changed:
+        _save_local(users, actor, "personas.cast.ensure", {"count": len(DEMO_CAST)})
+    return list_users()
+
+
+def cast_for_switcher() -> list[dict]:
+    """People available in the Signed-in-as switcher (local demo cast + enabled directory)."""
+    ensure_demo_cast()
+    if _use_cognito():
+        # JWT mode: no header switcher; empty cast. Cognito users are managed in Personas.
+        return []
+    out = []
+    for u in list_users():
+        if not u.get("enabled", True):
+            continue
+        role = u.get("role")
+        if role not in ROLES:
+            continue
+        label = u.get("label") or u.get("email") or u.get("username")
+        out.append({
+            "id": u.get("username") or u.get("email"),
+            "label": label,
+            "email": u.get("email"),
+            "roles": [role],
+        })
+    # Stable demo order first, then any extra admin-created users
+    order = {row["id"]: i for i, row in enumerate(DEMO_CAST)}
+    out.sort(key=lambda p: (order.get(p["id"], 1000), p["label"]))
+    return out
 
 
 def get_user(username: str) -> dict:

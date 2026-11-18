@@ -48,6 +48,10 @@ locals {
   db_driver    = local.db_sqlserver ? "mssql+pyodbc" : "postgresql+psycopg"
   common_env = {
     LBP_ENV                  = "aws"
+    LBP_AWS_REGION           = var.region
+    LBP_DATA_DIR             = "/tmp/lbp-data" # Lambda task root is read-only; S3 downloads land here
+    # Built from the name, not the state-machine resource, so Lambdas and Glue can start runs without a cycle.
+    LBP_STATE_MACHINE_ARN    = "arn:aws:states:${var.region}:${local.account_id}:stateMachine:${local.name}-boarding"
     LBP_AI_PROVIDER          = var.ai_provider
     LBP_BEDROCK_MODEL_ID     = var.bedrock_model_id
     LBP_RAW_BUCKET           = aws_s3_bucket.zone["raw"].bucket
@@ -72,5 +76,6 @@ locals {
     LBP_ALERT_TOPIC_ARN      = aws_sns_topic.alerts.arn
     LBP_PULL_ALLOWED_HOSTS   = join(",", concat(var.vendor_sftp_hosts, [for b in var.vendor_pull_buckets : "s3:${b}"]))
     LBP_VENDOR_SECRET_PREFIX = "${local.name}/vendors/"
+    LBP_CONFIG_SIGNING_SECRET_ARN = aws_secretsmanager_secret.config_signing.arn
   }
 }

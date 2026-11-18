@@ -32,3 +32,16 @@ def test_author_returns_tree_when_possible(client):
     h = {"X-User": "dan", "X-Roles": "sme"}
     d = client.post("/api/rules/author", json={"text": "Interest rate must be between 0.5 and 15"}, headers=h).json()
     assert d["draft"] and d["draft"].get("tree")
+
+
+def test_compose_pattern_loan_number(client):
+    h = {"X-User": "dan", "X-Roles": "sme"}
+    tree = {"shape": "pattern", "field": "loan_number", "pattern": "[A-Z0-9-]{6,20}", "ok_example": "LN-100001", "bad_example": "AB"}
+    c = client.post("/api/rules/compose", json={"tree": tree}, headers=h)
+    assert c.status_code == 200, c.text
+    body = c.json()
+    assert body["draft"]["expression"] == {"matches": [{"var": "loan_number"}, "[A-Z0-9-]{6,20}"]}
+    assert all(t["passed"] for t in body["test_results"])
+    shapes = client.get("/api/rules/shapes").json()
+    assert any(s["id"] == "pattern" for s in shapes["shapes"])
+    assert shapes.get("pattern_presets")

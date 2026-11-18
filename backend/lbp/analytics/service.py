@@ -12,13 +12,22 @@ import re
 from collections import Counter, defaultdict
 from datetime import timedelta
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 
 from ..exceptions.policy import TIER_LABELS
 from ..schema.sse_target import ATTRIBUTES, BY_NAME, MODULES  # noqa: F401
 from ..store import db
 
 DAY = timedelta(days=1)
+ATTENTION_STATUSES = ("failed", "blocked", "waiting", "paused", "out_of_order")
+RUNNING_STATUSES = ("running", "queued")
+# Step Functions history is only polled for in-flight rows on the list endpoint (throttle).
+TRACE_STATUSES = ("queued", "running", "pausing", "paused", "blocked", "waiting", "out_of_order")
+
+
+def _like_escape(raw: str) -> str:
+    """Treat user search as a literal substring — escape LIKE wildcards."""
+    return raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _iso(d):
@@ -45,14 +54,53 @@ def _names(c) -> dict:
     return names_by_source(c)
 
 
-def import_status(limit: int = 25, source_ids: list[str] | None = None) -> dict:
+def import_status(limit: int = 50, source_ids: list[str] | None = None, *,
+                  statuses: list[str] | None = None, since=None, until=None, q: str | None = None) -> dict:
     b = db.batches
-    with db.get_engine().connect() as c:
-        q = select(b, db.sources.c.name.label("source_name")).join(db.sources, db.sources.c.source_id == b.c.source_id)
+    e = db.exceptions
+    open_states = ("open", "pending_review", "pending_checker", "escalated")
+    limit = max(1, min(int(limit or 50), 200))
+
+    def _scope_time_q(stmt):
         if source_ids is not None:
-            q = q.where(b.c.source_id.in_(source_ids or ["-"]))
-        rows = c.execute(q.order_by(b.c.created_at.desc()).limit(limit)).all()
+            stmt = stmt.where(b.c.source_id.in_(source_ids or ["-"]))
+        if since is not None:
+            stmt = stmt.where(b.c.created_at >= since)
+        if until is not None:
+            stmt = stmt.where(b.c.created_at <= until)
+        if q:
+            needle = f"%{_like_escape(q.strip())}%"
+            # escapechar so \% / \_ are literals (SQLite + Postgres)
+            stmt = stmt.where(or_(
+                b.c.filename.ilike(needle, escape="\\"),
+                b.c.batch_id.ilike(needle, escape="\\"),
+            ))
+        return stmt
+
+    with db.get_engine().connect() as c:
+        q_rows = _scope_time_q(select(b, db.sources.c.name.label("source_name")).join(
+            db.sources, db.sources.c.source_id == b.c.source_id))
+        if statuses:
+            q_rows = q_rows.where(b.c.status.in_(statuses))
+        rows = c.execute(q_rows.order_by(b.c.created_at.desc()).limit(limit)).all()
+        attn_statuses = [s for s in (statuses or ATTENTION_STATUSES) if s in ATTENTION_STATUSES]
+        attn_q = _scope_time_q(select(func.count()).select_from(b)).where(
+            b.c.status.in_(attn_statuses or ["__none__"]))
+        attention = int(c.execute(attn_q).scalar() or 0)
+        run_statuses = [s for s in (statuses or RUNNING_STATUSES) if s in RUNNING_STATUSES]
+        run_base = _scope_time_q(select(func.count(), func.coalesce(func.sum(b.c.throughput_lps), 0))
+                                 .select_from(b)).where(b.c.status.in_(run_statuses or ["__none__"]))
+        run_row = c.execute(run_base).one()
+        running_n = int(run_row[0] or 0)
+        throughput = float(run_row[1] or 0)
         names = _names(c)
+        bids = [r.batch_id for r in rows]
+        ex_total, ex_open = {}, {}
+        if bids:
+            for bid, n in c.execute(select(e.c.batch_id, func.count()).where(e.c.batch_id.in_(bids)).group_by(e.c.batch_id)):
+                ex_total[bid] = n
+            for bid, n in c.execute(select(e.c.batch_id, func.count()).where(e.c.batch_id.in_(bids), e.c.status.in_(open_states)).group_by(e.c.batch_id)):
+                ex_open[bid] = n
     items = []
     for r in rows:
         total = r.total_rows or 0
@@ -63,6 +111,7 @@ def import_status(limit: int = 25, source_ids: list[str] | None = None) -> dict:
             "batch_id": r.batch_id, "source_id": r.source_id, "source_name": r.source_name,
             "vendor_id": names.get(r.source_id, {}).get("vendor_id"), "vendor_name": names.get(r.source_id, {}).get("vendor_name"), "filename": r.filename, "status": r.status,
             "total_rows": total, "processed": r.processed, "passed": r.passed, "warned": r.warned, "failed": r.failed, "loaded": r.loaded,
+            "exceptions": ex_total.get(r.batch_id, 0), "open_exceptions": ex_open.get(r.batch_id, 0),
             "progress_pct": round((r.processed or 0) / total * 100, 1) if total else (100.0 if r.status == "completed" else 0.0),
             "throughput_lps": r.throughput_lps, "projected_24h": int((r.throughput_lps or 0) * 86400), "eta_seconds": eta,
             "micro_batches": len(mbs), "last_micro_batches": mbs[-20:], "created_at": _iso(r.created_at), "started_at": _iso(r.started_at),
@@ -71,9 +120,15 @@ def import_status(limit: int = 25, source_ids: list[str] | None = None) -> dict:
             "load_type": r.load_type or "full", "sequence": _seq(r.sequence), "sequence_detail": r.sequence_detail,
             "change_summary": r.change_summary, "delivery_id": r.delivery_id,
         })
-    running = [i for i in items if i["status"] == "running"]
-    return {"batches": items, "running": len(running),
-            "current_throughput_lps": round(sum(i["throughput_lps"] or 0 for i in running), 1),
+    from ..pipeline.trace import fetch_traces
+
+    trace_ids = [i["batch_id"] for i in items if i["status"] in TRACE_STATUSES]
+    for bid, trace in fetch_traces(trace_ids).items():
+        for item in items:
+            if item["batch_id"] == bid:
+                item["pipeline"] = trace
+    return {"batches": items, "running": running_n, "attention": attention,
+            "current_throughput_lps": round(throughput, 1),
             "target_lps": round(1_000_000 / 86400, 1)}
 
 

@@ -7,18 +7,63 @@ Modes (LBP_AUTH_MODE):
 
 API Gateway also validates the token at the edge; the service verifies again (defence in depth),
 so a request that reaches ECS some other way is still rejected.
+
+Teams (Cognito groups): onboarding / monitoring / compliance (+ *_reviewer) and admin.
+Reviewer groups include their team's member powers via expand_roles().
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Iterable
 
 from fastapi import Header, HTTPException
 
 from .config import get_settings
 
-ROLES = ("analyst", "sme", "ops", "reviewer", "checker", "compliance", "admin")
+ROLES = (
+    "onboarding",
+    "onboarding_reviewer",
+    "monitoring",
+    "monitoring_reviewer",
+    "compliance",
+    "compliance_reviewer",
+    "admin",
+)
+
+# Old Cognito / header names → team model (dev compatibility + leftover data).
+# Note: "compliance" is a real team-member role now — do not alias it.
+ROLE_ALIASES: dict[str, str] = {
+    "analyst": "onboarding",
+    "sme": "onboarding_reviewer",
+    "ops": "monitoring",
+    "reviewer": "monitoring",
+    "checker": "monitoring_reviewer",
+}
+
+# Reviewer ⊇ member for the same team.
+_REVIEWER_INCLUDES_MEMBER: dict[str, str] = {
+    "onboarding_reviewer": "onboarding",
+    "monitoring_reviewer": "monitoring",
+    "compliance_reviewer": "compliance",
+}
+
+
+def expand_roles(raw: Iterable[str]) -> tuple[str, ...]:
+    """Alias legacy names, keep only known roles, and grant member powers to reviewers."""
+    out: list[str] = []
+    for r in raw:
+        key = (r or "").strip()
+        if not key:
+            continue
+        canon = ROLE_ALIASES.get(key, key)
+        if canon not in ROLES:
+            continue
+        for piece in (canon, _REVIEWER_INCLUDES_MEMBER.get(canon)):
+            if piece and piece not in out:
+                out.append(piece)
+    return tuple(out)
 
 
 @dataclass(frozen=True)
@@ -63,7 +108,7 @@ def principal_from_claims(claims: dict) -> Principal:
     if isinstance(groups, str):
         groups = [g.strip() for g in groups.strip("[]").replace(",", " ").split() if g.strip()]
     name = claims.get("email") or claims.get("username") or claims.get("cognito:username") or claims.get("sub")
-    return Principal(name=str(name), roles=tuple(r for r in groups if r in ROLES))
+    return Principal(name=str(name), roles=expand_roles(groups))
 
 
 def current_principal(authorization: str | None = Header(default=None), x_user: str | None = Header(default=None),
@@ -72,8 +117,8 @@ def current_principal(authorization: str | None = Header(default=None), x_user: 
     if s.auth_mode == "dev":
         if s.env != "local":
             raise HTTPException(500, "dev auth is not allowed outside local")
-        roles = tuple(r.strip() for r in (x_roles or "analyst,sme,ops,reviewer,checker,compliance,admin").split(",") if r.strip() in ROLES)
-        return Principal(name=x_user or "dev.user", roles=roles)
+        raw = (x_roles or ",".join(ROLES)).split(",")
+        return Principal(name=x_user or "dev.user", roles=expand_roles(raw))
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing bearer token", headers={"WWW-Authenticate": "Bearer"})
     try:

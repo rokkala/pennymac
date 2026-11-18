@@ -25,6 +25,17 @@ def aws_mode() -> bool:
     return s.env == "aws" and bool(s.state_machine_arn)
 
 
+def dispatchable(batch_ids: list[str]) -> list[str]:
+    """The ids a local scheduler may start: those not recorded as failed (one query). A failed batch (suspended
+    vendor, unsequenceable file) is only ever re-run by an explicit user retry, never by a tick or a pull."""
+    ids = list(batch_ids)
+    if not ids:
+        return []
+    with db.get_engine().connect() as c:
+        failed = set(c.execute(select(db.batches.c.batch_id).where(db.batches.c.batch_id.in_(ids), db.batches.c.status == "failed")).scalars())
+    return [b for b in ids if b not in failed]
+
+
 def dispatch(batch_id: str) -> str:
     if not aws_mode():
         from .pipeline.batch import start_batch_async

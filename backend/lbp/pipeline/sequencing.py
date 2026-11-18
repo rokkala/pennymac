@@ -119,7 +119,9 @@ def _load(c, batch_id):
 
 
 def skip_gap(batch_id: str, actor: str, roles: list[str], reason: str) -> None:
-    if not set(roles) & {"ops", "sme", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"monitoring", "onboarding_reviewer", "admin"}:
         raise SequenceActionError("Ops or SME role required")
     if not reason:
         raise SequenceActionError("a reason is required")
@@ -138,7 +140,9 @@ def skip_gap(batch_id: str, actor: str, roles: list[str], reason: str) -> None:
 
 
 def apply_out_of_order(batch_id: str, actor: str, roles: list[str], reason: str) -> None:
-    if not set(roles) & {"sme", "compliance", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"onboarding_reviewer", "compliance_reviewer", "admin"}:
         raise SequenceActionError("SME or Compliance role required")
     if not reason:
         raise SequenceActionError("a reason is required")
@@ -154,7 +158,9 @@ def apply_out_of_order(batch_id: str, actor: str, roles: list[str], reason: str)
 
 def discard(batch_id: str, actor: str, roles: list[str], reason: str) -> list[str]:
     """Drop a file that has not loaded anything (bad resend, superseded). Releases files waiting behind it."""
-    if not set(roles) & {"ops", "sme", "admin"}:
+    from ..security import expand_roles
+    roles = list(expand_roles(roles))
+    if not set(roles) & {"monitoring", "onboarding_reviewer", "admin"}:
         raise SequenceActionError("Ops or SME role required")
     if not reason:
         raise SequenceActionError("a reason is required")

@@ -11,7 +11,8 @@ resource "aws_ecr_repository" "lbp" {
 locals {
   lambdas = {
     # control plane only: no Lambda transforms or loads loan data (that is Glue's job)
-    on-file-arrival = { handler = "handlers.on_file_arrival", timeout = 120, memory = 1024, concurrency = 10 }
+    # Large tapes download into /tmp for sha256 + row estimate; 10GB ephemeral covers ~multi‑GB files.
+    on-file-arrival = { handler = "handlers.on_file_arrival", timeout = 900, memory = 3008, concurrency = 10, ephemeral = 10240 }
     route           = { handler = "handlers.route_batch", timeout = 30, memory = 512, concurrency = 20 }
     finalize        = { handler = "handlers.finalize_batch", timeout = 60, memory = 512, concurrency = 20 }
     mark-failed     = { handler = "handlers.mark_failed", timeout = 60, memory = 512, concurrency = 10 }
@@ -26,14 +27,21 @@ locals {
 resource "aws_lambda_function" "fn" {
   #checkov:skip=CKV_AWS_272:Container-image functions; integrity via immutable ECR tags + image scanning (code signing applies to zip packages)
   for_each                       = local.lambdas
-  reserved_concurrent_executions = each.value.concurrency
+  # poc accounts often have the default Lambda quota (10). Reserving the prod caps drops unreserved below AWS's floor of 10.
+  reserved_concurrent_executions = var.env == "poc" ? -1 : each.value.concurrency
   function_name                  = "${local.name}-${each.key}"
   role                           = aws_iam_role.lambda.arn
   package_type                   = "Image"
+  architectures                  = ["arm64"]
   image_uri                      = "${aws_ecr_repository.lbp.repository_url}:lambda-${var.image_tag}"
   timeout                        = each.value.timeout
   memory_size                    = each.value.memory
   kms_key_arn                    = aws_kms_key.data.arn
+
+  # Large on-file-arrival downloads need >512MB /tmp; others stay at the default.
+  ephemeral_storage {
+    size = try(each.value.ephemeral, 512)
+  }
 
   image_config { command = [each.value.handler] }
 

@@ -32,3 +32,40 @@ def test_migrations_match_models_and_app_starts(monkeypatch):
     db.reset_engine()
     with pytest.raises(RuntimeError, match="not current"):
         db.check_schema_current()
+
+
+NEW_COLS = {
+    "sources": {"layout", "readiness", "layout_draft", "readiness_draft", "layout_proposed_by"},
+    "mappings": {"entity"},
+    "batches": {"file_set_id", "joined_path", "join_summary"},
+    "exceptions": {"role"},
+}
+NEW_TABLES = {"file_sets", "batch_files"}
+
+
+def test_0007_upgrade_downgrade_roundtrip_sqlite(tmp_path, monkeypatch):
+    from alembic import command
+    from sqlalchemy import create_engine, inspect
+
+    from lbp import cli, config
+    from lbp.store import db
+
+    url = f"sqlite:///{tmp_path / 'mig.db'}"
+    monkeypatch.setenv("LBP_DATABASE_URL", url)
+    monkeypatch.setenv("LBP_AUTO_CREATE_SCHEMA", "false")
+    config.reset_settings()
+    db.reset_engine()
+    cfg = cli._alembic_cfg()
+    command.upgrade(cfg, "head")
+    insp = inspect(create_engine(url))
+    assert NEW_TABLES <= set(insp.get_table_names())
+    for table, cols in NEW_COLS.items():
+        assert cols <= {c["name"] for c in insp.get_columns(table)}
+    command.downgrade(cfg, "0006")
+    insp = inspect(create_engine(url))
+    assert not NEW_TABLES & set(insp.get_table_names())
+    for table, cols in NEW_COLS.items():
+        assert not cols & {c["name"] for c in insp.get_columns(table)}
+    command.upgrade(cfg, "head")
+    db.reset_engine()
+    config.reset_settings()

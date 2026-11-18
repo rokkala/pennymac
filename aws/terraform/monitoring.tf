@@ -7,11 +7,18 @@ resource "aws_sns_topic_policy" "alerts" {
   arn = aws_sns_topic.alerts.arn
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "EventBridgePublish", Effect = "Allow", Principal = { Service = "events.amazonaws.com" },
-      Action    = "sns:Publish", Resource = aws_sns_topic.alerts.arn
-      Condition = { StringEquals = { "aws:SourceAccount" = local.account_id } }
-    }]
+    Statement = [
+      {
+        Sid       = "EventBridgePublish", Effect = "Allow", Principal = { Service = "events.amazonaws.com" },
+        Action    = "sns:Publish", Resource = aws_sns_topic.alerts.arn
+        Condition = { StringEquals = { "aws:SourceAccount" = local.account_id } }
+      },
+      {
+        Sid       = "CloudTrailPublish", Effect = "Allow", Principal = { Service = "cloudtrail.amazonaws.com" },
+        Action    = "sns:Publish", Resource = aws_sns_topic.alerts.arn
+        Condition = { StringEquals = { "aws:SourceAccount" = local.account_id } }
+      }
+    ]
   })
 }
 
@@ -40,7 +47,7 @@ resource "aws_cloudwatch_event_rule" "glue_failed" {
   name = "${local.name}-glue-failed"
   event_pattern = jsonencode({
     source = ["aws.glue"], "detail-type" = ["Glue Job State Change"],
-    detail = { jobName = [aws_glue_job.feed.name, aws_glue_job.feed_spark.name, aws_glue_job.vendor_pull.name], state = ["FAILED", "TIMEOUT", "ERROR"] }
+    detail = { jobName = [aws_glue_job.feed.name, aws_glue_job.feed_spark.name, aws_glue_job.feed_load.name, aws_glue_job.vendor_pull.name], state = ["FAILED", "TIMEOUT", "ERROR"] }
   })
 }
 
@@ -72,7 +79,7 @@ resource "aws_cloudwatch_metric_alarm" "failure_rate" {
   alarm_actions       = [aws_sns_topic.alerts.arn]
   metric_query {
     id          = "rate"
-    expression  = "100 * failed / MAX([processed, 1])"
+    expression  = "100 * failed / IF(processed == 0, 1, processed)"
     label       = "Failure %"
     return_data = true
   }

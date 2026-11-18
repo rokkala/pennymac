@@ -32,12 +32,12 @@ def test_triage_proposals(env):
 
 def test_policy_change_requires_compliance(env):
     with pytest.raises(PolicyError):
-        set_policy({"qa_sample_pct": 10}, "analyst", "analyst", ["compliance"])
+        set_policy({"qa_sample_pct": 10}, "analyst", "analyst", ["compliance_reviewer"])
     with pytest.raises(PolicyError):
-        set_policy({"qa_sample_pct": 10}, "analyst", "bob", ["sme"])
+        set_policy({"qa_sample_pct": 10}, "analyst", "bob", ["onboarding_reviewer"])
     with pytest.raises(PolicyError):
-        set_policy({"t1_min_confidence": 0.5}, "analyst", "comp", ["compliance"])
-    assert set_policy({"qa_sample_pct": 10}, "analyst", "comp", ["compliance"])["qa_sample_pct"] == 10
+        set_policy({"t1_min_confidence": 0.5}, "analyst", "comp", ["compliance"])  # member ≠ reviewer
+    assert set_policy({"qa_sample_pct": 10}, "analyst", "comp", ["compliance_reviewer"])["qa_sample_pct"] == 10
 
 
 def _batch(onboarded, key="pcg_retail"):
@@ -93,7 +93,7 @@ def test_t5_only_compliance(onboarded):
         m.resolve(t5[0]["exception_id"], "reviewer1", ["reviewer"], value="C")
     with pytest.raises(ExceptionActionError):
         m.compliance_clear(t5[0]["exception_id"], "reviewer1", ["reviewer"], "C", "note")
-    r = m.reject_loan(t5[0]["exception_id"], "comp1", ["compliance"], "confirmed OFAC match")
+    r = m.reject_loan(t5[0]["exception_id"], "comp1", ["compliance_reviewer"], "confirmed OFAC match")
     assert r["status"] == "rejected"
 
 
@@ -144,13 +144,13 @@ def test_t1_kill_switch_and_auto_suspend(env):
     t = Triage(rng_seed=1)
     ex = t.classify_and_propose("R016", "occ", "format", "FAIL", "occupancy_type", {**BASE_LOAN, "occupancy_type": "owner"}, "m")
     assert ex["tier"] == "T1"
-    # emergency off: one Compliance user may switch auto-apply off (never on) alone
-    set_policy({"t1_enabled": False}, "comp1", "comp1", ["compliance"])
+    # emergency off: one Compliance · Reviewer may switch auto-apply off (never on) alone
+    set_policy({"t1_enabled": False}, "comp1", "comp1", ["compliance_reviewer"])
     ex = Triage(rng_seed=1).classify_and_propose("R016", "occ", "format", "FAIL", "occupancy_type", {**BASE_LOAN, "occupancy_type": "owner"}, "m")
     assert ex["tier"] == "T2"
     with pytest.raises(PolicyError):
-        set_policy({"t1_enabled": True}, "comp1", "comp1", ["compliance"])
-    set_policy({"t1_enabled": True}, "comp1", "comp2", ["compliance"])
+        set_policy({"t1_enabled": True}, "comp1", "comp1", ["compliance_reviewer"])
+    set_policy({"t1_enabled": True}, "comp1", "comp2", ["compliance_reviewer"])
     # auto-suspend: override rate above the 2% control limit with enough sample
     with db.get_engine().begin() as c:
         for i in range(60):

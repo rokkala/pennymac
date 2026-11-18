@@ -1,9 +1,19 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { api, takeIntent } from "../api.js";
+import { api, takeIntent, discardMapping } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog } from "../ui.jsx";
+import { canDiscardMapping } from "../lifecycleModel.js";
+import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog, ActionBar, PageHeader } from "../ui.jsx";
 import DeliveryProfile from "./DeliveryProfile.jsx";
+import FeedLayout from "./FeedLayout.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
+import { groupColumnsByRole } from "../layoutModel.js";
+
+/** <option>s for a source column picker. Feeds with a multi-file layout group `role.column` names under their file; others stay flat. */
+function ColumnOptions({ columns, grouped }) {
+  if (!grouped) return columns.map((c) => <option key={c}>{c}</option>);
+  return groupColumnsByRole(columns).map((g) => (
+    <optgroup key={g.role} label={g.role === "master" ? "Main file" : `${g.role} file`}>{g.columns.map((c) => <option key={c} value={c}>{c}</option>)}</optgroup>));
+}
 import { VendorList, VendorWorkspace } from "./Vendors.jsx";
 import { Segments } from "../charts.jsx";
 
@@ -100,7 +110,7 @@ function ValueMap({ mappingId, target, draft, onSaved }) {
   );
 }
 
-function FieldInspector({ mappingId, field, columns, draft, catalog, lookups, onField, onClose, go, onMap, feedsOf, nav }) {
+function FieldInspector({ mappingId, field, columns, grouped, draft, catalog, lookups, onField, onClose, go, onMap, feedsOf, nav }) {
   const base = useApi(`/api/mappings/${mappingId}/fields/${field.target}/inspect`, [field.target, JSON.stringify(field.transform), (field.sources || []).join()]);
   const [editing, setEditing] = useState(false);
   const [steps, setSteps] = useState(field.transform || []);
@@ -116,9 +126,9 @@ function FieldInspector({ mappingId, field, columns, draft, catalog, lookups, on
       sub={d ? `${d.attribute.module} · ${d.attribute.dtype}${d.attribute.length ? `(${d.attribute.length})` : ""} · ${d.attribute.risk} risk${d.attribute.required ? " · required" : ""}${d.attribute.pii ? " · PII" : ""}` : ""}
       footer={draft && !editing ? <>
         <span className="lead faint">Changes save to draft v{field._version || ""}; nothing reaches Glue until the mapping is approved.</span>
-        {field.manual || field.one_to_many || field.retargeted_from
-          ? <button className="btn danger" onClick={() => onField(field.target, { action: "remove" })}>Remove mapping</button>
-          : <button className="btn danger" disabled={field.status === "rejected"} onClick={() => onField(field.target, { action: "reject" })}>Reject</button>}
+        <button className="btn danger" onClick={() => onField(field.target, { action: "remove" })}>Remove mapping</button>
+        {field.status !== "rejected" && !field.manual && !field.one_to_many && !field.retargeted_from
+          && <button className="btn" onClick={() => onField(field.target, { action: "reject" })}>Keep row, reject suggestion</button>}
         <button className="btn primary" disabled={field.status === "accepted"} onClick={async () => { await onField(field.target, { action: "accept" }); nav?.onNext?.(); }}>{field.status === "accepted" ? "Accepted" : "Accept and next"}</button></> : null}>
       {!d ? <Loading error={base.error} /> : (
         <div className="stack" style={{ gap: 16 }}>
@@ -140,7 +150,7 @@ function FieldInspector({ mappingId, field, columns, draft, catalog, lookups, on
                 <label className="stack" style={{ gap: 4 }} htmlFor="tb-src"><span className="eyebrow">Source column{srcs.length > 1 ? "s (N:1)" : ""}</span>
                   {srcs.map((sv, i) => (
                     <div key={i} className="row" style={{ flexWrap: "nowrap" }}>
-                      <select id={i === 0 ? "tb-src" : undefined} className="input" style={{ flex: 1 }} value={sv || ""} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}>{columns.map((c) => <option key={c}>{c}</option>)}</select>
+                      <select id={i === 0 ? "tb-src" : undefined} className="input" style={{ flex: 1 }} value={sv || ""} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}><ColumnOptions columns={columns} grouped={grouped} /></select>
                       {srcs.length > 1 && <button className="btn sm danger" onClick={() => setSrcs(srcs.filter((_, j) => j !== i))}>✕</button>}
                     </div>))}
                   <button className="btn sm" style={{ alignSelf: "flex-start" }} onClick={() => setSrcs([...srcs, columns[0]])}>+ Add source column</button></label>
@@ -237,7 +247,7 @@ function ProfileTab({ sourceId, feedsOf, draft, onMap, onPick }) {
 }
 
 /** Map any source column(s) to any SSE attribute (incl. 1:N), or re-point an existing mapping. */
-function MapTargetModal({ mappingId, fields, columns, catalog, lookups, preset, onClose, onSaved }) {
+function MapTargetModal({ mappingId, fields, columns, grouped, catalog, lookups, preset, onClose, onSaved }) {
   const schema = useApi("/api/schema/target");
   const retarget = preset?.retargetFrom;
   const [target, setTarget] = useState(preset?.target || "");
@@ -283,7 +293,7 @@ function MapTargetModal({ mappingId, fields, columns, catalog, lookups, preset, 
           <span className="eyebrow">Source column{srcs.length > 1 ? "s (N:1, joined in order)" : ""}</span>
           {srcs.map((sv, i) => (
             <div key={i} className="row" style={{ flexWrap: "nowrap" }}>
-              <select className="input" style={{ flex: 1 }} aria-label={`Source column ${i + 1}`} value={sv} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}>{columns.map((c) => <option key={c}>{c}</option>)}</select>
+              <select className="input" style={{ flex: 1 }} aria-label={`Source column ${i + 1}`} value={sv} onChange={(e) => setSrcs(srcs.map((x, j) => (j === i ? e.target.value : x)))}><ColumnOptions columns={columns} grouped={grouped} /></select>
               {srcs.length > 1 && <button className="btn sm danger" onClick={() => setSrcs(srcs.filter((_, j) => j !== i))}>✕</button>}
             </div>))}
           <button className="btn sm" style={{ alignSelf: "flex-start" }} onClick={() => setSrcs([...srcs, columns[0]])}>+ Add source column</button>
@@ -375,6 +385,8 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
   const m = useApi(`/api/mappings/${mappingId}`);
   const dq = useApi(`/api/mappings/${mappingId}/dq`);
   const meta = useApi("/api/meta/transforms");
+  const lay = useApi(m.data?.source_id ? `/api/sources/${m.data.source_id}/layout` : null, [m.data?.source_id]);
+  const layoutOn = !!(lay.data?.configured || lay.data?.draft);
   const [filter, setFilter] = useState("all");
   const [view, setView] = useState(initialView || "fields");
   const [sel, setSel] = useState(initialTarget || null);
@@ -409,36 +421,42 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
   const dqFails = (dq.data?.rules || []).filter((r) => r.failed > 0).length;
   return (
     <>
-      <div className="page-head">
-        <div><div className="crumbs"><a onClick={onVendors}>All vendors</a><span className="faint">›</span>
-            <a onClick={() => (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack())}>{mp.source.vendor_name || "Vendor"}</a><span className="faint">›</span>
-            <span>{mp.source.name}</span><span className="faint">›</span><span>Mapping v{mp.version}</span></div>
-          <h1 style={{ marginTop: 6 }}>{mp.source.name}{mp.source.vendor_name && mp.source.vendor_name !== mp.source.name && <span className="faint" style={{ fontWeight: 400 }}> · {mp.source.vendor_name}</span>}</h1>
-          <p className="sub">Mapping v{mp.version} · <Status s={mp.status} /> · prepared by {mp.created_by}{mp.approved_by ? ` · approved by ${mp.approved_by}` : ""}</p></div>
-        <div className="stack" style={{ gap: 8, alignItems: "flex-end" }}>
-        <div className="row">
-          <button className="btn" onClick={() => setModal("preview")}>Validation preview</button>
-          {mp.version > 1 && <button className="btn" onClick={() => setModal("diff")}>Changes vs v{mp.version - 1}</button>}
-          {mp.status === "approved" && canEdit && <button className="btn primary" onClick={() => ask({ kind: "confirm", title: `Edit ${mp.source.name} as a new version`, confirmLabel: `Create draft v${mp.version + 1}`,
-            body: <span>A draft copy of the live mapping v{mp.version} is created for editing. The live version keeps running until the draft is approved.</span>,
-            onConfirm: async () => { const r = await act(() => api(`/api/sources/${mp.source_id}/mappings/new-version`, { method: "POST" }), (x) => `Draft v${x.version} created from the live mapping`); if (r) onOpen(r.mapping_id); return r; } })}>Edit as new version…</button>}
-          {draft && canEdit && <button className="btn" disabled={!pending} onClick={() => ask({ kind: "confirm", title: "Accept high-confidence suggestions", confirmLabel: "Accept all ≥ 0.80",
-            body: <span>Accepts every suggested mapping with confidence 0.80 or higher ({fields.filter((f) => ["suggested", "needs_review"].includes(f.status) && f.confidence >= 0.8).length} fields). Lower-confidence fields stay for review. You can still change any field before submitting.</span>,
-            onConfirm: () => act(() => api(`/api/mappings/${mappingId}/accept-all?min_confidence=0.8`, { method: "POST" }), (r) => `Accepted ${r.accepted} high-confidence mappings`).then((r) => { if (r) m.reload(); return r; }) })}>Accept all ≥ 0.80…</button>}
-          {draft && canEdit && <button className="btn primary" onClick={() => ask({ kind: "reason", title: "Submit for SME approval", confirmLabel: "Submit", required: false, label: "Note for the approver",
-            help: pending ? `${pending} field(s) are still awaiting review; the server will refuse the submission until each is accepted, changed or rejected.` : "An SME other than you reviews and approves. On approval the configuration is published to the Glue data plane.",
-            placeholder: "e.g. New value translations for LoanType; please check FHA codes",
-            onSubmit: () => act(() => api(`/api/mappings/${mappingId}/submit`, { method: "POST" }), "Sent to SME for approval").then((r) => { if (r) m.reload(); return r; }) })}>Submit for approval…</button>}
-          {mp.status === "in_review" && canApprove && <>
-            <button className="btn" onClick={() => ask({ kind: "reason", title: "Send back to the analyst", confirmLabel: "Send back", minLength: 5,
+      <PageHeader
+        eyebrow={<span className="crumbs"><a onClick={onVendors}>All vendors</a><span className="faint">›</span>
+          <a onClick={() => (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack())}>{mp.source.vendor_name || "Vendor"}</a><span className="faint">›</span>
+          <span>{mp.source.name}</span><span className="faint">›</span><span>Mapping v{mp.version}</span></span>}
+        title={<>{mp.source.name}{mp.source.vendor_name && mp.source.vendor_name !== mp.source.name && <span className="faint" style={{ fontWeight: 400 }}> · {mp.source.vendor_name}</span>}</>}
+        sub={<>Mapping v{mp.version} · <Status s={mp.status} /> · prepared by {mp.created_by}{mp.approved_by ? ` · approved by ${mp.approved_by}` : ""}</>}
+        guideHref="#guide?path=setup&step=mapping"
+        primary={
+          mp.status === "in_review" && canApprove ? <button type="button" className="btn primary" onClick={() => setModal("approve")}>Approve…</button>
+            : draft && canEdit ? <button type="button" className="btn primary" onClick={() => ask({ kind: "reason", title: "Submit for SME approval", confirmLabel: "Submit", required: false, label: "Note for the approver",
+              help: pending ? `${pending} field(s) are still awaiting review; the server will refuse the submission until each is accepted, changed or rejected.` : "An SME other than you reviews and approves. On approval the configuration is published to the Glue data plane.",
+              placeholder: "e.g. New value translations for LoanType; please check FHA codes",
+              onSubmit: () => act(() => api(`/api/mappings/${mappingId}/submit`, { method: "POST" }), "Sent to SME for approval").then((r) => { if (r) m.reload(); return r; }) })}>Submit for approval…</button>
+            : mp.status === "approved" && canEdit ? <button type="button" className="btn primary" onClick={() => ask({ kind: "confirm", title: `Edit ${mp.source.name} as a new version`, confirmLabel: `Create draft v${mp.version + 1}`,
+              body: <span>A draft copy of the live mapping v{mp.version} is created for editing. The live version keeps running until the draft is approved.</span>,
+              onConfirm: async () => { const r = await act(() => api(`/api/sources/${mp.source_id}/mappings/new-version`, { method: "POST" }), (x) => `Draft v${x.version} created from the live mapping`); if (r) onOpen(r.mapping_id); return r; } })}>Edit as new version…</button>
+            : null
+        }
+        secondary={(
+          <ActionBar>
+            <button type="button" className="btn" onClick={() => setModal("preview")}>Validation preview</button>
+            {mp.version > 1 && <button type="button" className="btn" onClick={() => setModal("diff")}>Changes vs v{mp.version - 1}</button>}
+            {draft && canEdit && <button type="button" className="btn" disabled={!pending} onClick={() => ask({ kind: "confirm", title: "Accept high-confidence suggestions", confirmLabel: "Accept all ≥ 0.80",
+              body: <span>Accepts every suggested mapping with confidence 0.80 or higher ({fields.filter((f) => ["suggested", "needs_review"].includes(f.status) && f.confidence >= 0.8).length} fields). Lower-confidence fields stay for review. You can still change any field before submitting.</span>,
+              onConfirm: () => act(() => api(`/api/mappings/${mappingId}/accept-all?min_confidence=0.8`, { method: "POST" }), (r) => `Accepted ${r.accepted} high-confidence mappings`).then((r) => { if (r) m.reload(); return r; }) })}>Accept all ≥ 0.80…</button>}
+            {mp.status === "in_review" && canApprove && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: "Send back to the analyst", confirmLabel: "Send back", minLength: 5,
               help: "The mapping returns to draft with your comment. Say what needs to change.", presets: ["Please revisit the low-confidence fields", "Value translations incomplete"],
-              onSubmit: (comment) => act(() => api(`/api/mappings/${mappingId}/approve`, { method: "POST", body: { approve: false, comment } }), "Sent back to analyst").then((r) => { if (r) m.reload(); return r; }) })}>Send back…</button>
-            <button className="btn primary" onClick={() => setModal("approve")}>Approve…</button></>}
-          {mp.status === "in_review" && !canApprove && <span className="faint" style={{ fontSize: ".82rem" }}>SME can approve</span>}
-        </div>
-        {mp.source_id && mp.source.status === "live" && <FeedConfigChip sourceId={mp.source_id} persona={persona} />}
-        </div>
-      </div>
+              onSubmit: (comment) => act(() => api(`/api/mappings/${mappingId}/approve`, { method: "POST", body: { approve: false, comment } }), "Sent back to analyst").then((r) => { if (r) m.reload(); return r; }) })}>Send back…</button>}
+            {canDiscardMapping(persona, mp, mp.source) && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: `Discard draft v${mp.version}`, confirmLabel: "Discard draft", danger: true, required: true, minLength: 5,
+              help: "This version is set aside and can no longer be edited or approved. The live version, if there is one, keeps running. It stays in the history.", placeholder: "e.g. Started from the wrong sample file",
+              onSubmit: (reason) => act(() => discardMapping(mappingId, reason), `Draft v${mp.version} discarded`).then((r) => { if (r) (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack()); return r; }) })}>Discard this draft…</button>}
+            {mp.status === "in_review" && !canApprove && <span className="faint" style={{ fontSize: ".82rem" }}>SME can approve</span>}
+            {mp.source_id && mp.source.status === "live" && <FeedConfigChip sourceId={mp.source_id} persona={persona} />}
+          </ActionBar>
+        )}
+      />
       <Kpis items={[
         { label: "Auto-mapped", value: `${mp.stats?.auto_mapped_pct}%`, detail: "confidence ≥ 0.80 (PoC target 70%)" },
         { label: "Avg confidence", value: (mp.stats?.avg_confidence ?? 0).toFixed(2) },
@@ -450,11 +468,13 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
       {modal === "diff" && <DiffModal mappingId={mappingId} onClose={() => setModal(null)} />}
       {modal === "approve" && <ApproveModal mp={mp} dqFails={dqFails} onClose={() => setModal(null)} onDone={() => { setModal(null); m.reload(); }} />}
       {dialog}
-      <Tabs value={view} onChange={setView} tabs={[{ id: "fields", label: "Field mappings & transformations", count: fields.length }, { id: "dq", label: "DQ rules", count: dq.data?.rules.length }, { id: "profile", label: "Source profile", count: mp.source.columns.length }, { id: "delivery", label: "Delivery & schedule" }]} />
+      <Tabs value={view} onChange={setView} tabs={[{ id: "fields", label: "Field mappings & transformations", count: fields.length }, { id: "dq", label: "DQ rules", count: dq.data?.rules.length }, { id: "profile", label: "Source profile", count: mp.source.columns.length }, { id: "delivery", label: "Delivery & schedule" }, ...(layoutOn || view === "layout" ? [{ id: "layout", label: "File layout" }] : [])]} />
       {view === "dq" && <DqTab mappingId={mappingId} go={go} />}
       {view === "delivery" && <DeliveryProfile sourceId={mp.source_id} persona={persona} go={go} />}
+      {view === "delivery" && lay.data && !layoutOn && canCap(persona, "editDelivery") && <div className="row"><button type="button" className="btn sm" onClick={() => setView("layout")}>This feed arrives as several files…</button></div>}
+      {view === "layout" && <FeedLayout sourceId={mp.source_id} persona={persona} />}
       {view === "profile" && <ProfileTab sourceId={mp.source_id} feedsOf={feedsOf} draft={draft} onMap={(c) => setMapModal({ sources: [c] })} onPick={(t) => { setView("fields"); setSel(t); }} />}
-      {mapModal && <MapTargetModal mappingId={mappingId} fields={fields} columns={mp.source.columns} catalog={meta.data?.ops || []} lookups={Object.keys(meta.data?.lookup_tables || {})}
+      {mapModal && <MapTargetModal mappingId={mappingId} fields={fields} columns={mp.source.columns} grouped={layoutOn} catalog={meta.data?.ops || []} lookups={Object.keys(meta.data?.lookup_tables || {})}
         preset={mapModal} onClose={() => setMapModal(null)} onSaved={(t) => { setMapModal(null); m.reload(); dq.reload(); setView("fields"); setSel(t); }} />}
       {view === "fields" && draft && <div className="row"><button className="btn primary" onClick={() => setMapModal({})}>+ Map a source column to an SSE field</button>
         <span className="faint" style={{ fontSize: ".8rem" }}>Any column can feed several SSE fields (1:N). Select a row to change its target or transformation.</span></div>}
@@ -488,14 +508,15 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
                           <td><Status s={f.status} /></td>
                           {draft && <td className="r" onClick={(e) => e.stopPropagation()}><span className="row" style={{ gap: 4, justifyContent: "flex-end", flexWrap: "nowrap" }}>
                             <button className="btn sm" onClick={() => doField(f.target, { action: "accept" })} disabled={f.status === "accepted"}>Accept</button>
-                            <button className="btn sm" onClick={() => setSel(f.target)}>Inspect</button></span></td>}
+                            <button className="btn sm" onClick={() => setSel(f.target)}>Inspect</button>
+                            <button type="button" className="btn sm danger" title="Drop this SSE mapping from the draft" onClick={() => doField(f.target, { action: "remove" })}>Remove</button></span></td>}
                         </tr>);
                     })}
                   </React.Fragment>);
               })}</tbody>
             </table></div>
           </Panel>
-          {selField && <FieldInspector key={selField.target} mappingId={mappingId} field={{ ...selField, _version: mp.version }} columns={mp.source.columns} draft={draft}
+          {selField && <FieldInspector key={selField.target} mappingId={mappingId} field={{ ...selField, _version: mp.version }} columns={mp.source.columns} grouped={layoutOn} draft={draft}
             catalog={meta.data?.ops || []} lookups={Object.keys(meta.data?.lookup_tables || {})} onField={doField} onClose={() => setSel(null)} go={go}
             onMap={setMapModal} feedsOf={feedsOf}
             nav={{ label: selIdx >= 0 ? `${selIdx + 1} of ${order.length}` : "", onPrev: selIdx > 0 ? () => setSel(order[selIdx - 1].target) : null,

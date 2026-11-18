@@ -14,12 +14,12 @@
                                                        │
  Vendor file ─▶ S3 raw/incoming/<feed>/ ─EventBridge─▶ on_file_arrival ─▶ Step Functions
  API upload  ─▶ S3 raw/uploads/<feed>/  ──────────────────────────────────▶   Route (Lambda: standard or Spark?)
- Vendor pull (Glue lbp-vendor-pull) ─▶ raw/incoming/ ─┘                        Glue lbp-feed  |  lbp-feed-spark   (.sync)
-                                                                                  └─ load + verify signed config
-                                                                                  └─ sequencing gate, pre-flight
-                                                                                  └─ map, validate, triage T1–T5
-                                                                                  └─ throttled micro-batches → SSE (RDS)
-                                                                                  └─ checkpoint, reconcile, advance cursor
+ Vendor pull (Glue lbp-vendor-pull) ─▶ raw/incoming/ ─┘                        Glue lbp-feed  (.sync)  ──▶ Finalize
+                                                                             or Glue lbp-feed-spark (.sync)
+                                                                                  └─ map → Parquet (processed/)
+                                                                                  └─ write clean/dirty parts → S3 bulk-load/
+                                                                             then Glue lbp-feed-load (.sync)
+                                                                                  └─ COPY parts → SSE, reconcile
                                                                                Finalize (Lambda) → start released files
                                                                                SNS notify / MarkFailed
 ```
@@ -40,7 +40,8 @@
 | Job | Runtime | Used for |
 |---|---|---|
 | `lbp-feed` | Glue 5.0 (Python 3.11), 2 × G.1X, driver only | Every batch by default: full tapes, change files, snapshots, Excel. Also replays held loans (`--mode replay`). Max concurrent runs = `glue_feed_concurrency`, the primary SSE protection knob. |
-| `lbp-feed-spark` | Glue 5.0 Spark, auto-scaling to `glue_spark_max_workers` | Full CSV / TXT tapes above `glue_threshold_rows`. Partitions run the same mapping and rule code (`mapInPandas`). The driver persists in ordered, bounded micro-batches, so SSE sees a fixed number of connections whatever the worker count. Writes Parquet to the processed zone for Athena. If it fails, Step Functions resumes the batch on `lbp-feed` from the last checkpoint. |
+| `lbp-feed-spark` | Glue 5.0 Spark, auto-scaling to `glue_spark_max_workers` | Full CSV / TXT tapes above `glue_threshold_rows`. Executors map/validate (same code as standard). Writes Parquet under `processed/batch_id=…/` and materializes clean SSE CSV + dirty JSONL under `bulk-load/<batch>/` (DB-free). Does **not** write SSE. On failure, Step Functions marks the batch failed (no automatic fallback to `lbp-feed`). Remap is skipped only when Parquet `_SUCCESS` exists (`LBP_FORCE_REMAP=1` to rebuild). |
+| `lbp-feed-load` | Glue 5.0, 2 × G.1X, driver only | After Spark: COPY `bulk-load/<batch>/` parts into SSE, reconcile, complete. Independently retryable without rematerializing Spark. |
 | `lbp-vendor-pull` | Glue 5.0, driver only | SFTP (pinned host key) or S3 pulls for vendors that do not push. Pulled files land in `raw/incoming/` and arrive like any other file. |
 
 Glue Python shell is not used: it supports only Python 3.9, and `lbp` needs 3.11 or later.
@@ -55,10 +56,13 @@ All three jobs run in the VPC through a Glue `NETWORK` connection, with the SSE 
 |---|---|
 | Mapping version approved (SME, not the preparer) | that feed |
 | Delivery profile change approved (a second SME) | that feed |
+| Multi-file layout change approved (a second SME) | that feed |
 | Rule enters or leaves active / canary / shadow, or retires | every live feed |
 | Feed moved to another vendor | every live feed (a vendor's feed list is part of each bundle) |
 | `migrate` Lambda on each deploy | any live feed whose bundle is missing |
 | Republish (SME, with a reason) | that feed. Used after a failed publication or a signing-key rotation. No new version is created if nothing changed. |
+
+A feed may also declare a multi-file **layout** (master and detail files, relations, readiness). It is approved by a second SME like a delivery profile, compiled into the same signed bundle, and its file sets are joined by the standard engine before mapping (never Glue/Spark in Phase 1). See [MULTI_FILE_FEEDS.md](MULTI_FILE_FEEDS.md).
 
 The web app shows each feed's publication as a "Glue config vN" chip (on feed cards and in the mapping workbench). Open it to see the version, the mapping version, rule counts, the signature status, whether it is in sync with the active mapping, and the publication history.
 

@@ -1,9 +1,9 @@
 import React, { useEffect, useState } from "react";
 import { api } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Loading, Modal, Field } from "../ui.jsx";
+import { useApi, useAction, Panel, Loading, Modal, Field, PageHeader } from "../ui.jsx";
 
-const ROLE_ORDER = ["admin", "sme", "analyst", "ops", "reviewer", "checker", "compliance"];
+const ROLE_ORDER = ["admin", "onboarding_reviewer", "onboarding", "monitoring_reviewer", "monitoring", "compliance_reviewer", "compliance"];
 
 export default function Personas({ persona, go }) {
   const act = useAction();
@@ -76,27 +76,28 @@ export default function Personas({ persona, go }) {
 
   return (
     <>
-      <div className="page-head">
-        <div>
-          <span className="eyebrow">Platform · identity</span>
-          <h1>Personas</h1>
-          <p className="sub">Create Cognito users (one role each) and hide screens a role does not need. API permissions stay fixed in code.</p>
-        </div>
-        <div className="row">
-          <button type="button" className={`btn ${tab === "users" ? "primary" : ""}`} onClick={() => setTab("users")}>Users</button>
-          <button type="button" className={`btn ${tab === "screens" ? "primary" : ""}`} onClick={() => setTab("screens")}>Screen access</button>
-        </div>
-      </div>
+      <PageHeader
+        eyebrow="Govern"
+        title="Personas"
+        sub="Who can sign in, and which screens they see."
+        primary={tab === "screens" ? <button type="button" className="btn primary" onClick={saveMatrix}>Save access</button> : <button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>Add user</button>}
+        secondary={(
+          <>
+            <button type="button" className={`btn sm ${tab === "users" ? "primary" : ""}`} onClick={() => setTab("users")}>Users</button>
+            <button type="button" className={`btn sm ${tab === "screens" ? "primary" : ""}`} onClick={() => setTab("screens")}>Screen access</button>
+          </>
+        )}
+      />
 
       {tab === "users" && (
-        <Panel title="Users" sub="One Cognito group per person. Temp password forces change on first sign-in."
-          actions={<button type="button" className="btn primary" onClick={() => setCreateOpen(true)}>Add user</button>}>
+        <Panel title="Users" sub="One Cognito group per person. Display name feeds the Signed-in-as switcher in local/demo mode.">
           <div className="tbl-wrap" style={{ overflowX: "auto" }}>
             <table className="tbl">
-              <thead><tr><th>Email</th><th>Role</th><th>Status</th><th>Enabled</th><th /></tr></thead>
+              <thead><tr><th>Display name</th><th>Email</th><th>Role</th><th>Status</th><th>Enabled</th><th /></tr></thead>
               <tbody>
                 {(usersApi.data.users || []).map((u) => (
                   <tr key={u.username || u.email}>
+                    <td>{u.label || "—"}</td>
                     <td>{u.email}</td>
                     <td>
                       <select aria-label={`Role for ${u.email}`} value={u.role || ""}
@@ -114,7 +115,7 @@ export default function Personas({ persona, go }) {
                     </td>
                   </tr>
                 ))}
-                {!usersApi.data.users?.length && <tr><td colSpan={5} className="muted">No users yet.</td></tr>}
+                {!usersApi.data.users?.length && <tr><td colSpan={6} className="muted">No users yet.</td></tr>}
               </tbody>
             </table>
           </div>
@@ -122,8 +123,7 @@ export default function Personas({ persona, go }) {
       )}
 
       {tab === "screens" && (
-        <Panel title="Screen access by role" sub="Uncheck to hide a screen in the nav. You cannot grant a screen the role does not already have by default."
-          actions={<button type="button" className="btn primary" onClick={saveMatrix}>Save access</button>}>
+        <Panel title="Screen access by role" sub="Uncheck to hide a screen in the nav. You cannot grant a screen the role does not already have by default.">
           <div className="tbl-wrap" style={{ overflowX: "auto" }}>
             <table className="tbl">
               <thead>

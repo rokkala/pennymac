@@ -16,10 +16,11 @@ import json
 import random
 from datetime import timedelta
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 
 from ..ai import get_llm
 from ..ingestion.pii import TARGET_PII_TYPES, mask_record
+from ..lifecycle import FeedArchivedError
 from ..schema.sse_target import BY_NAME, risk_of
 from ..store import db
 from . import fixers
@@ -31,6 +32,15 @@ OPEN_STATES = ("open", "pending_review", "pending_checker", "escalated")
 
 class ExceptionActionError(ValueError):
     pass
+
+
+JOIN_CATEGORY = "join"
+JOIN_ONLY_ACK = ("join exceptions have no staged loan: they cannot be resolved with a value or rejected as a loan; "
+                 "acknowledge (close) them with a reason, or fix the files and resend the set")
+
+
+def _is_join(ex) -> bool:
+    return (ex.get("category") if isinstance(ex, dict) else getattr(ex, "category", None)) == JOIN_CATEGORY
 
 
 def _str(v):
@@ -109,8 +119,9 @@ class ExceptionManager:
     # ------------------------------------------------------------------ reads
     def list(self, status: str | None = None, tier: str | None = None, queue: str | None = None, batch_id: str | None = None,
              rule_id: str | None = None, source_id: str | None = None, q: str | None = None, limit: int = 100, offset: int = 0,
-             source_ids: list[str] | None = None) -> dict:
+             source_ids: list[str] | None = None, loaded_on: str | None = None) -> dict:
         t = db.exceptions
+        b = db.batches
         conds = []
         if status == "open":
             conds.append(t.c.status.in_(OPEN_STATES))
@@ -123,17 +134,35 @@ class ExceptionManager:
             conds.append(t.c.source_id.in_(source_ids or ["-"]))
         if q:
             conds.append(t.c.loan_number.like(f"%{q}%"))
+        if loaded_on:
+            # calendar day of the batch load (UTC date of started_at, else created_at)
+            load_ts = func.coalesce(b.c.started_at, b.c.created_at)
+            conds.append(func.date(load_ts) == loaded_on)
+        join = t.outerjoin(b, b.c.batch_id == t.c.batch_id)
         where = and_(*conds) if conds else True
         with db.get_engine().connect() as c:
-            total = c.execute(select(func.count()).select_from(t).where(where)).scalar()
-            rows = c.execute(select(t).where(where).order_by(t.c.created_at.desc(), t.c.exception_id).limit(limit).offset(offset)).all()
+            total = c.execute(select(func.count()).select_from(join).where(where)).scalar()
+            rows = c.execute(
+                select(t, b.c.filename.label("filename"),
+                       func.coalesce(b.c.started_at, b.c.created_at).label("loaded_at"))
+                .select_from(join).where(where)
+                .order_by(func.coalesce(b.c.started_at, b.c.created_at).desc().nullslast(),
+                          t.c.created_at.desc(), t.c.exception_id)
+                .limit(limit).offset(offset)
+            ).all()
             from ..vendors import names_by_source
 
             names = names_by_source(c)
-        items = [db.row_to_dict(r) for r in rows]
-        for it in items:
+        items = []
+        for r in rows:
+            it = db.row_to_dict(r)
+            # row_to_dict may include joined labels; normalize
+            it["filename"] = getattr(r, "filename", None) or it.get("filename")
+            loaded = getattr(r, "loaded_at", None) or it.get("loaded_at")
+            it["loaded_at"] = loaded.isoformat() + "Z" if hasattr(loaded, "isoformat") else loaded
             n = names.get(it.get("source_id")) or {}
             it["vendor_id"], it["vendor_name"], it["feed_name"] = n.get("vendor_id"), n.get("vendor_name"), n.get("feed_name")
+            items.append(it)
         from ..ingestion.pii import mask_value
 
         for it in items:  # list views never carry raw NPI
@@ -147,16 +176,63 @@ class ExceptionManager:
                                                             for k in ("value", "previous", "vendor") if k in pr}}
         return {"total": total, "items": items}
 
+    def loads(self, status: str | None = "open", source_ids: list[str] | None = None, vendor_id: str | None = None,
+              tier: str | None = None) -> dict:
+        """Distinct file loads that have exceptions — options for vendor / file / date filters."""
+        t, b = db.exceptions, db.batches
+        conds = []
+        if status == "open":
+            conds.append(t.c.status.in_(OPEN_STATES))
+        elif status:
+            conds.append(t.c.status == status)
+        if tier:
+            conds.append(t.c.tier == tier)
+        if source_ids is not None:
+            conds.append(t.c.source_id.in_(source_ids or ["-"]))
+        where = and_(*conds) if conds else True
+        load_ts = func.coalesce(b.c.started_at, b.c.created_at)
+        with db.get_engine().connect() as c:
+            from ..vendors import names_by_source
+
+            names = names_by_source(c)
+            if vendor_id:
+                sids = [sid for sid, n in names.items() if n.get("vendor_id") == vendor_id]
+                where = and_(where, t.c.source_id.in_(sids or ["-"]))
+            rows = c.execute(
+                select(t.c.batch_id, t.c.source_id, b.c.filename, load_ts.label("loaded_at"), func.count().label("open_count"))
+                .select_from(t.outerjoin(b, b.c.batch_id == t.c.batch_id))
+                .where(where).group_by(t.c.batch_id, t.c.source_id, b.c.filename, load_ts)
+                .order_by(load_ts.desc().nullslast())
+            ).all()
+        out = []
+        for r in rows:
+            n = names.get(r.source_id) or {}
+            loaded = r.loaded_at
+            iso = loaded.isoformat() + "Z" if hasattr(loaded, "isoformat") else None
+            out.append({
+                "batch_id": r.batch_id,
+                "source_id": r.source_id,
+                "filename": r.filename,
+                "loaded_at": iso,
+                "loaded_on": iso[:10] if iso else None,
+                "vendor_id": n.get("vendor_id"),
+                "vendor_name": n.get("vendor_name"),
+                "feed_name": n.get("feed_name"),
+                "open_count": r.open_count,
+            })
+        return {"loads": out}
     def get(self, exception_id: str, roles: list[str] | None = None) -> dict:
         with db.get_engine().connect() as c:
             row = c.execute(select(db.exceptions).where(db.exceptions.c.exception_id == exception_id)).first()
             if not row:
                 raise ExceptionActionError("exception not found")
             ex = db.row_to_dict(row)
-            st = c.execute(select(db.loans_staging).where(db.loans_staging.c.id == ex["staging_id"])).first()
-            siblings = c.execute(select(db.exceptions.c.exception_id, db.exceptions.c.rule_id, db.exceptions.c.field,
-                                        db.exceptions.c.status, db.exceptions.c.tier)
-                                 .where(db.exceptions.c.staging_id == ex["staging_id"])).all()
+            st, siblings = None, []
+            if ex["staging_id"] is not None:  # NULL (join exceptions) must never mean "every unstaged exception"
+                st = c.execute(select(db.loans_staging).where(db.loans_staging.c.id == ex["staging_id"])).first()
+                siblings = c.execute(select(db.exceptions.c.exception_id, db.exceptions.c.rule_id, db.exceptions.c.field,
+                                            db.exceptions.c.status, db.exceptions.c.tier)
+                                     .where(db.exceptions.c.staging_id == ex["staging_id"])).all()
             audit = c.execute(select(db.audit_log).where(db.audit_log.c.entity_id == exception_id).order_by(db.audit_log.c.ts)).all()
         record = (st.record if st else {}) or {}
         can_see_pii = bool(set(roles or []) & {"compliance", "admin"})
@@ -222,6 +298,8 @@ class ExceptionManager:
                 comment: str | None = None) -> dict:
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
+            if _is_join(ex):
+                raise ExceptionActionError(JOIN_ONLY_ACK)
             if ex["status"] not in ("open", "pending_review"):
                 raise ExceptionActionError(f"cannot resolve an exception in status {ex['status']}")
             if ex["tier"] == "T5":
@@ -246,14 +324,17 @@ class ExceptionManager:
         return {"exception_id": exception_id, "status": "resolved", "loan_boarded": boarded}
 
     def checker_decision(self, exception_id: str, actor: str, roles: list[str], approve: bool, comment: str | None = None) -> dict:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
             if ex["status"] != "pending_checker":
                 raise ExceptionActionError("exception is not awaiting a checker")
             if actor == ex["maker"]:
                 raise ExceptionActionError("maker-checker: checker must be a different user from the maker")
-            if not set(roles) & {"checker", "compliance", "admin"}:
-                raise ExceptionActionError("checker role required")
+            if not set(roles) & {"monitoring_reviewer", "admin"}:
+                raise ExceptionActionError("monitoring reviewer role required")
             if not approve:
                 self._set(c, exception_id, status="open", checker=actor)
                 db.audit(c, actor, "exception.checker_reject", "exception", exception_id, {"comment": comment})
@@ -265,16 +346,42 @@ class ExceptionManager:
         return {"exception_id": exception_id, "status": "resolved", "loan_boarded": boarded}
 
     def reject_loan(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
-            if ex["tier"] == "T5" and "compliance" not in roles:
+            if _is_join(ex):
+                raise ExceptionActionError(JOIN_ONLY_ACK)
+            if ex["tier"] == "T5" and "compliance_reviewer" not in roles and "admin" not in roles:
                 raise ExceptionActionError("only Compliance can act on T5 exceptions")
-            c.execute(db.exceptions.update().where(and_(db.exceptions.c.staging_id == ex["staging_id"],
-                                                        db.exceptions.c.status.in_(OPEN_STATES)))
+            if ex["staging_id"] is None:  # no staged loan: scope to this exception only, never `staging_id IS NULL`
+                scope = db.exceptions.c.exception_id == exception_id
+            else:
+                scope = db.exceptions.c.staging_id == ex["staging_id"]
+            c.execute(db.exceptions.update().where(and_(scope, db.exceptions.c.status.in_(OPEN_STATES)))
                       .values(status="rejected", maker=actor, resolved_at=db.now()))
-            c.execute(db.loans_staging.update().where(db.loans_staging.c.id == ex["staging_id"]).values(status="REJECTED", updated_at=db.now()))
+            if ex["staging_id"] is not None:
+                c.execute(db.loans_staging.update().where(db.loans_staging.c.id == ex["staging_id"]).values(status="REJECTED", updated_at=db.now()))
             db.audit(c, actor, "loan.reject", "exception", exception_id, {"reason": reason, "loan_number": ex["loan_number"]})
         return {"exception_id": exception_id, "status": "rejected"}
+
+    def acknowledge(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
+        """Close one join exception with a mandatory reason (the action set of category `join`: no value resolve,
+        no reject-loan, nothing written to precedent memory). Only this exception changes; audited."""
+        reason = (reason or "").strip()
+        with db.get_engine().begin() as c:
+            ex = self._load(c, exception_id)
+            if not _is_join(ex):
+                raise ExceptionActionError("acknowledge applies to join exceptions only")
+            if ex["status"] not in OPEN_STATES:
+                raise ExceptionActionError(f"cannot acknowledge an exception in status {ex['status']}")
+            if not reason:
+                raise ExceptionActionError("a reason is required to acknowledge a join exception")
+            self._set(c, exception_id, status="resolved", maker=actor, resolved_at=db.now())
+            db.audit(c, actor, "exception.join_acknowledged", "exception", exception_id,
+                     {"reason": reason, "rule_id": ex["rule_id"], "batch_id": ex["batch_id"], "role": ex.get("role")})
+        return {"exception_id": exception_id, "status": "resolved"}
 
     def escalate(self, exception_id: str, actor: str, roles: list[str], reason: str) -> dict:
         with db.get_engine().begin() as c:
@@ -285,10 +392,15 @@ class ExceptionManager:
 
     def compliance_clear(self, exception_id: str, actor: str, roles: list[str], value, comment: str) -> dict:
         """Compliance has investigated outside EM (e.g. OFAC false positive) and records the outcome."""
-        if "compliance" not in roles:
+        from ..security import expand_roles
+
+        roles = list(expand_roles(roles))
+        if "compliance_reviewer" not in roles and "admin" not in roles:
             raise ExceptionActionError("Compliance role required")
         with db.get_engine().begin() as c:
             ex = self._load(c, exception_id)
+            if _is_join(ex):
+                raise ExceptionActionError(JOIN_ONLY_ACK)
             if ex["tier"] != "T5":
                 raise ExceptionActionError("only T5 exceptions use compliance clearance")
             if not comment:
@@ -302,7 +414,8 @@ class ExceptionManager:
     def bulk_resolve(self, actor: str, roles: list[str], rule_id: str, original_value, value=None, use_proposal: bool = False,
                      batch_id: str | None = None, limit: int = 5000) -> dict:
         t = db.exceptions
-        conds = [t.c.rule_id == rule_id, t.c.status.in_(("open", "pending_review")), t.c.tier.in_(("T2", "T3"))]
+        conds = [t.c.rule_id == rule_id, t.c.status.in_(("open", "pending_review")), t.c.tier.in_(("T2", "T3")),
+                 or_(t.c.category.is_(None), t.c.category != JOIN_CATEGORY)]
         conds.append(t.c.original_value.is_(None) if original_value is None else t.c.original_value == _str(original_value))
         if batch_id:
             conds.append(t.c.batch_id == batch_id)
@@ -313,7 +426,7 @@ class ExceptionManager:
             try:
                 self.resolve(eid, actor, roles, value=value, use_proposal=use_proposal, comment="bulk resolve")
                 done += 1
-            except ExceptionActionError as e:
+            except (ExceptionActionError, FeedArchivedError) as e:
                 errors.append({"exception_id": eid, "error": str(e)})
         return {"matched": len(ids), "resolved": done, "errors": errors[:20]}
 
@@ -349,6 +462,8 @@ class ExceptionManager:
     def ai_suggest(self, exception_id: str) -> dict:
         """On-demand LLM suggestion with masked context; stored as proposal, never auto-applied."""
         ex = self.get(exception_id)
+        if _is_join(ex):
+            raise ExceptionActionError(JOIN_ONLY_ACK)
         if ex["tier"] in ("T5",):
             raise ExceptionActionError("no AI suggestions for blocked loans")
         llm = get_llm()
@@ -370,6 +485,8 @@ class ExceptionManager:
 
     # ------------------------------------------------------------------ internals
     def _remember(self, c, ex, value, actor):
+        if _is_join(ex):  # masked raw rows, not field values: never precedent memory
+            return
         self.index.add(c, ex["rule_id"], ex["field"], ex["source_id"], ex["original_value"], _str(value), {"tier": ex["tier"]}, actor)
 
     def _finalize_loan(self, c, staging_id: int, actor: str) -> bool:
@@ -381,6 +498,8 @@ class ExceptionManager:
         from ..rules.executor import RuleExecutor
         from ..rules.registry import RuleRegistry
 
+        if staging_id is None:  # nothing staged (e.g. join exceptions): never `staging_id IS NULL`
+            return False
         st = c.execute(select(db.loans_staging).where(db.loans_staging.c.id == staging_id)).first()
         if not st or st.boarded:
             return False
@@ -398,6 +517,12 @@ class ExceptionManager:
             return False
         action = st.action or "add"
         source_id = exs[0].source_id if exs else None
+        feed = c.execute(select(db.sources.c.name, db.sources.c.status).where(db.sources.c.source_id == source_id)).first() \
+            if source_id else None
+        if feed is not None and feed.status == "retired":  # the whole decision rolls back: nothing boards for a retired feed
+            from ..lifecycle import FeedArchivedError
+
+            raise FeedArchivedError(f"feed '{feed.name}' is archived; restore it before boarding its loans")
         if action in ("close", "close_inferred"):
             return self._finalize_close(c, st, rec, source_id, actor)
         executor = RuleExecutor(RuleRegistry().runtime_set())

@@ -301,7 +301,6 @@ Vendor ──▶ Feed ──▶ Map+Rules+Delivery ──▶ S3 | Pull | Upload 
 <tr><td>Dan · SME</td><td class="mono">sme, analyst</td><td>Approve, publish, rules, vendor lifecycle</td><td>Setup a feed</td></tr>
 <tr><td>Maria · Boarding Ops</td><td class="mono">ops</td><td>Upload, monitor batches, schedules, replay</td><td>Run a file</td></tr>
 <tr><td>Lee · Exception Reviewer</td><td class="mono">reviewer</td><td>Work exception queues</td><td>Run a file</td></tr>
-<tr><td>Sam · Checker</td><td class="mono">checker, reviewer</td><td>Checker approval on dual-control items</td><td>Run a file</td></tr>
 <tr><td>Ana · Compliance</td><td class="mono">compliance, checker</td><td>Regulated rules, policy, T5, audit</td><td>Setup a feed</td></tr>
 <tr><td>Platform Admin</td><td class="mono">admin (+ all)</td><td>Full access + demo setup + Maintenance</td><td>Setup a feed</td></tr>
   </table>
@@ -649,15 +648,6 @@ Vendor pull (lbp-vendor-pull) ─▶ raw/incoming/ ─┘                 Finali
     <ul><li>Clear T2–T3 exception queues so loans can continue boarding</li><li>Apply suggested fixes, document decisions, escalate dual-control items</li><li>Watch open counts and root-cause patterns day to day</li></ul>
     <h4>How the platform helps</h4>
     <ul><li>Exception Manager queues by tier with root-cause rollups — not a raw Glue log dump</li><li>Suggested fixes and confidence from rules / models cut average handle time</li><li>Nav badge shows open exception count so backlog is visible without a report</li><li>Guide marks “Your step” on exception handling; dual-control items route to Checker</li></ul>
-  </div>
-
-  <div class="persona">
-    <h3>Sam · Checker</h3>
-    <p class="meta-row"><b>Roles:</b> <span class="mono">checker, reviewer</span> · <b>Primary job:</b> Checker approval on dual-control items · <b>Guide default:</b> Run a file<br/><b>Home screens:</b> Exception Manager, How it works (Run), Overview</p>
-    <h4>Functions</h4>
-    <ul><li>Second-person approve on T4 / maker-checker exception paths</li><li>Can also work reviewer queues when capacity requires</li><li>Refuse or return items that fail control standards</li></ul>
-    <h4>How the platform helps</h4>
-    <ul><li>Platform enforces maker ≠ checker — same actor cannot self-approve</li><li>Exception Manager surfaces pending checker work separately from first-pass review</li><li>Audit trail records both maker and checker with reasons for examiners</li><li>Same console as Lee so handoffs do not jump tools</li></ul>
   </div>
 
   <div class="persona">

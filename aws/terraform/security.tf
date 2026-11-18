@@ -78,7 +78,7 @@ resource "aws_kms_key_policy" "data" {
         Sid       = "CloudTrail"
         Effect    = "Allow"
         Principal = { Service = "cloudtrail.amazonaws.com" }
-        Action    = ["kms:GenerateDataKey*", "kms:DescribeKey"]
+        Action    = ["kms:GenerateDataKey*", "kms:Decrypt", "kms:DescribeKey"]
         Resource  = "*"
       },
       {

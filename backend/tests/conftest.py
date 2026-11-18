@@ -49,7 +49,7 @@ def onboarded(sample_files):
         reg = ms.register_source(key, path, "analyst1")
         ms.accept_all(reg["mapping_id"], "analyst1", 0.0)
         ms.submit(reg["mapping_id"], "analyst1")
-        ms.approve(reg["mapping_id"], "sme1", ["sme"])
+        ms.approve(reg["mapping_id"], "onboarding.reviewer", ["onboarding_reviewer"])
         out[key] = {**reg, "path": path}
     return out
 

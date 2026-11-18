@@ -1,0 +1,137 @@
+{
+  "description": "Master rows 1 and 3 share a key. reject_all excludes both; first keeps row 1, last keeps row 3; every dropped master row is a JOIN03 (role master, master row number). Excluded masters count as rejected.",
+  "layout": {
+    "files": [
+      {
+        "role": "master",
+        "name_pattern": "m_(?P<date>\\d{8})\\.csv",
+        "key": [
+          "id"
+        ],
+        "required": true
+      },
+      {
+        "role": "details",
+        "name_pattern": "d_(?P<date>\\d{8})\\.csv",
+        "required": true
+      }
+    ],
+    "relations": [
+      {
+        "detail": "details",
+        "to": "master",
+        "on": [
+          {
+            "parent": "id",
+            "detail": "ref"
+          }
+        ],
+        "normalize": [
+          "trim"
+        ],
+        "cardinality": "one",
+        "mode": "merge",
+        "on_missing_detail": "allow"
+      }
+    ]
+  },
+  "files": {
+    "master": "master.csv",
+    "details": "details.csv"
+  },
+  "parse_options": {},
+  "variants": [
+    {
+      "id": "reject_all",
+      "relation": {
+        "on_duplicate_master": "reject_all"
+      },
+      "expected_rows": "expected_reject_all.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN03",
+          "role": "master",
+          "row_number": 1
+        },
+        {
+          "code": "JOIN03",
+          "role": "master",
+          "row_number": 3
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 4,
+          "matched": 4,
+          "orphaned": 0,
+          "rejected": 2
+        },
+        "details": {
+          "rows_in": 3,
+          "matched": 3,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "first",
+      "relation": {
+        "on_duplicate_master": "first"
+      },
+      "expected_rows": "expected_first.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN03",
+          "role": "master",
+          "row_number": 3
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 4,
+          "matched": 4,
+          "orphaned": 0,
+          "rejected": 1
+        },
+        "details": {
+          "rows_in": 3,
+          "matched": 3,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    },
+    {
+      "id": "last",
+      "relation": {
+        "on_duplicate_master": "last"
+      },
+      "expected_rows": "expected_last.csv",
+      "expected_exceptions": [
+        {
+          "code": "JOIN03",
+          "role": "master",
+          "row_number": 1
+        }
+      ],
+      "expected_blocked": null,
+      "expected_per_role": {
+        "master": {
+          "rows_in": 4,
+          "matched": 4,
+          "orphaned": 0,
+          "rejected": 1
+        },
+        "details": {
+          "rows_in": 3,
+          "matched": 3,
+          "orphaned": 0,
+          "rejected": 0
+        }
+      }
+    }
+  ]
+}
