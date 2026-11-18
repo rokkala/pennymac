@@ -63,6 +63,10 @@ const enc = encodeURIComponent;
 export const getLayout = (sourceId) => api(`/api/sources/${enc(sourceId)}/layout`);
 export const proposeLayout = (sourceId, layout, readiness) => api(`/api/sources/${enc(sourceId)}/layout`, { method: "PUT", body: { layout, readiness } });
 export const decideLayout = (sourceId, approve, comment) => api(`/api/sources/${enc(sourceId)}/layout/decide`, { method: "POST", body: { approve, comment } });
+export const archiveFeed = (sourceId, reason) => api(`/api/sources/${enc(sourceId)}/archive`, { method: "POST", body: { reason } });
+export const restoreFeed = (sourceId, reason) => api(`/api/sources/${enc(sourceId)}/restore`, { method: "POST", body: { reason } });
+export const discardMapping = (mappingId, reason) => api(`/api/mappings/${enc(mappingId)}/discard`, { method: "POST", body: { reason } });
+export const deleteFeed = (sourceId, reason) => api(`/api/sources/${enc(sourceId)}?reason=${enc(reason)}`, { method: "DELETE" });
 /** filesByRole: {role: File}. Dry run: nothing is stored. */
 export const previewJoin = (sourceId, layout, readiness, filesByRole) => {
   const form = new FormData();

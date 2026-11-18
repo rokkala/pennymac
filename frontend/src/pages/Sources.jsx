@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { api, takeIntent } from "../api.js";
+import { api, takeIntent, discardMapping } from "../api.js";
 import { canCap } from "../roles.js";
+import { canDiscardMapping } from "../lifecycleModel.js";
 import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog, ActionBar, PageHeader } from "../ui.jsx";
 import DeliveryProfile from "./DeliveryProfile.jsx";
 import FeedLayout from "./FeedLayout.jsx";
@@ -448,6 +449,9 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
             {mp.status === "in_review" && canApprove && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: "Send back to the analyst", confirmLabel: "Send back", minLength: 5,
               help: "The mapping returns to draft with your comment. Say what needs to change.", presets: ["Please revisit the low-confidence fields", "Value translations incomplete"],
               onSubmit: (comment) => act(() => api(`/api/mappings/${mappingId}/approve`, { method: "POST", body: { approve: false, comment } }), "Sent back to analyst").then((r) => { if (r) m.reload(); return r; }) })}>Send back…</button>}
+            {canDiscardMapping(persona, mp, mp.source) && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: `Discard draft v${mp.version}`, confirmLabel: "Discard draft", danger: true, required: true, minLength: 5,
+              help: "This version is set aside and can no longer be edited or approved. The live version, if there is one, keeps running. It stays in the history.", placeholder: "e.g. Started from the wrong sample file",
+              onSubmit: (reason) => act(() => discardMapping(mappingId, reason), `Draft v${mp.version} discarded`).then((r) => { if (r) (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack()); return r; }) })}>Discard this draft…</button>}
             {mp.status === "in_review" && !canApprove && <span className="faint" style={{ fontSize: ".82rem" }}>SME can approve</span>}
             {mp.source_id && mp.source.status === "live" && <FeedConfigChip sourceId={mp.source_id} persona={persona} />}
           </ActionBar>

@@ -1,7 +1,8 @@
 import React, { useState } from "react";
-import { api, scoped } from "../api.js";
+import { api, scoped, archiveFeed, restoreFeed, deleteFeed } from "../api.js";
 import { canCap } from "../roles.js";
-import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field, PageHeader, ActionBar } from "../ui.jsx";
+import { canArchive, canRestore, canDelete, splitFeeds, archivedLine, RESTORE_NOTE } from "../lifecycleModel.js";
+import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field, PageHeader, ActionBar, useDialog } from "../ui.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { BatchModal } from "./Imports.jsx";
 
@@ -106,7 +107,7 @@ export function VendorList({ persona, onOpen, onCreated }) {
   );
 }
 
-function FeedCard({ f, onOpenMapping, onDelivery, go, onMove, persona }) {
+function FeedCard({ f, onOpenMapping, onDelivery, go, onMove, onArchive, persona }) {
   const latest = f.mappings[f.mappings.length - 1];
   const live = f.mappings.find((m) => m.mapping_id === f.active_mapping_id);
   return (
@@ -130,8 +131,55 @@ function FeedCard({ f, onOpenMapping, onDelivery, go, onMove, persona }) {
         <button className="btn sm" onClick={() => go("imports")}>Files</button>
         <span className="spacer" />
         {canCap(persona, "moveFeed") && <button className="btn sm" onClick={() => onMove(f)}>Move…</button>}
+        {canArchive(persona, f) && <button className="btn sm" onClick={() => onArchive(f)}>Archive…</button>}
       </div>
     </div>
+  );
+}
+
+function ArchivedFeeds({ feeds, persona, onRestore, onDelete }) {
+  if (!feeds.length) return null;
+  return (
+    <Panel title={`Archived feeds (${feeds.length})`} sub="Kept for history. No files are accepted and nothing is scheduled while a feed is archived." pad={false}>
+      <div className="tbl-wrap"><table className="tbl">
+        <thead><tr><th>Feed</th><th>Archived</th><th>Why</th><th /></tr></thead>
+        <tbody>{feeds.map((f) => (
+          <tr key={f.source_id}>
+            <td><b>{f.name}</b> <span className="pill">Archived</span></td>
+            <td className="faint">{f.retired_at ? ago(f.retired_at) : "—"}{f.retired_by ? ` · ${f.retired_by}` : ""}</td>
+            <td>{archivedLine({ retired_reason: f.retired_reason }) || <span className="faint">no reason recorded</span>}</td>
+            <td className="r"><span className="row" style={{ gap: 4, justifyContent: "flex-end" }}>
+              {canRestore(persona, f) && <button type="button" className="btn sm" onClick={() => onRestore(f)}>Restore…</button>}
+              {canDelete(persona, f) && <button type="button" className="btn sm danger" onClick={() => onDelete(f)}>Delete permanently…</button>}
+            </span></td>
+          </tr>))}</tbody>
+      </table></div>
+    </Panel>
+  );
+}
+
+function DeleteFeedModal({ feed, onClose, onDone }) {
+  const [reason, setReason] = useState("");
+  const [sure, setSure] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const act = useAction();
+  const go = async () => {
+    setBusy(true);
+    const r = await act(() => deleteFeed(feed.source_id, reason.trim()), `${feed.name} deleted`);
+    setBusy(false);
+    if (r) onDone();
+  };
+  return (
+    <Modal title={`Delete ${feed.name} permanently`} size="sm" onClose={onClose} busy={busy}
+      footer={<><button className="btn" onClick={onClose} disabled={busy}>Cancel</button>
+        <button className="btn danger" disabled={reason.trim().length < 5 || !sure || busy} onClick={go}>{busy ? "Working…" : "Delete permanently"}</button></>}>
+      <div className="stack">
+        <div className="callout t5"><b>This cannot be undone.</b> The feed, its mappings and its schedules are removed. This only works for a feed that never received a file; the server refuses otherwise, and archiving is the way to retire a used feed. The audit trail is kept.</div>
+        <Field id="df-r" label="Reason (audited)"><textarea id="df-r" className="input" rows={2} data-autofocus value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Created by mistake, never used" /></Field>
+        <span className="faint" style={{ fontSize: ".74rem" }}>At least 5 characters.</span>
+        <label className="row" style={{ gap: 6 }}><input type="checkbox" checked={sure} onChange={(e) => setSure(e.target.checked)} />I understand this cannot be undone</label>
+      </div>
+    </Modal>
   );
 }
 
@@ -202,10 +250,20 @@ export function VendorWorkspace({ vendorId, persona, go, onBack, onOpenMapping, 
   const v = useApi(`/api/vendors/${vendorId}`, [vendorId]);
   const all = useApi("/api/vendors");
   const [tab, setTab] = useState("feeds");
-  const [modal, setModal] = useState(null); // "feed" | "edit" | "status" | {move: feed}
+  const [modal, setModal] = useState(null); // "feed" | "edit" | "status" | {move: feed} | {del: feed}
+  const [dialog, ask] = useDialog();
+  const act = useAction();
   if (!v.data) return <Loading error={v.error} />;
   const x = v.data;
   const reload = () => { v.reload(); reloadVendors && reloadVendors(); };
+  const { active, archived } = splitFeeds(x.feeds);
+  const archive = (f) => ask({ kind: "reason", title: `Archive ${f.name}`, confirmLabel: "Archive feed", danger: true, required: true, minLength: 5,
+    help: `${f.name} stops accepting files and its schedules are paused. Its mappings, files and history are kept, and you can restore it later.${f.status === "live" ? " This feed is live; archiving it needs a reviewer." : ""}`,
+    placeholder: "e.g. Vendor no longer sends this file",
+    onSubmit: (reason) => act(() => archiveFeed(f.source_id, reason), `${f.name} archived`).then((r) => { if (r) reload(); return r; }) });
+  const restore = (f) => ask({ kind: "reason", title: `Restore ${f.name}`, confirmLabel: "Restore feed", required: true, minLength: 5,
+    help: RESTORE_NOTE, placeholder: "e.g. Vendor resumed sending this file",
+    onSubmit: (reason) => act(() => restoreFeed(f.source_id, reason), `${f.name} restored. Its schedules are still paused.`).then((r) => { if (r) reload(); return r; }) });
   return (
     <>
       <PageHeader
@@ -224,18 +282,22 @@ export function VendorWorkspace({ vendorId, persona, go, onBack, onOpenMapping, 
       />
       {x.status === "suspended" && <div className="callout t5" style={{ marginBottom: 12 }}><b>Suspended.</b> Files from this vendor are recorded but not processed.</div>}
       <Kpis items={[
-        { label: "Feeds", value: x.feeds.length, detail: `${x.live_feeds || 0} live` },
+        { label: "Feeds", value: active.length, detail: `${x.live_feeds || 0} live` },
         { label: "Active loans", value: fmt(x.active_loans) },
         { label: "Open exceptions", value: fmt(x.open_exceptions) },
         { label: "On time (30 d)", value: x.on_time_pct === null || x.on_time_pct === undefined ? "—" : `${x.on_time_pct}%`, detail: x.late_or_missed ? `${x.late_or_missed} late or missed` : "no late files" },
         { label: "Last file", value: ago(x.last_file) },
       ]} />
-      <Tabs value={tab} onChange={setTab} tabs={[{ id: "feeds", label: "Feeds & mappings", count: x.feeds.length }, { id: "deliveries", label: "Deliveries & schedules" },
+      <Tabs value={tab} onChange={setTab} tabs={[{ id: "feeds", label: "Feeds & mappings", count: active.length }, { id: "deliveries", label: "Deliveries & schedules" },
         { id: "files", label: "Files" }, { id: "exceptions", label: "Exceptions", count: x.open_exceptions }, { id: "profile", label: "Vendor profile" }]} />
-      {tab === "feeds" && (x.feeds.length ? <div className="feeds">{x.feeds.map((f) => <FeedCard key={f.source_id} f={f} go={(p) => { pickVendor(vendorId); go(p); }}
-        persona={persona} onMove={(feed) => setModal({ move: feed })}
-        onOpenMapping={(mid) => onOpenMapping(mid, "fields")} onDelivery={(mid) => onOpenMapping(mid, "delivery")} />)}</div>
-        : <Panel><div className="empty">No feeds yet. Add the vendor's first feed from a sample file.</div></Panel>)}
+      {tab === "feeds" && (
+        <div className="stack">
+          {active.length ? <div className="feeds">{active.map((f) => <FeedCard key={f.source_id} f={f} go={(p) => { pickVendor(vendorId); go(p); }}
+            persona={persona} onMove={(feed) => setModal({ move: feed })} onArchive={archive}
+            onOpenMapping={(mid) => onOpenMapping(mid, "fields")} onDelivery={(mid) => onOpenMapping(mid, "delivery")} />)}</div>
+            : <Panel><div className="empty">{archived.length ? "No active feeds. Restore an archived feed below or add a new one." : "No feeds yet. Add the vendor's first feed from a sample file."}</div></Panel>}
+          <ArchivedFeeds feeds={archived} persona={persona} onRestore={restore} onDelete={(f) => setModal({ del: f })} />
+        </div>)}
       {tab === "deliveries" && <VendorDeliveries vendorId={vendorId} />}
       {tab === "files" && <VendorFiles vendorId={vendorId} persona={persona} go={go} />}
       {tab === "exceptions" && <VendorExceptions vendorId={vendorId} go={go} pickVendor={pickVendor} />}
@@ -251,6 +313,8 @@ export function VendorWorkspace({ vendorId, persona, go, onBack, onOpenMapping, 
       {modal === "feed" && <FeedModal vendor={x} onClose={() => setModal(null)} onCreated={(mid) => { setModal(null); reload(); onOpenMapping(mid, "fields"); }} />}
       {modal === "edit" && <VendorModal initial={x} onClose={() => setModal(null)} onSaved={() => { setModal(null); reload(); }} />}
       {modal === "status" && <VendorStatusModal vendor={x} onClose={() => setModal(null)} onDone={() => { setModal(null); reload(); }} />}
+      {dialog}
+      {modal?.del && <DeleteFeedModal feed={modal.del} onClose={() => setModal(null)} onDone={() => { setModal(null); reload(); }} />}
       {modal?.move && <MoveFeedModal feed={modal.move} vendor={x} vendors={(all.data?.vendors || []).filter((o) => o.vendor_id !== vendorId)} onClose={() => setModal(null)} onDone={() => { setModal(null); reload(); }} />}
     </>
   );
