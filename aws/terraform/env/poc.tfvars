@@ -1,6 +1,6 @@
 env    = "poc"
 region = "us-west-2"
-image_tag = "app6"
+image_tag = "app11"
 # Small PostgreSQL for a poc. The suite is verified on PostgreSQL; SQL Server Standard cannot run this small.
 db_engine                = "postgres"
 db_engine_version        = "16"

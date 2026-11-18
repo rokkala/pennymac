@@ -52,6 +52,8 @@ export const CAPS = {
   moveFeed: ["onboarding_reviewer"],
   publishConfig: ["onboarding_reviewer"],
   editDelivery: ["onboarding"],
+  archiveFeed: ["onboarding"],
+  deleteFeed: ["admin"],
   approveDelivery: ["onboarding_reviewer"],
   overrideFileSet: ["onboarding_reviewer", "compliance_reviewer"],
   skipGap: ["monitoring", "onboarding_reviewer"],

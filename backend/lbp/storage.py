@@ -43,6 +43,17 @@ def local_path(uri: str | Path) -> Path:
     return dest
 
 
+def delete_stored(uri: str | Path) -> None:
+    """Remove a file stored by persist_upload (and its local S3 cache copy, if any). Missing is fine."""
+    if not is_s3(uri):
+        Path(uri).unlink(missing_ok=True)
+        return
+    bucket, key = _split(str(uri))
+    _s3().delete_object(Bucket=bucket, Key=key)
+    cache = get_settings().data_dir / "s3cache" / f"{hashlib.sha256(str(uri).encode()).hexdigest()[:16]}_{Path(key).name}"
+    cache.unlink(missing_ok=True)
+
+
 def persist_upload(local_file: Path, prefix: str, metadata: dict | None = None) -> str:
     """Store an uploaded file durably and return its URI (S3 in AWS, the local path otherwise)."""
     s = get_settings()

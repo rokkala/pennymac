@@ -13,7 +13,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..ai import LLMMappingReranker, get_llm
 from ..ingestion.parser import ParseOptions, read_sample
@@ -129,7 +129,10 @@ def register_source(name: str, file_path: Path, actor: str, description: str = "
         with db.get_engine().connect() as c:
             if not c.execute(select(db.vendors.c.vendor_id).where(db.vendors.c.vendor_id == vendor_id)).first():
                 raise MappingError("vendor not found")
-            if c.execute(select(db.sources.c.source_id).where(db.sources.c.vendor_id == vendor_id, db.sources.c.name == name)).first():
+            clash = c.execute(select(db.sources.c.status).where(db.sources.c.vendor_id == vendor_id, db.sources.c.name == name)).first()
+            if clash:
+                if clash.status == "retired":
+                    raise MappingError(f"this vendor already has an archived feed named '{name}'; restore it or choose another name")
                 raise MappingError(f"this vendor already has a feed named '{name}'")
     else:
         vendor_id = vendor_svc.ensure_vendor(name, actor)
@@ -367,9 +370,20 @@ def preview(mapping_id: str, n: int = 500) -> dict:
             "samples": samples, "first_record": mask_record(mapper(rows[0])[0], TARGET_PII_TYPES) if rows else None}
 
 
+def _refuse_if_archived(c, source_id: str) -> None:
+    """An archived feed's mappings are frozen: approving one would silently make the feed live again, skipping
+    the restore reason, audit row and name check. Restore the feed first."""
+    row = c.execute(select(db.sources.c.name, db.sources.c.status).where(db.sources.c.source_id == source_id)).first()
+    if row is not None and row.status == "retired":
+        from ..lifecycle import FeedArchivedError
+
+        raise FeedArchivedError(f"feed '{row.name}' is archived; restore the feed first")
+
+
 def submit(mapping_id: str, actor: str) -> dict:
     with db.get_engine().begin() as c:
         m = _require_draft(c, mapping_id)
+        _refuse_if_archived(c, m.source_id)
         pending = [f["target"] for f in m.fields if f["status"] in ("suggested", "needs_review")]
         if pending:
             raise MappingError(f"{len(pending)} field(s) not yet reviewed: {pending[:8]}")
@@ -390,6 +404,7 @@ def approve(mapping_id: str, actor: str, roles: list[str], approve_: bool = True
         m = c.execute(select(db.mappings).where(db.mappings.c.mapping_id == mapping_id)).first()
         if not m or m.status != "in_review":
             raise MappingError("mapping is not awaiting approval")
+        _refuse_if_archived(c, m.source_id)
         if not set(roles) & {"onboarding_reviewer", "admin"}:
             raise MappingError("Onboarding reviewer role required to approve mappings")
         if actor in (m.created_by, m.reviewed_by):
@@ -415,13 +430,17 @@ def approve(mapping_id: str, actor: str, roles: list[str], approve_: bool = True
 
 def new_version(source_id: str, actor: str) -> dict:
     with db.get_engine().begin() as c:
-        latest = c.execute(select(db.mappings).where(db.mappings.c.source_id == source_id).order_by(db.mappings.c.version.desc())).first()
+        _refuse_if_archived(c, source_id)
+        # a discarded draft is not a base: build on the latest version that was not discarded
+        latest = c.execute(select(db.mappings).where(db.mappings.c.source_id == source_id, db.mappings.c.status != "discarded")
+                           .order_by(db.mappings.c.version.desc())).first()
         if not latest:
-            raise MappingError("source has no mapping")
+            raise MappingError("no mapping to base a new version on")
         if latest.status in ("draft", "in_review"):
             raise MappingError("a draft already exists")
+        top = c.execute(select(func.max(db.mappings.c.version)).where(db.mappings.c.source_id == source_id)).scalar() or latest.version
         mid = db.new_id("map")
-        c.execute(db.mappings.insert().values(mapping_id=mid, source_id=source_id, version=latest.version + 1, status="draft",
+        c.execute(db.mappings.insert().values(mapping_id=mid, source_id=source_id, version=top + 1, status="draft",
                                               fields=latest.fields, stats=latest.stats, created_by=actor, comments=[]))
         db.audit(c, actor, "mapping.new_version", "mapping", mid, {"from": latest.mapping_id})
     return get_mapping(mid)

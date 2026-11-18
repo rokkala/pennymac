@@ -352,7 +352,15 @@ export function createMockApi() {
     ["POST", /^\/api\/sources\/([^/]+)\/layout\/preview$/, () => ({ errors: ["The demo cannot preview a join of sample files."] })],
     ["GET", /^\/api\/file-sets$/, () => []],
     ["POST", /^\/api\/file-sets\/([^/]+)\/override$/, () => fail("There are no file sets in the demo.")],
-    ["POST", /^\/api\/upload\/set$/, () => fail("Multi-file uploads are not available in the demo.")],
+    ["POST", /^\/api\/upload\/set$/, (m, form, user) => {
+      const sourceId = form.get("source_id");
+      const src = s.sources.sources.find((x) => x.source_id === sourceId);
+      if (!src?.active_mapping_id) fail("source has no approved mapping; complete onboarding first");
+      const files = form.getAll("files");
+      const names = files.map((f) => f?.name || "file").join(", ");
+      log(user.id, "file_set.upload", "source", sourceId, { files: names });
+      return files.map(() => ({ set_id: uid("set"), status: "waiting", batch_id: null }));
+    }],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery\/test$/, (m, b, u, q) => filenameTest(m[1], q.get("filename") || "", q.get("draft") === "true")],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery$/, (m) => s.delivery_profiles[m[1]] || { ...clone(Object.values(s.delivery_profiles)[0]), source_id: m[1], delivery: clone(Object.values(s.delivery_profiles)[0].defaults), configured: false, draft: null, proposed_by: null, last_sequence: null }],
     ["PUT", /^\/api\/sources\/([^/]+)\/delivery$/, (m, b, user) => {
@@ -401,7 +409,7 @@ export function createMockApi() {
     ["GET", /^\/api\/schema\/target$/, () => s.schema],
     ["GET", /^\/api\/meta\/transforms$/, () => s.transforms],
     // ---------------- sources & mappings
-    ["GET", /^\/api\/sources$/, () => s.sources],
+    ["GET", /^\/api\/sources$/, (m, b, user, q) => (q && q.get("include_archived") === "true" ? s.sources : { ...s.sources, sources: s.sources.sources.filter((x) => x.status !== "retired") })],
     ["GET", /^\/api\/sources\/([^/]+)$/, (m) => ({ source_id: m[1], profile: s.source_profiles[m[1]] })],
     ["POST", /^\/api\/sources$/, (m, form, user) => {
       const base = s.mappings[s.new_source_mapping_id];
@@ -458,6 +466,47 @@ export function createMockApi() {
     ["POST", /^\/api\/mappings\/([^/]+)\/fields\/([^/]+)\/inspect$/, (m, b) => {
       const base = inspectBase(m[1], m[2], b.sources);
       return retrace(base, b.sources || base.sources, b.transform || base.transform);
+    }],
+    // ---------------- feed lifecycle (archive, restore, discard a draft, delete an unused feed)
+    ["POST", /^\/api\/sources\/([^/]+)\/(archive|restore)$/, (m, b, user) => {
+      if (!has(user, "onboarding")) fail("requires one of: onboarding");
+      if ((b.reason || "").trim().length < 5) fail("a reason of at least 5 characters is required");
+      const feed = Object.values(s.vendor_details).flatMap((v) => v.feeds).find((f) => f.source_id === m[1]) || fail("feed not found");
+      const src = s.sources.sources.find((x) => x.source_id === m[1]);
+      if (m[2] === "archive") {
+        if (feed.status === "retired") fail("this feed is already archived");
+        if (feed.status === "live" && !has(user, "onboarding_reviewer")) fail("archiving a live feed requires the onboarding_reviewer role");
+        Object.assign(feed, { retired_from_status: feed.status, status: "retired", retired_at: now(), retired_by: user.id, retired_reason: b.reason, schedules: feed.schedules.map((x) => ({ ...x, status: x.status === "active" ? "paused" : x.status })) });
+      } else {
+        if (feed.status !== "retired") fail("this feed is not archived");
+        if (feed.retired_from_status === "live" && !has(user, "onboarding_reviewer")) fail("restoring a live feed requires the onboarding_reviewer role");
+        Object.assign(feed, { status: feed.retired_from_status || "mapping", retired_at: null, retired_by: null, retired_reason: null });
+      }
+      if (src) src.status = feed.status;
+      log(user.id, `source.${m[2]}`, "source", m[1], { reason: b.reason });
+      return { source_id: m[1], status: feed.status };
+    }],
+    ["POST", /^\/api\/mappings\/([^/]+)\/discard$/, (m, b, user) => {
+      if (!has(user, "onboarding")) fail("requires one of: onboarding");
+      if ((b.reason || "").trim().length < 5) fail("a reason of at least 5 characters is required");
+      const mp = s.mappings[m[1]] || fail("mapping not found");
+      if (mp.status === "in_review") fail("this mapping is awaiting review; the reviewer must send it back before it can be discarded");
+      if (mp.status !== "draft") fail(`only a draft mapping can be discarded; this one is ${mp.status}`);
+      mp.status = "discarded";
+      Object.values(s.vendor_details).flatMap((v) => v.feeds).concat(s.sources.sources).forEach((f) => (f.mappings || []).forEach((x) => { if (x.mapping_id === m[1]) x.status = "discarded"; }));
+      log(user.id, "mapping.discard", "mapping", m[1], { reason: b.reason });
+      return { mapping_id: m[1], status: "discarded" };
+    }],
+    ["DELETE", /^\/api\/sources\/([^/?]+)$/, (m, b, user, q) => {
+      if (!has(user, "admin")) fail("only an administrator can permanently delete a feed");
+      if (((q && q.get("reason")) || "").trim().length < 5) fail("a reason of at least 5 characters is required");
+      const v = Object.values(s.vendor_details).find((d) => d.feeds.some((f) => f.source_id === m[1])) || fail("feed not found");
+      const feed = v.feeds.find((f) => f.source_id === m[1]);
+      if (feed.last_file || feed.active_loans) fail("this feed has files on record, so it cannot be deleted; archive it instead");
+      v.feeds = v.feeds.filter((f) => f.source_id !== m[1]);
+      s.sources.sources = s.sources.sources.filter((x) => x.source_id !== m[1]);
+      log(user.id, "source.delete", "source", m[1], { reason: q.get("reason") });
+      return { source_id: m[1], deleted: true };
     }],
     ["POST", /^\/api\/sources\/([^/]+)\/mappings\/new-version$/, (m, b, user) => newVersion(m[1], user)],
     ["GET", /^\/api\/mappings\/([^/]+)\/diff$/, (m) => s.diffs[m[1]] || diffOf(m[1])],

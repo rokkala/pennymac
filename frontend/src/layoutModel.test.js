@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   emptyLayout, emptyReadiness, addDetail, validateLayoutForm, groupColumnsByRole, setStatusLabel, missingRoles,
-  matchRateBadge, previewTrust, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
+  matchRateBadge, previewTrust, guessPattern, starterLayout, checkSignature, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
 } from "./layoutModel.js";
 
 const valid = () => {
@@ -238,5 +238,81 @@ describe("client column ids", () => {
     assert.deepEqual(ensureColumnIds(withIds).relations[0].aggregate.columns.map((c) => c._id), ids);
     assert.deepEqual(stripClientIds(withIds), l);
     assert.equal(l.relations[0].aggregate.columns[0]._id, undefined);
+  });
+});
+
+describe("guessPattern", () => {
+  it("turns an 8-digit date into a named group", () => {
+    assert.equal(guessPattern("loans_20261117.csv"), "loans_(?P<date>\\d{8})\\.csv");
+    assert.ok(new RegExp(guessPattern("loans_20261117.csv").replace("(?P<", "(?<")).test("loans_20261118.csv"));
+  });
+  it("uses an escaped exact-name regex when there is no date", () => {
+    assert.equal(guessPattern("loans.csv"), "loans\\.csv");
+  });
+  it("escapes regex metacharacters", () => {
+    const p = guessPattern("a+b (1).csv");
+    assert.ok(new RegExp(`^${p}$`).test("a+b (1).csv"));
+    assert.ok(!new RegExp(`^${p}$`).test("aab 1.csv"));
+  });
+});
+
+describe("starterLayout", () => {
+  const roles = [
+    { role: "master", filename: "loans_20261117.csv", columns: ["Name", "LoanID", "Balance"] },
+    { role: "details", filename: "details_20261117.csv", columns: ["Fee", "LoanID", "Kind"] },
+    { role: "notes", filename: "notes_20261117.csv", columns: ["Text", "Other"] },
+  ];
+  it("makes the master required with an id-like key", () => {
+    const l = starterLayout(roles, "master");
+    const m = l.files.find((f) => f.role === "master");
+    assert.equal(m.required, true);
+    assert.deepEqual(m.key, ["LoanID"]);
+    assert.equal(m.name_pattern, "loans_(?P<date>\\d{8})\\.csv");
+  });
+  it("falls back to the first column for the key", () => {
+    const l = starterLayout([{ role: "master", filename: "m.csv", columns: ["A", "B"] }], "master");
+    assert.deepEqual(l.files[0].key, ["A"]);
+  });
+  it("builds one merge relation per detail and guesses on from shared columns", () => {
+    const l = starterLayout(roles, "master");
+    assert.equal(l.files.length, 3);
+    assert.equal(l.relations.length, 2);
+    const r = l.relations.find((x) => x.detail === "details");
+    assert.equal(r.to, "master"); assert.equal(r.mode, "merge"); assert.equal(r.join, "left"); assert.equal(r.cardinality, "one");
+    assert.deepEqual(r.on, [{ parent: "LoanID", detail: "LoanID" }]);
+    assert.deepEqual(l.relations.find((x) => x.detail === "notes").on, []);
+    assert.ok(l.files.find((f) => f.role === "details").name_pattern.startsWith("details_"));
+  });
+});
+
+describe("checkSignature", () => {
+  const f = (name, size) => ({ name, size, lastModified: 1 });
+  it("ignores client ids and is stable", () => {
+    const l = ensureColumnIds(valid());
+    assert.equal(checkSignature(l, emptyReadiness(), { master: f("a.csv", 1) }), checkSignature(stripClientIds(l), emptyReadiness(), { master: f("a.csv", 1) }));
+  });
+  it("changes when the layout, readiness or a file changes", () => {
+    const l = valid();
+    const base = checkSignature(l, emptyReadiness(), { master: f("a.csv", 1) });
+    const l2 = JSON.parse(JSON.stringify(l)); l2.files[0].name_pattern = "x";
+    assert.notEqual(checkSignature(l2, emptyReadiness(), { master: f("a.csv", 1) }), base);
+    assert.notEqual(checkSignature(l, { ...emptyReadiness(), wait_timeout_minutes: 1 }, { master: f("a.csv", 1) }), base);
+    assert.notEqual(checkSignature(l, emptyReadiness(), { master: f("a.csv", 2) }), base);
+  });
+});
+
+describe("role names and sample files (final review)", async () => {
+  const { roleNameOk, rolesWithoutSample } = await import("./layoutModel.js");
+  it("allows lowercase tokens up to 40 characters, like the server", () => {
+    assert.equal(roleNameOk("escrow_items"), true);
+    assert.equal(roleNameOk("a".repeat(40)), true);
+    assert.equal(roleNameOk("a".repeat(41)), false);
+    for (const bad of ["../x", "/abs/x", "", "Upper", "1abc", "layout", "files"]) assert.equal(roleNameOk(bad), false, bad);
+  });
+  it("lists the layout roles that have no sample file", () => {
+    const l = addDetail(addDetail(emptyLayout(), "details"), "fees");
+    assert.deepEqual(rolesWithoutSample(l, { master: {}, details: {} }), ["fees"]);
+    assert.deepEqual(rolesWithoutSample(l, { master: {}, details: {}, fees: {} }), []);
+    assert.deepEqual(rolesWithoutSample(null, {}), []);
   });
 });

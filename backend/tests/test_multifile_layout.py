@@ -218,3 +218,37 @@ def test_master_only_forbids_required_details():
     lay["files"][1]["required"] = True
     errs = validate_layout(lay, {"require": "master_only"})
     assert any("master_only" in e and "fees" in e for e in errs)
+
+
+# ------------------------------------------------------------------ role names (final review C2)
+import pytest  # noqa: E402
+
+BAD_ROLES = ["../x", "/abs/dir/x", "", "Upper", "a" * 41, "1abc", "has space", "layout", "readiness", "manifest", "files",
+             "a-b", "x.csv"]
+
+
+@pytest.mark.parametrize("bad", BAD_ROLES)
+def test_role_names_must_be_safe_tokens(bad):
+    lay = layout()
+    lay["files"][1]["role"] = bad
+    lay["relations"][0]["detail"] = bad
+    errs = validate_layout(lay, DEFAULT_READINESS)
+    assert any("role name" in e for e in errs), errs
+
+
+@pytest.mark.parametrize("good", ["master", "fees", "escrow_items", "a", "a" * 40, "x1_2"])
+def test_good_role_names_validate(good):
+    from lbp.multifile.layout import role_name_ok
+
+    assert role_name_ok(good)
+    if good != "master":
+        lay = layout()
+        lay["files"][1]["role"] = good
+        lay["relations"][0]["detail"] = good
+        assert validate_layout(lay, DEFAULT_READINESS) == []
+
+
+def test_demo_layout_roles_still_validate():
+    from lbp import samples
+
+    assert validate_layout(samples.master_detail_layout(), samples.master_detail_readiness()) == []

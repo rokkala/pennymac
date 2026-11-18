@@ -36,6 +36,7 @@ from ..dispatch import aws_mode, dispatch, dispatchable, start_glue
 from ..exceptions.manager import ExceptionActionError, ExceptionManager
 from ..exceptions.policy import DEFAULT_POLICY, TIER_LABELS, PolicyError, get_policy, set_policy
 from ..ingestion.parser import read_sample
+from ..lifecycle import FeedArchivedError
 from ..ingestion.profiler import profile_rows
 from ..mapping import service as mapping_svc
 from ..mapping.engine import suggest_mappings
@@ -118,11 +119,19 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("PUT", "/api/vendors/{vendor_id}"): EDIT_MAPPING + COMPLIANCE_REVIEW,
     ("POST", "/api/sources/{source_id}/vendor"): ONBOARDING_REVIEW,
     ("POST", "/api/sources/{source_id}/publish"): ONBOARDING_REVIEW,
+    # feed lifecycle (a live feed needs the reviewer role: enforced in lbp.lifecycle)
+    ("POST", "/api/sources/{source_id}/archive"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/restore"): EDIT_MAPPING,
+    ("POST", "/api/mappings/{mapping_id}/discard"): EDIT_MAPPING,
+    ("DELETE", "/api/sources/{source_id}"): ("admin",),
     # incremental loads, sequencing, delivery scheduler
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
     ("PUT", "/api/sources/{source_id}/layout"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/layout/preview"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds/inspect"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds/preview"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/layout/decide"): ONBOARDING_REVIEW,
     ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
@@ -229,6 +238,14 @@ def _start_local_scheduler():
 
 app = FastAPI(title="PennyMac Loan Boarding Platform", version="1.0.0", lifespan=lifespan, dependencies=[Depends(authorize)],
               description="Mapping, validation, exception management and analytics for SSE loan boarding.")
+
+
+@app.exception_handler(FeedArchivedError)
+async def _archived_feed(_request: Request, e: FeedArchivedError):
+    """Any intake path that reaches an archived feed answers 409 (never queued, never a 500)."""
+    return JSONResponse(status_code=409, content={"detail": str(e)})
+
+
 _origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
 if _origins:
     app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET", "POST", "PUT", "DELETE"],
@@ -290,7 +307,9 @@ def _scope(vendor_id: str | None) -> list[str] | None:
 
 
 def _err(e: Exception, code: int = 400):
-    raise HTTPException(status_code=code, detail=str(e))
+    from ..lifecycle import FeedArchivedError
+
+    raise HTTPException(status_code=409 if isinstance(e, FeedArchivedError) else code, detail=str(e))
 
 
 def upload_dir() -> Path:
@@ -564,12 +583,13 @@ def create_source(name: str = Form(...), description: str = Form(""), file: Uplo
 
 
 @app.get("/api/sources")
-def list_sources(vendor_id: str | None = None):
+def list_sources(vendor_id: str | None = None, include_archived: bool = False):
     ids = _scope(vendor_id)
     with db.get_engine().connect() as c:
         rows = c.execute(select(db.sources.c.source_id, db.sources.c.name, db.sources.c.format, db.sources.c.status,
                                 db.sources.c.active_mapping_id, db.sources.c.created_by, db.sources.c.created_at, db.sources.c.delivery,
-                                db.sources.c.delivery_draft, db.sources.c.last_sequence, db.sources.c.vendor_id)
+                                db.sources.c.delivery_draft, db.sources.c.last_sequence, db.sources.c.vendor_id,
+                                db.sources.c.retired_at, db.sources.c.retired_reason)
                          .order_by(db.sources.c.created_at.desc())).all()
         vnames = dict(c.execute(select(db.vendors.c.vendor_id, db.vendors.c.name)).all())
         nsched = dict(c.execute(select(db.delivery_schedules.c.source_id, func.count()).where(
@@ -585,6 +605,8 @@ def list_sources(vendor_id: str | None = None):
     out = []
     for r in rows:
         if ids is not None and r.source_id not in ids:
+            continue
+        if r.status == "retired" and not include_archived:
             continue
         d = {k: v for k, v in db.row_to_dict(r).items() if k not in ("delivery", "delivery_draft", "last_sequence")}
         d["vendor_name"] = vnames.get(r.vendor_id)
@@ -610,6 +632,47 @@ def new_mapping_version(source_id: str, user: User = Depends(current_user)):
         return mapping_svc.new_version(source_id, user.name)
     except mapping_svc.MappingError as e:
         _err(e)
+
+
+class LifecycleReason(BaseModel):
+    reason: str
+
+
+def _lifecycle_call(fn, *a):
+    from ..lifecycle import LifecycleError
+
+    try:
+        return fn(*a)
+    except LifecycleError as e:
+        _err(e, 404 if "not found" in str(e) else 400)
+
+
+@app.post("/api/sources/{source_id}/archive")
+def archive_source(source_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.archive_feed, source_id, user.name, user.roles, body.reason)
+
+
+@app.post("/api/sources/{source_id}/restore")
+def restore_source(source_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.restore_feed, source_id, user.name, user.roles, body.reason)
+
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: str, reason: str = "", user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.delete_feed, source_id, user.name, user.roles, reason)
+
+
+@app.post("/api/mappings/{mapping_id}/discard")
+def discard_mapping(mapping_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.discard_mapping, mapping_id, user.name, user.roles, body.reason)
 
 
 @app.get("/api/mappings/{mapping_id}")
@@ -814,7 +877,7 @@ def _attach_uploads(source_id: str, items: list[tuple[str, Path, str | None]], u
             out.append(fileset.attach_file(source_id, name, uri, user.name, role=role or None, strict=True))
     except pipeline.DuplicateFileError as e:
         raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
-    except ValueError as e:
+    except ValueError as e:  # _err maps an archived feed to 409
         _err(e)
     finally:
         if auto_start:
@@ -830,8 +893,10 @@ def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start:
            role: str | None = Form(None), user: User = Depends(current_user)):
     """One file. A feed with a multi-file layout attaches it to its file set (optional `role`, else routed by
     name) and returns {set_id, role, status, batch_id}; a single-file feed registers a batch as before."""
+    from ..lifecycle import assert_not_archived
     from ..storage import persist_upload
 
+    assert_not_archived(source_id)  # 409 before the file is read or saved
     layout = _feed_layout(source_id)
     if layout:
         given = [n for n, v in (("allow_duplicate", allow_duplicate), ("reason", reason), ("load_type", load_type)) if v]
@@ -863,8 +928,10 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
     nothing: a file that routes nowhere (or any other problem found before attaching) attaches no file.
     Returns the per-file results [{set_id, role, status, batch_id}], the master last."""
     from ..config_store import load
+    from ..lifecycle import assert_not_archived
     from ..multifile.fileset import FileSetError, plan_files
 
+    assert_not_archived(source_id)  # 409 before any part is read or saved
     layout = _feed_layout(source_id)
     if not layout:
         raise HTTPException(400, "this feed has no multi-file layout; upload its file with POST /api/upload")
@@ -909,9 +976,12 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
 def presign(source_id: str, filename: str, role: str | None = None, user: User = Depends(current_user)):
     """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline.
     `role` (a multi-file feed) is passed to the arrival handler as object metadata."""
+    from ..lifecycle import assert_not_archived
+
     s = get_settings()
     if s.env != "aws" or not s.raw_bucket:
         raise HTTPException(400, "presigned upload is only available in AWS mode; use POST /api/upload locally")
+    assert_not_archived(source_id)
     import boto3
 
     key = f"incoming/{source_id}/{uuid.uuid4().hex[:8]}_{Path(filename).name}"
@@ -982,8 +1052,19 @@ def pause_batch(batch_id: str, user: User = Depends(current_user)):
     return {"batch_id": batch_id, "status": "pausing"}
 
 
+def _refuse_archived_batch(batch_id: str) -> None:
+    """409 when the batch belongs to an archived feed: nothing of a retired feed is resumed, replayed or released."""
+    from ..lifecycle import assert_not_archived
+
+    with db.get_engine().connect() as c:
+        sid = c.execute(select(db.batches.c.source_id).where(db.batches.c.batch_id == batch_id)).scalar()
+    if sid:
+        assert_not_archived(sid)
+
+
 @app.post("/api/batches/{batch_id}/resume")
 def resume_batch(batch_id: str, user: User = Depends(current_user)):
+    _refuse_archived_batch(batch_id)
     with db.get_engine().begin() as c:
         st = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == batch_id)).scalar()
         if st not in ("paused", "failed", "queued", "blocked", "waiting"):
@@ -999,6 +1080,7 @@ class Override(BaseModel):
 
 @app.post("/api/batches/{batch_id}/override-preflight")
 def override_preflight(batch_id: str, body: Override, user: User = Depends(current_user)):
+    _refuse_archived_batch(batch_id)
     try:
         pipeline.override_preflight(batch_id, user.name, user.roles, body.reason)
     except ValueError as e:
@@ -1032,6 +1114,7 @@ def replay(batch_id: str, dry_run: bool = True, user: User = Depends(current_use
 
     if not dry_run and not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
         raise HTTPException(403, "Monitoring or Onboarding reviewer role required to replay a batch")
+    _refuse_archived_batch(batch_id)  # before the dry-run / Glue branch: an archived feed replays nothing
     if not dry_run and aws_mode():
         run_id = start_glue(get_settings().glue_feed_job, {"mode": "replay", "batch_id": batch_id, "actor": user.name})
         with db.get_engine().begin() as c:
@@ -1164,6 +1247,11 @@ async def preview_layout(source_id: str, request: Request):
         raise HTTPException(400, "send a layout, or configure one for this feed first")
     readiness = _json("readiness", src.readiness if "layout" not in form else {})
     parts = [(k, v) for k, v in form.multi_items() if hasattr(v, "filename") and hasattr(v, "file")]
+    from ..multifile.layout import role_name_error
+
+    bad = next((role_name_error(k) for k, _ in parts if role_name_error(k)), None)
+    if bad:
+        raise HTTPException(400, bad)
     roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
         if isinstance(layout, dict) else set()
     if len(parts) > len(roles):
@@ -1190,6 +1278,130 @@ async def preview_layout(source_id: str, request: Request):
     except (AttributeError, TypeError):  # a malformed layout: preview_join reports it as errors
         opts = {}
     return await run_in_threadpool(preview_join, layout, readiness, samples, opts, 10, cfg)
+
+
+_MULTIFILE_FIELDS = {"name", "description", "vendor_id", "layout", "readiness"}
+
+
+async def _multifile_form(request: Request):
+    """(form fields, role -> saved upload path). Every file part is a role, named by the role; the caller deletes
+    the saved files."""
+    from ..multifile.layout import role_name_error
+
+    form = await request.form()
+    saved: dict[str, Path] = {}
+    try:
+        for k, v in form.multi_items():
+            if hasattr(v, "filename") and hasattr(v, "file"):
+                if role_name_error(k):
+                    raise HTTPException(400, role_name_error(k))
+                if k in saved:
+                    raise HTTPException(400, f"more than one file was sent for the {k} role")
+                saved[k] = _save_upload(v)
+    except BaseException:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+        raise
+    return form, saved
+
+
+def _form_json(form, name: str, default=None):
+    raw = form.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{name} must be JSON") from None
+
+
+@app.post("/api/multi-file-feeds/inspect")
+async def inspect_multifile(request: Request):
+    """Columns of each sample file (multipart: one part per role, named by the role). Nothing is stored."""
+    from starlette.concurrency import run_in_threadpool
+
+    from ..multifile.onboard import OnboardError, inspect_files
+
+    _form, saved = await _multifile_form(request)
+    try:
+        files = {r: (p.read_bytes(), p.name) for r, p in saved.items()}
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+    try:
+        return await run_in_threadpool(inspect_files, files)
+    except OnboardError as e:
+        _err(e)
+
+
+@app.post("/api/multi-file-feeds/preview")
+async def preview_multifile(request: Request):
+    """Dry-run join of sample files for a layout that has no feed yet (multipart: role parts plus `layout` and
+    `readiness` JSON fields). Read-only and masked like the feed-level preview; problems come back as 200 with
+    `errors`."""
+    from types import SimpleNamespace
+
+    from starlette.concurrency import run_in_threadpool
+
+    from ..ingestion.parser import read_bytes_sample
+    from ..multifile import stage
+    from ..multifile.preview import preview_join
+
+    form, saved = await _multifile_form(request)
+    try:
+        samples_in = {r: (p.read_bytes(), p.name) for r, p in saved.items()}
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+    layout = _form_json(form, "layout")
+    if not isinstance(layout, dict) or not layout:
+        raise HTTPException(400, "send a layout")
+    readiness = _form_json(form, "readiness", {})
+    roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
+        if isinstance(layout.get("files"), list) else set()
+    # as the feed preview: one part per layout role, nothing else (a layout with no roles at all is reported as
+    # layout errors by preview_join, which writes nothing before the layout is valid)
+    if roles and any(r not in roles for r in samples_in):
+        raise HTTPException(400, f"send one file per layout role, as a part named by the role ({sorted(map(str, roles))})")
+    profile: dict = {}
+    if "master" in samples_in:  # no feed yet: profile the master sample so its PII columns are masked
+        try:
+            meta, rows = read_bytes_sample(*samples_in["master"], 500)
+            profile = profile_rows(meta.columns, rows) if meta.columns and rows else {}
+        except Exception:  # noqa: BLE001 - preview_join reports an unreadable master itself
+            profile = {}
+    cfg = SimpleNamespace(profile=profile, fields=[], parse_options={})
+    try:
+        opts = stage._parse_overrides(layout, cfg)
+    except (AttributeError, TypeError):
+        opts = {}
+    return await run_in_threadpool(preview_join, layout, readiness, samples_in, opts, 10, cfg)
+
+
+@app.post("/api/multi-file-feeds")
+async def create_multifile_feed(request: Request, user: User = Depends(current_user)):
+    """Create a feed from sample files (multipart: `name`, `description`, `vendor_id`, `layout`, `readiness`, and one
+    file part per role). The draft mapping comes from the joined sample; the layout waits for approval."""
+    from starlette.concurrency import run_in_threadpool
+
+    from ..mapping.service import MappingError
+    from ..multifile.layout import LayoutError
+    from ..multifile.onboard import OnboardError, register_multifile_source
+    from ..multifile.service import LayoutServiceError
+
+    form, saved = await _multifile_form(request)
+    try:
+        layout = _form_json(form, "layout")
+        readiness = _form_json(form, "readiness", {})
+        try:
+            return await run_in_threadpool(
+                register_multifile_source, (form.get("name") or "").strip(), saved, layout, readiness, user.name, user.roles,
+                form.get("description") or "", form.get("vendor_id") or None)
+        except (OnboardError, LayoutError, LayoutServiceError, MappingError) as e:
+            _err(e)
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
 
 
 @app.post("/api/sources/{source_id}/layout/decide")
@@ -1264,6 +1476,7 @@ def feed_publish(source_id: str, body: ReasonIn, user: User = Depends(current_us
 def batch_skip_gap(batch_id: str, body: ReasonIn, user: User = Depends(current_user)):
     from ..pipeline import sequencing
 
+    _refuse_archived_batch(batch_id)
     try:
         sequencing.skip_gap(batch_id, user.name, user.roles, body.reason)
     except sequencing.SequenceActionError as e:
@@ -1276,6 +1489,7 @@ def batch_skip_gap(batch_id: str, body: ReasonIn, user: User = Depends(current_u
 def batch_apply_ooo(batch_id: str, body: ReasonIn, user: User = Depends(current_user)):
     from ..pipeline import sequencing
 
+    _refuse_archived_batch(batch_id)
     try:
         sequencing.apply_out_of_order(batch_id, user.name, user.roles, body.reason)
     except sequencing.SequenceActionError as e:
@@ -1420,11 +1634,12 @@ class StatusIn(BaseModel):
 
 
 def _sched_call(fn, *a, **kw):
+    from ..lifecycle import FeedArchivedError
     from ..scheduling.service import ScheduleError
 
     try:
         return fn(*a, **kw)
-    except ScheduleError as e:
+    except (ScheduleError, FeedArchivedError) as e:
         _err(e)
 
 
@@ -1472,6 +1687,15 @@ def schedules_pull(schedule_id: str, user: User = Depends(current_user)):
     if aws_mode():
         if not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
             raise HTTPException(403, "requires one of: monitoring, onboarding_reviewer")
+        from ..lifecycle import assert_not_archived
+
+        with db.get_engine().connect() as c:
+            sid = c.execute(select(db.delivery_schedules.c.source_id).where(db.delivery_schedules.c.schedule_id == schedule_id)).scalar()
+        if sid:
+            try:
+                assert_not_archived(sid)
+            except ValueError as e:
+                _err(e)
         run_id = start_glue(get_settings().glue_pull_job, {"schedule_id": schedule_id})
         with db.get_engine().begin() as c:
             db.audit(c, user.name, "schedule.pull_submitted", "schedule", schedule_id, {"glue_run_id": run_id})

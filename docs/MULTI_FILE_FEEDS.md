@@ -7,7 +7,7 @@ until the set is complete, joins it into one row per loan, and loads it as **one
 mapping, rules, exceptions, approval, audit and replay. A feed with no layout is a single-file feed and works
 exactly as before.
 
-Phase 1 (this release) supports the `merge` and `aggregate` modes on the standard engine. The design is in
+Phase 1 supports the `merge` and `aggregate` modes on the standard engine. The design is in
 [superpowers/specs/2026-11-17-multi-file-feeds-design.md](superpowers/specs/2026-11-17-multi-file-feeds-design.md).
 
 ---
@@ -94,26 +94,67 @@ aggregated into `tax_total`, `hazard_total`, `escrow_item_count` and `escrow_pay
 
 ## 3. Onboard a master/detail vendor
 
-### In the web app
+### Onboarding a multi-file feed (in the web app)
 
-1. **Vendors & Mapping:** pick the vendor, "Add feed", and upload a sample of the **master** file. Map it as
-   usual (Priya) but do not submit yet if you want to map detail columns (step 4).
-2. **Delivery & schedule** tab: click "This feed arrives as several files…". The **File layout** tab opens.
-3. **Files:** the master role (name pattern with a named group such as `(?P<date>\d{8})`, key columns), then
-   one card per detail role (name pattern, required or not, declared columns if you know them).
-   **Relations:** matching columns, normalizers, mode, policies, minimum match rate, aggregate columns.
-   **Readiness:** require, pairing, timeout and timeout action.
-4. **Join preview:** upload one sample per role. You see the match rate, per-role counts (read, matched,
-   orphaned, rejected), the JOIN codes in words and the first joined rows with PII masked. A preview on a
-   sample is a sanity check only (note (d)).
-5. **Propose** the layout. A different SME (Dan) opens the feed and **approves** it; the same person cannot do
-   both. Approval publishes a new signed feed bundle that carries the layout and readiness.
-6. Map the joined columns (merged `role.column` names such as `escrow_items.ItemType`, aggregate outputs such
-   as `tax_total`). In Phase 1 the workbench's column picker lists the sampled master columns only, and adding
-   a field on a joined name is refused, so use the workaround in "Mapping joined columns in Phase 1" below.
-   Then submit and approve the mapping as usual.
+You can create the feed straight from sample files. You do not need to create it from one file first.
+
+1. **Vendors & Mapping:** pick the vendor, click **Add feed**, and choose **Several files** at the top of the
+   dialog. Give the feed a name.
+2. **Pick files:** choose the **master** sample (one row per loan), then add one row for each detail file
+   ("+ Add a detail file"): type the role name (for example `escrow_items`) and choose its sample file. The
+   columns of each file appear under it. A role name uses lowercase letters, digits and underscores, starts with
+   a letter and is up to 40 characters long (`layout`, `readiness`, `manifest` and `files` are reserved). The
+   server refuses any other name with a 400.
+3. **Set up the join:** click "Set up the join". The app proposes a layout: a file name pattern per role, the
+   master's key, and how each detail file matches the master. Adjust it in the same editor used on the File
+   layout tab. Pick the matching column on each side. In this dialog the files are the ones picked in step 2:
+   to add or remove a file, change the list above and set up the join again.
+4. **Check the join:** click "Check the join". You see the match rate, the counts per file, any join problems in
+   words, and the first joined rows (PII masked). Create stays disabled until the check has run without errors
+   and the layout has not changed since. Change anything and you must check again.
+5. **Create:** click "Create feed and draft mapping". The feed, a draft mapping built from the joined sample,
+   and a proposed layout are created together. If anything fails, nothing is left behind: no feed, mapping or
+   vendor row, and no copy of the joined sample file. The layout needs a
+   second person's approval before files use it.
+6. **Approve:** the mapping is reviewed and approved as usual (a different person from the preparer). A
+   different SME also approves the layout on the File layout tab; the same person cannot propose and approve.
+   Approval publishes the signed feed bundle. Then deliver the files (Import Monitor, or `/api/upload/set`).
+
+**Which mode: summarise (aggregate) or merge?** Use **merge** only when the detail file has exactly one row per
+loan; its columns arrive as `role.column`. Use **summarise (aggregate)** when a loan can have several detail
+rows (escrow items, fees): you choose the totals, counts or lists to keep (for example the sum of TAX items).
+The starter layout uses `one` per loan, so if the check reports **JOIN04** (several detail rows for one loan),
+switch that file to summarise (aggregate) and add the columns you need.
+
+The draft mapping is guessed from column names, so review it: some suggestions may be wrong (for example an item
+count mapped to a term field) and must be rejected or re-pointed.
+
+### Adding a layout to an existing feed (in the web app)
+
+1. Open the feed's **Delivery & schedule** tab and click "This feed arrives as several files...". The **File
+   layout** tab opens.
+2. **Files, Relations, Readiness:** fill in the master and detail roles, the matching columns, the mode,
+   policies and the minimum match rate, then how a complete set is recognised and what happens on timeout.
+3. **Join preview:** upload one sample per role to see the match rate, the per-role counts and the first joined
+   rows. A preview on a sample is a sanity check only (note (d)).
+4. **Propose** the layout. A different SME approves it. Approval publishes a new signed feed bundle that
+   carries the layout and readiness.
+5. Map the joined columns (`role.column` names, aggregate outputs such as `tax_total`); see "Mapping joined
+   columns in Phase 1" below. Then submit and approve the mapping as usual.
 
 ### Through the API
+
+One call creates the feed from samples (multipart: `name`, `description`, `layout`, `readiness`, and one file
+part per role named by the role); `POST /api/multi-file-feeds/inspect` and `.../preview` are the read-only
+helpers the dialog uses:
+
+```bash
+curl -X POST localhost:8000/api/multi-file-feeds -H "X-User: priya" -H "X-Roles: onboarding" \
+  -F name="Escrow tape" -F layout=@layout.json -F readiness=@readiness.json \
+  -F master=@loans_20261117.csv -F escrow_items=@escrow_items_20261117.csv
+```
+
+To add a layout to an existing feed instead:
 
 ```bash
 H='-H "X-User: priya" -H "X-Roles: onboarding"'
@@ -136,12 +177,50 @@ curl -X POST localhost:8000/api/upload/set -H "X-User: maria" -H "X-Roles: ops" 
 ```
 
 In Python the same steps are `multifile.service.propose_layout` / `decide_layout` and
-`multifile.fileset.attach_file`; `tests/test_multifile_e2e.py` runs the whole flow.
+`multifile.fileset.attach_file`; `tests/test_multifile_e2e.py` runs the whole flow, and `tests/test_lifecycle_and_onboarding_e2e.py` drives the
+onboarding, approval, delivery, archive and delete steps over HTTP.
 
 **Mapping joined columns in Phase 1.** The mapping service checks a new field's source against the sampled
 master file, so `add_field` refuses `role.column` and aggregate names. Add the field on any master column,
 then change its source (`POST /api/mappings/{id}/fields/{target}` with `action: override` and
 `sources: ["tax_total"]`), as `demo_setup.py` does.
+
+## Archiving and deleting feeds
+
+These apply to any feed, single-file or multi-file. Every action needs a reason of at least 5 characters and
+is audited.
+
+| Action | What it does | Who |
+|---|---|---|
+| **Archive** | Retires a feed that is no longer used. History (batches, loans, exceptions) is kept. | Onboarding. A **live** feed needs an onboarding reviewer (or admin). |
+| **Restore** | Brings an archived feed back. | Same rule as archive (a feed that was live needs a reviewer). |
+| **Discard** (a mapping) | Drops a **draft** mapping version nobody will approve. The row stays, marked discarded. | Onboarding. |
+| **Delete** | Permanently removes a feed that was **never used**. | Admin only. |
+
+**Archive is refused** while the feed has a file being processed, a batch that is blocked, waiting for its turn,
+paused or out of order, a file set that is waiting or ready, or a mapping in review. Finish or clear those first.
+Nothing is half-archived.
+
+**An archived feed refuses everything:** uploads (`/api/upload`, `/api/upload/set`, presigned uploads) get a 409,
+a file arriving in S3 is rejected and an alert is raised, "Pull now" is refused and scheduled pulls do not run.
+Submitting, approving or creating a new version of its mapping is refused too. Nothing already on record loads
+either: a failed batch cannot be resumed or replayed (409), an override, skip or out-of-order release of its
+batches is refused, a file set cannot be accepted as partial or repaired (discarding one is allowed), and fixing
+one of its exceptions does not board the loan. Restore the feed first. As a last guard, a batch of an archived
+feed that reaches a runner anyway is marked failed with the reason "feed archived". Archiving pauses the feed's
+schedules and waives their future expected deliveries. It disappears from the Vendors page feed list and from
+`GET /api/sources` (use `?include_archived=true`), and shows under "Archived feeds" with the reason. The vendor's
+loans, exceptions and history stay visible.
+
+**Restore leaves schedules paused.** Re-activate each schedule on purpose when you are ready for deliveries to be
+expected again. A restore is refused if another feed of the same vendor now uses the name.
+
+**Discard** works only on a draft. An approved mapping is history and cannot be discarded; one in review must be
+sent back by the reviewer first. After discarding the only draft you can create a new version.
+
+**Delete** is refused when the feed has any batches, file sets, exceptions or loans on record: archive it
+instead. Deleting a feed made by mistake removes its mappings and schedules; the audit trail is kept.
+
 
 ## 4. Delivery scenarios
 
@@ -267,8 +346,9 @@ masters with 10,000,000 detail rows; on an Apple Silicon laptop it took 72.5 s w
   name patterns decide routing.
 - **(j)** File-set batches run on the standard engine, never on Glue/Spark, in Phase 1. Replay re-runs from
   the stored joined file.
-- **(k)** The client form's role-name rule is stricter than the server: lowercase letters, digits and
-  underscore, starting with a letter.
+- **(k)** Role names: lowercase letters, digits and underscore, starting with a letter, up to 40 characters,
+  and not `layout`, `readiness`, `manifest` or `files`. The server checks this on every layout and every file
+  part. The client form also reserves `source_id` and `auto_start`.
 - **(l)** Phase 1 limits: modes `merge` and `aggregate` only, every relation joins the master, and file-set
   batches load as `full` (flatten, child records, Spark parity, relation trees and snapshot/incremental sets
   come in later phases). PostgreSQL was not exercised in this work (SQLite only), and the new

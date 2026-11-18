@@ -43,8 +43,27 @@ PAIRINGS = ("sequence", "business_date", "filename_token", "window_minutes")
 NAMED_GROUP_PAIRINGS = ("sequence", "business_date", "filename_token")
 
 
+# A role names a file part, a temp file and a `role.column` prefix: a short safe token, never a path.
+ROLE_NAME_RE = re.compile(r"[a-z][a-z0-9_]{0,39}")
+RESERVED_ROLES = frozenset({"layout", "readiness", "manifest", "files"})
+ROLE_NAME_RULE = ("use lowercase letters, digits and underscores, starting with a letter, up to 40 characters "
+                  "(not layout, readiness, manifest or files)")
+
+
 class LayoutError(ValueError):
     pass
+
+
+def role_name_ok(role) -> bool:
+    """`master`, or a lowercase token (letter first, up to 40 characters) that is not a reserved form field name."""
+    return isinstance(role, str) and (role == "master" or (ROLE_NAME_RE.fullmatch(role) is not None and role not in RESERVED_ROLES))
+
+
+def role_name_error(role) -> str | None:
+    if role_name_ok(role):
+        return None
+    shown = role if isinstance(role, str) else repr(role)
+    return f"the role name {shown[:60]!r} is not allowed: {ROLE_NAME_RULE}"
 
 
 def normalize_layout(layout: dict) -> dict:
@@ -123,7 +142,9 @@ def validate_layout(layout: dict, readiness: dict | None, columns: dict[str, lis
     for f in files:
         role = f.get("role")
         if not role:
-            errs.append("every file needs a role")
+            errs.append("every file needs a role name")
+        elif role_name_error(role):
+            errs.append(role_name_error(role))
         try:
             re.compile(f.get("name_pattern") or "")
         except re.error as e:

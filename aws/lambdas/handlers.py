@@ -48,6 +48,16 @@ def on_file_arrival(event, _ctx):
     source_id = parts[1]
     head = s3.head_object(Bucket=bucket, Key=key)
     meta = head.get("Metadata", {})
+    from lbp.lifecycle import FeedArchivedError, assert_not_archived
+
+    try:
+        assert_not_archived(source_id)
+    except FeedArchivedError:  # an archived feed accepts nothing: alerted, never queued
+        from lbp.scheduling.alerts import notify
+
+        msg = f"{Path(key).name} was refused: feed {source_id} is archived"
+        notify("file_rejected", msg, {"source_id": source_id, "key": key})
+        return {"rejected": msg, "key": key}
     from lbp.config_store import ConfigError
     from lbp.multifile.fileset import feed_layout
 
@@ -155,6 +165,8 @@ def finalize_batch(event, _ctx):
 
 
 def mark_failed(event, _ctx):
+    from sqlalchemy import not_, or_
+
     from lbp.store import db
 
     batch_id = event.get("batch_id")
@@ -170,6 +182,8 @@ def mark_failed(event, _ctx):
         if not force:
             # Never clobber an active worker (e.g. duplicate SFN for the same batch hit BatchBusyError).
             q = q.where(db.batches.c.status.notin_(("completed", "running", "pausing")))
+            # run_batch already failed it because its feed is archived: keep that plain reason, not the Glue error
+            q = q.where(or_(db.batches.c.error.is_(None), not_(db.batches.c.error.startswith("feed archived"))))
         c.execute(q.values(**values))
         db.audit(c, "pipeline", "batch.failed", "batch", batch_id, {"error": err, "force": force})
     return {"batch_id": batch_id, "status": "failed", "force": force}

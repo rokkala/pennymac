@@ -74,6 +74,7 @@ Across the platform:
 9. **Snapshot truncation guard (Maria, 1 min).** Upload `correspondent_snapshot_<date>.csv` (from `2_upload_live`) to Summit / Weekly portfolio snapshot. Half the portfolio is missing, so it is flagged **truncated**, no close reviews are raised, and an alert fires.
 10. **Replay (Maria, 1 min).** Open `correspondent_2026-11-02.csv` and click "Preview replay…". The held "Owner-Occ" loans now board on mapping v2.
 11. **Two-file feed (Maria, 2 min).** In the Import Monitor, PCG / Escrow items feed shows a file set **waiting for escrow_items file**. Upload `escrow_items_<today>.csv` from `demo_uploads/3_multi_file/`: the set completes, one batch runs, and the batch shows per-file counts (rows read, matched, orphaned). Details in `docs/MULTI_FILE_FEEDS.md`.
+    - *Optional, 3 min:* create a two-file feed in the UI. As Priya, Vendors & Mapping → pick a vendor → Add feed → **Several files**, choose a master and an escrow items sample (from `demo_uploads/3_multi_file/`), "Set up the join", set the escrow file to summarise (aggregate), "Check the join", then Create. Dan approves the mapping and the layout. Then, as Dan, **Archive…** the feed with a reason: uploads to it are refused. **Restore…** it and uploads work again.
 12. **Deliveries and governance (Ana, 2 min).**
     - Vendor Deliveries: PCG is late. Use "Waive…" (asks for a reason) or "Pull now…".
     - Rule Engine: open R015 to see the canary, and lifecycle transitions that ask for a comment.

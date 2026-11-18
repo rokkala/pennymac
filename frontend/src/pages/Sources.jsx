@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { api, takeIntent } from "../api.js";
+import { api, takeIntent, discardMapping } from "../api.js";
 import { canCap } from "../roles.js";
+import { canDiscardMapping } from "../lifecycleModel.js";
 import { useApi, useAction, Panel, Status, Conf, Transform, Modal, Loading, Tabs, fmt, Kpis, Bar, useDialog, ActionBar, PageHeader } from "../ui.jsx";
 import DeliveryProfile from "./DeliveryProfile.jsx";
 import FeedLayout from "./FeedLayout.jsx";
@@ -125,9 +126,9 @@ function FieldInspector({ mappingId, field, columns, grouped, draft, catalog, lo
       sub={d ? `${d.attribute.module} · ${d.attribute.dtype}${d.attribute.length ? `(${d.attribute.length})` : ""} · ${d.attribute.risk} risk${d.attribute.required ? " · required" : ""}${d.attribute.pii ? " · PII" : ""}` : ""}
       footer={draft && !editing ? <>
         <span className="lead faint">Changes save to draft v{field._version || ""}; nothing reaches Glue until the mapping is approved.</span>
-        {field.manual || field.one_to_many || field.retargeted_from
-          ? <button className="btn danger" onClick={() => onField(field.target, { action: "remove" })}>Remove mapping</button>
-          : <button className="btn danger" disabled={field.status === "rejected"} onClick={() => onField(field.target, { action: "reject" })}>Reject</button>}
+        <button className="btn danger" onClick={() => onField(field.target, { action: "remove" })}>Remove mapping</button>
+        {field.status !== "rejected" && !field.manual && !field.one_to_many && !field.retargeted_from
+          && <button className="btn" onClick={() => onField(field.target, { action: "reject" })}>Keep row, reject suggestion</button>}
         <button className="btn primary" disabled={field.status === "accepted"} onClick={async () => { await onField(field.target, { action: "accept" }); nav?.onNext?.(); }}>{field.status === "accepted" ? "Accepted" : "Accept and next"}</button></> : null}>
       {!d ? <Loading error={base.error} /> : (
         <div className="stack" style={{ gap: 16 }}>
@@ -448,6 +449,9 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
             {mp.status === "in_review" && canApprove && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: "Send back to the analyst", confirmLabel: "Send back", minLength: 5,
               help: "The mapping returns to draft with your comment. Say what needs to change.", presets: ["Please revisit the low-confidence fields", "Value translations incomplete"],
               onSubmit: (comment) => act(() => api(`/api/mappings/${mappingId}/approve`, { method: "POST", body: { approve: false, comment } }), "Sent back to analyst").then((r) => { if (r) m.reload(); return r; }) })}>Send back…</button>}
+            {canDiscardMapping(persona, mp, mp.source) && <button type="button" className="btn" onClick={() => ask({ kind: "reason", title: `Discard draft v${mp.version}`, confirmLabel: "Discard draft", danger: true, required: true, minLength: 5,
+              help: "This version is set aside and can no longer be edited or approved. The live version, if there is one, keeps running. It stays in the history.", placeholder: "e.g. Started from the wrong sample file",
+              onSubmit: (reason) => act(() => discardMapping(mappingId, reason), `Draft v${mp.version} discarded`).then((r) => { if (r) (mp.source.vendor_id ? onVendor(mp.source.vendor_id) : onBack()); return r; }) })}>Discard this draft…</button>}
             {mp.status === "in_review" && !canApprove && <span className="faint" style={{ fontSize: ".82rem" }}>SME can approve</span>}
             {mp.source_id && mp.source.status === "live" && <FeedConfigChip sourceId={mp.source_id} persona={persona} />}
           </ActionBar>
@@ -504,7 +508,8 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
                           <td><Status s={f.status} /></td>
                           {draft && <td className="r" onClick={(e) => e.stopPropagation()}><span className="row" style={{ gap: 4, justifyContent: "flex-end", flexWrap: "nowrap" }}>
                             <button className="btn sm" onClick={() => doField(f.target, { action: "accept" })} disabled={f.status === "accepted"}>Accept</button>
-                            <button className="btn sm" onClick={() => setSel(f.target)}>Inspect</button></span></td>}
+                            <button className="btn sm" onClick={() => setSel(f.target)}>Inspect</button>
+                            <button type="button" className="btn sm danger" title="Drop this SSE mapping from the draft" onClick={() => doField(f.target, { action: "remove" })}>Remove</button></span></td>}
                         </tr>);
                     })}
                   </React.Fragment>);

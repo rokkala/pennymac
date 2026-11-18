@@ -23,7 +23,11 @@ def _roles(roles: list[str]) -> set[str]:
 
 
 def known_columns(profile: dict | None) -> dict[str, list[str]] | None:
-    """Columns of the sampled file, which is the master role's; None when there is no profile."""
+    """Known columns by role: the profile's `role_columns` for a feed onboarded from several sample files,
+    else the sampled file's, which is the master role's; None when there is no profile."""
+    rc = (profile or {}).get("role_columns")
+    if rc:
+        return {r: list(c) for r, c in rc.items()}
     cols = [c["name"] for c in (profile or {}).get("columns", [])]
     return {"master": cols} if cols else None
 

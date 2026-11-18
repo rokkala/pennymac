@@ -180,7 +180,8 @@ def _rollups(c, vendor_ids: list[str] | None = None) -> dict[str, dict]:
     for vid, fs in by_v.items():
         if vendor_ids is not None and vid not in vendor_ids:
             continue
-        ids = [f.source_id for f in fs]
+        ids = [f.source_id for f in fs]  # all feeds: an archived feed's loans, history and open items still count
+        fs = [f for f in fs if f.status != "retired"]
         agg: dict[str, int] = {}
         for sid in ids:
             for k, n in dstats.get(sid, {}).items():
@@ -188,7 +189,7 @@ def _rollups(c, vendor_ids: list[str] | None = None) -> dict[str, dict]:
         due = sum(n for k, n in agg.items() if k != "waived")
         lasts = [last[s] for s in ids if last.get(s)]
         out[vid] = {
-            "feeds": len(fs), "live_feeds": sum(1 for f in fs if f.active_mapping_id),
+            "feeds": len(fs), "archived_feeds": len(ids) - len(fs), "live_feeds": sum(1 for f in fs if f.active_mapping_id),
             "load_types": sorted({profile_of(f.delivery)["load_type"] for f in fs}),
             "active_loans": sum(loans.get(s, 0) for s in ids), "open_exceptions": sum(open_ex.get(s, 0) for s in ids),
             "last_file": max(lasts).isoformat() + "Z" if lasts else None,
@@ -196,7 +197,7 @@ def _rollups(c, vendor_ids: list[str] | None = None) -> dict[str, dict]:
             "late_or_missed": sum(recent_bad.get(sid, 0) for sid in ids),  # last 48 h, still not received
             "missed_30d": agg.get("missed", 0),
             "on_time_pct": round(100 * agg.get("received", 0) / due, 1) if due else None,
-            "schedules": sum(sched.get(s, 0) for s in ids),
+            "schedules": sum(sched.get(f.source_id, 0) for f in fs),
             "pending_mapping_review": sum(1 for f in fs if f.status in ("draft", "mapping")),
         }
     return out
@@ -207,7 +208,7 @@ def list_vendors() -> list[dict]:
         rows = c.execute(select(db.vendors).order_by(db.vendors.c.name)).all()
         roll = _rollups(c)
     return [{**db.row_to_dict(r), **roll.get(r.vendor_id, {"feeds": 0, "live_feeds": 0, "load_types": [], "active_loans": 0,
-                                                           "open_exceptions": 0, "last_file": None, "attention_files": 0,
+                                                           "open_exceptions": 0, "last_file": None, "attention_files": 0, "archived_feeds": 0,
                                                            "late_or_missed": 0, "on_time_pct": None, "schedules": 0,
                                                            "pending_mapping_review": 0})} for r in rows]
 
@@ -241,6 +242,8 @@ def get_vendor(vendor_id: str) -> dict:
             "last_sequence": display_sequence(f.last_sequence), "active_loans": loans.get(f.source_id, 0),
             "last_file": last[f.source_id].isoformat() + "Z" if last.get(f.source_id) else None,
             "columns": len((f.profile or {}).get("columns", [])), "created_by": f.created_by,
+            "retired_at": f.retired_at.isoformat() + "Z" if f.retired_at else None, "retired_reason": f.retired_reason,
+            "retired_by": f.retired_by,
             "mappings": [{"mapping_id": m.mapping_id, "version": m.version, "status": m.status,
                           "auto_mapped_pct": (m.stats or {}).get("auto_mapped_pct"), "approved_by": m.approved_by}
                          for m in maps if m.source_id == f.source_id],

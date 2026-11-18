@@ -360,3 +360,24 @@ def test_state_machine_matches_handlers_and_glue_jobs():
     assert "--batch_id" in (root / "glue" / "feed_job.py").read_text() or '"batch_id"' in (root / "glue" / "feed_job.py").read_text()
     for job in ("feed_job.py", "feed_spark_job.py", "vendor_pull_job.py"):
         assert f'"{job}"' in tf or job in tf, f"{job} not deployed"
+
+
+def test_mark_failed_keeps_the_feed_archived_reason(onboarded, monkeypatch):
+    """run_batch fails a batch of an archived feed with a plain reason; the Step Functions catch must not bury it."""
+    from moto import mock_aws
+    from sqlalchemy import select
+
+    from lbp.pipeline.batch import create_batch
+    from lbp.store import db
+
+    with mock_aws():
+        h = _load(monkeypatch)
+        src = onboarded["pcg_retail"]
+        bid = create_batch(src["source_id"], src["path"], src["path"].name, "s3")
+        with db.get_engine().begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == bid).values(
+                status="failed", error="feed archived: restore the feed before running its files"))
+        h.mark_failed({"batch_id": bid, "error": {"Error": "FeedArchivedError"}}, None)
+        with db.get_engine().connect() as c:
+            b = c.execute(select(db.batches).where(db.batches.c.batch_id == bid)).first()
+        assert b.status == "failed" and b.error.startswith("feed archived")

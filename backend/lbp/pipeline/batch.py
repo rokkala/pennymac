@@ -215,15 +215,27 @@ SET_LOAD_TYPE_ERROR = ("multi-file (file-set) batches load as full in this phase
                        "are not supported for feeds with a layout")
 
 
+def _lock_source(c, source_id: str) -> None:
+    """Write-first lock on the feed row (no-op update; as multifile.fileset._lock_source and lifecycle._lock_feed):
+    serialises batch registration with archive/restore on PostgreSQL (row lock) and SQLite (database write lock)."""
+    s = db.sources
+    c.execute(s.update().where(s.c.source_id == source_id).values(source_id=s.c.source_id))
+
+
 def _register_batch(c, source_id: str, file_path, filename: str, actor: str, local: Path, digest: str, allow_duplicate: bool,
                     reason: str | None, load_type: str | None, strict: bool, file_set_id: str | None = None) -> str:
     """create_batch's body on an open connection (the caller owns the transaction). `file_set_id` links the
     batch to its multi-file set in the same insert, so a queued set batch is never visible unlinked."""
     from .delivery import LOAD_TYPES, DeliveryError, display_sequence, extract_sequence, file_action, profile_of
 
+    _lock_source(c, source_id)  # write-first row lock: an archive in flight either finishes first (seen below) or waits for us
     src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
     if not src:
         raise ValueError("unknown source")
+    if src.status == "retired":
+        from ..lifecycle import FeedArchivedError
+
+        raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before sending it files")
     if not src.active_mapping_id:
         raise ValueError("source has no approved mapping; complete onboarding first")
     prior = c.execute(select(db.batches.c.batch_id, db.batches.c.created_at).where(
@@ -412,7 +424,19 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
         if b is None:
             raise ValueError("unknown batch")
-        active = c.execute(select(db.sources.c.active_mapping_id).where(db.sources.c.source_id == b.source_id)).scalar()
+        src = c.execute(select(db.sources.c.active_mapping_id, db.sources.c.status, db.sources.c.name)
+                        .where(db.sources.c.source_id == b.source_id)).first()
+        active = src.active_mapping_id if src else None
+    if src is not None and src.status == "retired":
+        # backstop for every runner (local thread, worker, Glue/Step Functions): a retired feed loads nothing
+        from ..lifecycle import FeedArchivedError
+
+        msg = "feed archived: restore the feed before running its files"
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status.notin_(("completed", "running")))
+                      .values(status="failed", error=msg, worker_id=None))
+            db.audit(c, "pipeline", "batch.feed_archived", "batch", batch_id, {"source_id": b.source_id})
+        raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before running its files")
     # The data plane reads only the feed's published (approved, signed) configuration, never the live tables.
     try:
         cfg = load_config(b.source_id)

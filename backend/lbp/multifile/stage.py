@@ -460,8 +460,8 @@ def _join(batch_id: str, b, cfg, lay: dict, inputs: dict[str, Path], overrides: 
     out = d / f"{batch_id}.csv"
     empties = []
     try:
-        for role in absent:
-            empties.append(_write_empty(d / f"{batch_id}.{role}.empty.csv", _empty_columns(lay, role, cfg)))
+        for i, role in enumerate(absent):  # named by position, never by role
+            empties.append(_write_empty(d / f"{batch_id}.{i}.empty.csv", _empty_columns(lay, role, cfg)))
             inputs[role] = empties[-1]
             overrides[role] = dict(_EMPTY_PARSE_OPTIONS)
         with db.get_engine().begin() as c:  # rows left by an attempt that crashed before recording its file

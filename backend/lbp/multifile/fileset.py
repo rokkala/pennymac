@@ -35,6 +35,7 @@ from typing import Literal
 
 from sqlalchemy import select
 
+from ..lifecycle import FeedArchivedError
 from ..pipeline.batch import DuplicateFileError
 from ..store import db
 
@@ -222,9 +223,11 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
     """Attach one arriving file to its set; queue the set's batch when the set becomes ready. strict=False
     (unattended arrivals) records a batch that cannot be sequenced as failed, like create_batch(strict=False)."""
     from ..ingestion.parser import estimate_rows
+    from ..lifecycle import assert_not_archived
     from ..pipeline.batch import file_sha256
     from ..storage import local_path
 
+    assert_not_archived(source_id)
     cfg = _config(source_id)
     layout, readiness = cfg.layout, cfg.readiness or {}
     if role is not None:
@@ -243,6 +246,8 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
 
     with db.get_engine().begin() as c:
         _lock_source(c, source_id)
+        if c.execute(select(db.sources.c.status).where(db.sources.c.source_id == source_id)).scalar() == "retired":
+            raise FeedArchivedError("this feed is archived; restore it before sending it files")  # archived since the check above
         q = select(fs).where(fs.c.source_id == source_id, fs.c.status == "waiting")
         if readiness.get("pairing") == "window_minutes":
             q = q.where(fs.c.opened_at >= now - timedelta(minutes=int(readiness["window_minutes"])), fs.c.opened_at <= now)
@@ -294,7 +299,7 @@ def evaluate_set(set_id: str, now: datetime | None = None) -> str:
         return _evaluate(c, s, cfg, _naive_utc(now))
 
 
-SAFE_TEXT_ERRORS = (FileSetError, DuplicateFileError)
+SAFE_TEXT_ERRORS = (FileSetError, DuplicateFileError, FeedArchivedError)
 
 
 def _safe_message(e: Exception) -> str:
@@ -509,13 +514,20 @@ def _override_record(s, action: str, actor: str, reason: str, now: datetime, **e
     return cur
 
 
-def _open_for_override(c, set_id: str, allowed: tuple[str, ...]):
-    """Lock the feed, then the set; reject a set that already has a batch or is not in `allowed`."""
+def _open_for_override(c, set_id: str, allowed: tuple[str, ...], live_only: bool = False):
+    """Lock the feed, then the set; reject a set that already has a batch or is not in `allowed`. `live_only`:
+    refuse when the feed is archived (an override that can queue a load)."""
     fs = db.file_sets
     s0 = c.execute(select(fs.c.source_id).where(fs.c.set_id == set_id)).first()
     if s0 is None:
         raise FileSetError("file set not found")
     _lock_source(c, s0.source_id)
+    if live_only:
+        src = c.execute(select(db.sources.c.name, db.sources.c.status).where(db.sources.c.source_id == s0.source_id)).first()
+        if src is not None and src.status == "retired":
+            from ..lifecycle import FeedArchivedError
+
+            raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before loading its files")
     s = c.execute(select(fs).where(fs.c.set_id == set_id).with_for_update()).first()
     if s.batch_id is not None or s.status == "consumed":
         raise FileSetError(f"file set {set_id} is {s.status}: its batch {s.batch_id} is already queued, so it can no longer be overridden")
@@ -556,7 +568,8 @@ def override_set(set_id: str, action: Literal["accept_partial", "discard", "repa
 def _accept_or_discard(set_id: str, action: str, actor: str, reason: str, now: datetime) -> dict:
     fs = db.file_sets
     with db.get_engine().begin() as c:
-        s = _open_for_override(c, set_id, ("waiting", "expired", "overridden") if action == "accept_partial" else _OVERRIDABLE)
+        s = _open_for_override(c, set_id, ("waiting", "expired", "overridden") if action == "accept_partial" else _OVERRIDABLE,
+                               live_only=action == "accept_partial")
         present = _present(c, set_id)
         detail = {"action": action, "reason": reason, "roles": sorted(present), "previous_status": s.status}
         vals: dict = {}
@@ -594,7 +607,7 @@ def _repair(set_id: str, actor: str, reason: str, now: datetime, target_key: str
     if not target_key:
         raise FileSetError("target_pairing_key is required to repair a file set")
     with db.get_engine().begin() as c:
-        s = _open_for_override(c, set_id, _OVERRIDABLE)
+        s = _open_for_override(c, set_id, _OVERRIDABLE, live_only=True)
         cfg = _config(s.source_id)
         readiness = cfg.readiness or {}
         present = _present(c, set_id)

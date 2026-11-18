@@ -24,7 +24,7 @@ export const newRelation = (detail) => ({
 export function addDetail(layout, role) {
   const name = String(role || "").trim();
   if (!name) throw new Error("A file role needs a name");
-  if (name !== "master" && !roleNameOk(name)) throw new Error("Use lowercase letters, digits and underscores, starting with a letter (not layout, readiness, manifest or files)");
+  if (name !== "master" && !roleNameOk(name)) throw new Error("Use lowercase letters, digits and underscores, starting with a letter, up to 40 characters (not layout, readiness, manifest or files)");
   if (name === "master") throw new Error("master is the main file; add a different role");
   if ((layout.files || []).some((f) => f.role === name)) throw new Error(`There is already a file called ${name}`);
   const out = clone(layout);
@@ -42,7 +42,12 @@ export function removeDetail(layout, role) {
 }
 
 const RESERVED_ROLES = ["layout", "readiness", "manifest", "files", "source_id", "auto_start"];
-export const roleNameOk = (r) => /^[a-z][a-z0-9_]*$/.test(String(r || "")) && !RESERVED_ROLES.includes(r);
+export const roleNameOk = (r) => /^[a-z][a-z0-9_]{0,39}$/.test(String(r || "")) && !RESERVED_ROLES.includes(r);
+
+/** Layout roles that have no sample file in `files` ({role: file}), e.g. a role added to the layout without a file. */
+export function rolesWithoutSample(layout, files) {
+  return (layout?.files || []).map((f) => f.role).filter((r) => r && !files?.[r]);
+}
 const hasNamedGroup = (p) => /\(\?P?<(?![=!])[A-Za-z_]/.test(String(p || ""));
 
 /** Problems found on the form before it is sent. `columns` (optional): {role: [column names]} when known. */
@@ -57,7 +62,7 @@ export function validateLayoutForm(layout, readiness, columns) {
   for (const r of [...new Set(roles.filter((x, i) => roles.indexOf(x) !== i))]) errs.push(`The file ${r || "(no name)"} is listed more than once.`);
   for (const f of files) {
     if (!f.role) { errs.push("Every file needs a role name."); continue; }
-    if (f.role !== "master" && !roleNameOk(f.role)) errs.push(`The role name ${f.role} is not allowed: use lowercase letters, digits and underscores, starting with a letter (not layout, readiness, manifest or files).`);
+    if (f.role !== "master" && !roleNameOk(f.role)) errs.push(`The role name ${f.role} is not allowed: use lowercase letters, digits and underscores, starting with a letter, up to 40 characters (not layout, readiness, manifest or files).`);
     if (!String(f.name_pattern || "").trim()) errs.push(`The ${f.role} file needs a file name pattern.`);
   }
   if (masters.length === 1) {
@@ -212,4 +217,44 @@ export function stripClientIds(layout) {
   const out = clone(layout);
   for (const r of out.relations || []) for (const c of r.aggregate?.columns || []) delete c._id;
   return out;
+}
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** A file-name regex for a sample file: an 8-digit date becomes a named group, anything else must match exactly. */
+export function guessPattern(filename) {
+  const name = String(filename || "");
+  const m = /\d{8}/.exec(name);
+  if (!m) return escapeRegex(name);
+  return `${escapeRegex(name.slice(0, m.index))}(?P<date>\\d{8})${escapeRegex(name.slice(m.index + 8))}`;
+}
+
+/** A first layout for sample files: roles = [{role, filename, columns}]. The master is required and keyed on its first id-like column (loan_id, LoanID);
+ * each detail joins the master as a one-to-one merge on the columns the two files share by name (empty when none). */
+export function starterLayout(roles, masterRole) {
+  const list = roles || [];
+  const master = list.find((r) => r.role === masterRole) || list[0];
+  const mcols = master?.columns || [];
+  const key = mcols.find((c) => /(^|_)id$/i.test(c) || /[a-z](ID|Id)$/.test(c)) || mcols[0];
+  const layout = {
+    files: [{ role: masterRole, name_pattern: guessPattern(master?.filename), required: true, entity: "", key: key ? [key] : [], parse_options: {} }],
+    relations: [],
+  };
+  for (const d of list) {
+    if (d === master) continue;
+    layout.files.push({ role: d.role, name_pattern: guessPattern(d.filename), required: true, parse_options: {} });
+    const rel = newRelation(d.role);
+    rel.to = masterRole;
+    const shared = (d.columns || []).filter((c) => mcols.includes(c));
+    const pick = shared.includes(key) ? key : shared[0];
+    rel.on = pick ? [{ parent: pick, detail: pick }] : [];
+    layout.relations.push(rel);
+  }
+  return layout;
+}
+
+/** What a join check was run on. A result is only valid while this still equals the current one (layout, readiness, sample files). */
+export function checkSignature(layout, ready, filesByRole) {
+  const files = Object.keys(filesByRole || {}).sort().map((r) => { const f = filesByRole[r]; return [r, f?.name, f?.size, f?.lastModified]; });
+  return JSON.stringify([stripClientIds(layout || { files: [], relations: [] }), ready || {}, files]);
 }

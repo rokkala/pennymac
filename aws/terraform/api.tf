@@ -3,8 +3,8 @@ resource "aws_cognito_user_pool" "main" {
   name                     = local.name
   username_attributes      = ["email"]
   auto_verified_attributes = ["email"]
-  mfa_configuration        = "ON"
-  software_token_mfa_configuration { enabled = true }
+  # PoC: email+password only. Re-enable software MFA for prod.
+  mfa_configuration = "OFF"
   password_policy {
     minimum_length    = 14
     require_lowercase = true
