@@ -331,3 +331,135 @@ def test_pipe_delimited_full_flow_loads(env):
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == done["batch_id"])).first()
     assert b.status == "completed", b.error
     assert b.loaded > 0 and b.join_summary
+
+
+# ------------------------------------------------------------------ final review: role names, missing samples, tidy-up
+BAD_PART_NAMES = ["../x", "ABSOLUTE", "", "Upper", "a" * 41, "layout"]
+
+
+@pytest.fixture()
+def tmproot(tmp_path, monkeypatch):
+    """Every temp dir the routes make lives here; after a request nothing may be left in it (or beside it)."""
+    import tempfile
+
+    root = tmp_path / "tmproot" / "inner"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(root))
+    return root
+
+
+def _part_name(bad, tmp_path):
+    return str(tmp_path / "outside" / "pwned") if bad == "ABSOLUTE" else bad
+
+
+def _nothing_escaped(tmp_path, root):
+    assert not (tmp_path / "outside").exists() or not any((tmp_path / "outside").iterdir())
+    assert list(root.iterdir()) == []                 # temp dirs removed
+    assert [p.name for p in root.parent.iterdir()] == ["inner"]   # nothing written next to them (../x)
+
+
+@pytest.mark.parametrize("bad", BAD_PART_NAMES)
+@pytest.mark.parametrize("url", ["/api/multi-file-feeds/inspect", "/api/multi-file-feeds/preview", "/api/multi-file-feeds"])
+def test_bad_part_names_refused_and_nothing_written_outside(client, env, tmp_path, tmproot, url, bad):
+    (tmp_path / "outside").mkdir(exist_ok=True)
+    files = _files(env)
+    parts = {"master": _parts(files)["master"], _part_name(bad, tmp_path): _parts(files)["escrow_items"]}
+    data = {"name": "Bad", "layout": json.dumps(samples.master_detail_layout()), "readiness": json.dumps(samples.master_detail_readiness())}
+    before = _counts()
+    r = client.post(url, files=parts, data=data, headers=ANA)
+    assert r.status_code == 400, r.text
+    assert "is not allowed" in r.json()["detail"]
+    _nothing_escaped(tmp_path, tmproot)
+    assert _counts() == before
+
+
+@pytest.mark.parametrize("bad", ["../x", "ABSOLUTE", "", "Upper", "a" * 41])
+def test_bad_layout_role_names_refused_by_preview_and_register(client, env, tmp_path, tmproot, bad):
+    (tmp_path / "outside").mkdir(exist_ok=True)
+    lay = samples.master_detail_layout()
+    role = _part_name(bad, tmp_path)
+    lay["files"][1]["role"] = role
+    lay["relations"][0]["detail"] = role
+    files = _files(env)
+    data = {"name": "Bad", "layout": json.dumps(lay), "readiness": json.dumps(samples.master_detail_readiness())}
+    r = client.post("/api/multi-file-feeds/preview", files={"master": _parts(files)["master"]}, data=data, headers=ANA)
+    assert r.status_code == 200 and any("role name" in e for e in r.json()["errors"]), r.text
+    before = _counts()
+    with pytest.raises(OnboardError, match="role name"):
+        register_multifile_source("Bad", {"master": files["master"], role: files["escrow_items"]}, lay,
+                                  samples.master_detail_readiness(), "ana", ONB)
+    _nothing_escaped(tmp_path, tmproot)
+    assert _counts() == before
+
+
+def test_preview_refuses_parts_that_are_not_layout_roles(client, env):
+    files = _files(env)
+    data = {"layout": json.dumps(samples.master_detail_layout()), "readiness": json.dumps(samples.master_detail_readiness())}
+    r = client.post("/api/multi-file-feeds/preview", files={**_parts(files), "extra": ("e.csv", b"a\n1\n")}, data=data, headers=ANA)
+    assert r.status_code == 400 and "layout role" in r.json()["detail"]
+
+
+def test_inspect_and_preview_never_name_temp_files_by_role(env, tmproot, monkeypatch):
+    """Defence in depth: even called directly (no route check), a hostile role cannot steer a path."""
+    from lbp.multifile.preview import preview_join
+
+    files = _files(env)
+    evil = str(tmproot.parent / "evil")
+    with pytest.raises(OnboardError):
+        inspect_files({evil: (files["master"].read_bytes(), "x.csv")})
+    lay = samples.master_detail_layout()
+    out = preview_join(lay, samples.master_detail_readiness(),
+                       {"master": (files["master"].read_bytes(), "m.csv"), evil: (files["escrow_items"].read_bytes(), "d.csv")}, {})
+    assert out["errors"]
+    assert not list(tmproot.parent.glob("evil*")) and list(tmproot.iterdir()) == []
+
+
+def test_layout_role_without_a_sample_file_is_a_clear_error_not_500(client, env):
+    """The wizard's layout editor can add a detail role that has no sample slot: the check must say so."""
+    lay = samples.master_detail_layout()
+    lay["files"].append({"role": "fees", "name_pattern": r"fees_(?P<date>\d{8})\.csv", "required": False})
+    lay["relations"].append({"detail": "fees", "to": "master", "on": [{"parent": "LoanID", "detail": "LoanRef"}], "mode": "merge"})
+    files = _files(env)
+    data = {"name": "Gap", "layout": json.dumps(lay), "readiness": json.dumps(samples.master_detail_readiness())}
+    r = client.post("/api/multi-file-feeds/preview", files=_parts(files), data=data, headers=ANA)
+    assert r.status_code == 200, r.text
+    assert any("no sample file was sent for the fees role" in e for e in r.json()["errors"])
+    before = _counts()
+    r = client.post("/api/multi-file-feeds", files=_parts(files), data=data, headers=ANA)
+    assert r.status_code == 400 and "no sample file was sent for the fees role" in r.json()["detail"]
+    assert _counts() == before
+    from lbp.multifile.layout import LayoutError
+    from lbp.multifile.preview import build_joined_sample
+
+    with pytest.raises(LayoutError, match="no sample file was sent for the fees role"):
+        build_joined_sample(lay, samples.master_detail_readiness(), dict(files), {}, env / "out")
+
+
+def _sample_dir(env):
+    return env / "data" / "samples"
+
+
+def test_failed_onboarding_removes_the_joined_sample(env, monkeypatch):
+    from lbp.multifile import service
+
+    monkeypatch.setattr(onboard, "propose_layout", lambda *a, **k: (_ for _ in ()).throw(service.LayoutServiceError("boom")))
+    with pytest.raises(service.LayoutServiceError):
+        _reg(_files(env))
+    assert not _sample_dir(env).exists() or list(_sample_dir(env).iterdir()) == []
+
+
+def test_register_source_failure_removes_the_joined_sample(env, monkeypatch):
+    def boom(*a, **k):
+        raise ms.MappingError("this vendor already has a feed named X")
+
+    monkeypatch.setattr(ms, "register_source", boom)
+    before = _counts()
+    with pytest.raises(ms.MappingError):
+        _reg(_files(env))
+    assert not _sample_dir(env).exists() or list(_sample_dir(env).iterdir()) == []
+    assert _counts() == before
+
+
+def test_successful_onboarding_keeps_its_joined_sample(env):
+    _reg(_files(env))
+    assert len(list(_sample_dir(env).iterdir())) == 1

@@ -29,6 +29,10 @@ def replay_batch(batch_id: str, actor: str, dry_run: bool = False) -> dict:
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
         if not b:
             raise ValueError("batch not found")
+        if not dry_run:  # the API refuses first; this covers the Glue replay job, which calls in directly
+            from ..lifecycle import assert_not_archived
+
+            assert_not_archived(b.source_id)
         if b.status in ("running", "pausing", "queued", "claimed"):
             raise ValueError("wait for the batch to finish before replaying")
         if (b.load_type or "full") != "full":

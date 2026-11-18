@@ -102,15 +102,19 @@ You can create the feed straight from sample files. You do not need to create it
    dialog. Give the feed a name.
 2. **Pick files:** choose the **master** sample (one row per loan), then add one row for each detail file
    ("+ Add a detail file"): type the role name (for example `escrow_items`) and choose its sample file. The
-   columns of each file appear under it.
+   columns of each file appear under it. A role name uses lowercase letters, digits and underscores, starts with
+   a letter and is up to 40 characters long (`layout`, `readiness`, `manifest` and `files` are reserved). The
+   server refuses any other name with a 400.
 3. **Set up the join:** click "Set up the join". The app proposes a layout: a file name pattern per role, the
    master's key, and how each detail file matches the master. Adjust it in the same editor used on the File
-   layout tab. Pick the matching column on each side.
+   layout tab. Pick the matching column on each side. In this dialog the files are the ones picked in step 2:
+   to add or remove a file, change the list above and set up the join again.
 4. **Check the join:** click "Check the join". You see the match rate, the counts per file, any join problems in
    words, and the first joined rows (PII masked). Create stays disabled until the check has run without errors
    and the layout has not changed since. Change anything and you must check again.
 5. **Create:** click "Create feed and draft mapping". The feed, a draft mapping built from the joined sample,
-   and a proposed layout are created together. If anything fails, nothing is left behind. The layout needs a
+   and a proposed layout are created together. If anything fails, nothing is left behind: no feed, mapping or
+   vendor row, and no copy of the joined sample file. The layout needs a
    second person's approval before files use it.
 6. **Approve:** the mapping is reviewed and approved as usual (a different person from the preparer). A
    different SME also approves the layout on the File layout tab; the same person cannot propose and approve.
@@ -199,7 +203,11 @@ Nothing is half-archived.
 
 **An archived feed refuses everything:** uploads (`/api/upload`, `/api/upload/set`, presigned uploads) get a 409,
 a file arriving in S3 is rejected and an alert is raised, "Pull now" is refused and scheduled pulls do not run.
-Submitting, approving or creating a new version of its mapping is refused too. Archiving pauses the feed's
+Submitting, approving or creating a new version of its mapping is refused too. Nothing already on record loads
+either: a failed batch cannot be resumed or replayed (409), an override, skip or out-of-order release of its
+batches is refused, a file set cannot be accepted as partial or repaired (discarding one is allowed), and fixing
+one of its exceptions does not board the loan. Restore the feed first. As a last guard, a batch of an archived
+feed that reaches a runner anyway is marked failed with the reason "feed archived". Archiving pauses the feed's
 schedules and waives their future expected deliveries. It disappears from the Vendors page feed list and from
 `GET /api/sources` (use `?include_archived=true`), and shows under "Archived feeds" with the reason. The vendor's
 loans, exceptions and history stay visible.
@@ -338,8 +346,9 @@ masters with 10,000,000 detail rows; on an Apple Silicon laptop it took 72.5 s w
   name patterns decide routing.
 - **(j)** File-set batches run on the standard engine, never on Glue/Spark, in Phase 1. Replay re-runs from
   the stored joined file.
-- **(k)** The client form's role-name rule is stricter than the server: lowercase letters, digits and
-  underscore, starting with a letter.
+- **(k)** Role names: lowercase letters, digits and underscore, starting with a letter, up to 40 characters,
+  and not `layout`, `readiness`, `manifest` or `files`. The server checks this on every layout and every file
+  part. The client form also reserves `source_id` and `auto_start`.
 - **(l)** Phase 1 limits: modes `merge` and `aggregate` only, every relation joins the master, and file-set
   batches load as `full` (flatten, child records, Spark parity, relation trees and snapshot/incremental sets
   come in later phases). PostgreSQL was not exercised in this work (SQLite only), and the new

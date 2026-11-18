@@ -558,3 +558,148 @@ def test_create_batch_locks_feed_row_and_rechecks_archived_inside_transaction(sa
     assert calls == [sid]
     with db.get_engine().connect() as c:
         assert c.execute(select(db.batches)).first() is None
+
+
+# ------------------------------------------------------------------ final review: re-entry paths of an archived feed
+REV_H = {"X-User": "rev", "X-Roles": "onboarding_reviewer"}
+
+
+def _failed_batch_on_archived_feed(sample_files):
+    from lbp.pipeline.batch import create_batch
+
+    sid = _live_feed(sample_files)
+    bid = create_batch(sid, sample_files["pcg_retail"], "a.csv", "ops", strict=False)
+    with db.get_engine().begin() as c:
+        c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(status="failed", error="boom"))
+    lifecycle.archive_feed(sid, "rev", REVIEWER, WHY)
+    return sid, bid
+
+
+def _loaded(sid, bid):
+    with db.get_engine().connect() as c:
+        b = c.execute(select(db.batches).where(db.batches.c.batch_id == bid)).first()
+        n = c.execute(select(db.sse_loans).where(db.sse_loans.c.lbp_source_id == sid)).all()
+    return b, len(n)
+
+
+def test_resume_failed_batch_of_archived_feed_409_and_nothing_loaded(client, sample_files):
+    sid, bid = _failed_batch_on_archived_feed(sample_files)
+    r = client.post(f"/api/batches/{bid}/resume", headers=REV_H)
+    assert r.status_code == 409 and "archived" in r.json()["detail"]
+    b, n = _loaded(sid, bid)
+    assert b.status == "failed" and (b.loaded or 0) == 0 and n == 0
+    assert not _audit("batch.resume", bid)
+
+
+@pytest.mark.parametrize("dry_run", ["false", "true"])
+def test_replay_of_archived_feed_409(client, sample_files, dry_run):
+    sid, bid = _failed_batch_on_archived_feed(sample_files)
+    r = client.post(f"/api/batches/{bid}/replay?dry_run={dry_run}", headers=REV_H)
+    assert r.status_code == 409 and "archived" in r.json()["detail"]
+    assert _loaded(sid, bid)[1] == 0
+
+
+def test_replay_service_refuses_archived_feed(sample_files):
+    from lbp.pipeline.replay import replay_batch
+
+    _sid, bid = _failed_batch_on_archived_feed(sample_files)
+    with pytest.raises(FeedArchivedError):
+        replay_batch(bid, "glue", dry_run=False)  # the Glue replay job calls this directly
+
+
+def test_run_batch_on_queued_batch_of_retired_feed_fails_and_raises(sample_files):
+    from lbp.pipeline.batch import create_batch, run_batch
+
+    sid = _live_feed(sample_files)
+    lifecycle.archive_feed(sid, "rev", REVIEWER, WHY)
+    lifecycle.restore_feed(sid, "rev", REVIEWER, "bring it back")
+    bid = create_batch(sid, sample_files["pcg_retail"], "a.csv", "ops", strict=False)
+    with db.get_engine().begin() as c:  # archived behind the batch's back (e.g. a race or an older code path)
+        c.execute(update(db.sources).where(db.sources.c.source_id == sid).values(status="retired", retired_from_status="live"))
+    with pytest.raises(FeedArchivedError):
+        run_batch(bid)
+    b, n = _loaded(sid, bid)
+    assert b.status == "failed" and b.error.startswith("feed archived") and n == 0
+    assert _audit("batch.feed_archived", bid)
+
+
+def test_override_preflight_skip_gap_apply_ooo_refused_on_archived_feed(client, sample_files):
+    sid, bid = _failed_batch_on_archived_feed(sample_files)
+    for st, url in (("blocked", "override-preflight"), ("waiting", "skip-gap"), ("out_of_order", "apply-out-of-order")):
+        with db.get_engine().begin() as c:
+            c.execute(update(db.batches).where(db.batches.c.batch_id == bid).values(status=st))
+        r = client.post(f"/api/batches/{bid}/{url}", json={"reason": "please run it"}, headers=REV_H)
+        assert r.status_code == 409, (url, r.text)
+    assert _loaded(sid, bid)[1] == 0
+
+
+def test_fileset_accept_partial_refused_on_archived_feed_discard_allowed(env, sample_files):
+    sid = _live_feed(sample_files)
+    _multifile(sid)
+    d = env / "incoming"
+    d.mkdir()
+    p = d / "loans_20261117.csv"
+    p.write_bytes(sample_files["pcg_retail"].read_bytes())
+    out = fileset.attach_file(sid, p.name, p, "s3-auto-arrival")
+    with db.get_engine().begin() as c:
+        c.execute(update(db.file_sets).where(db.file_sets.c.set_id == out["set_id"]).values(status="expired"))
+    lifecycle.archive_feed(sid, "rev", REVIEWER, WHY)
+    with pytest.raises(FeedArchivedError):
+        fileset.override_set(out["set_id"], "accept_partial", "rev", REVIEWER, "load what we have")
+    with pytest.raises(FeedArchivedError):
+        fileset.override_set(out["set_id"], "repair", "rev", REVIEWER, "move it", "20261118", "master")
+    with db.get_engine().connect() as c:
+        assert c.execute(select(db.batches).where(db.batches.c.source_id == sid)).first() is None
+    assert fileset.override_set(out["set_id"], "discard", "rev", REVIEWER, "tidy up")["status"] == "discarded"
+
+
+def test_exception_fix_does_not_board_a_loan_of_an_archived_feed(sample_files):
+    from lbp.exceptions.manager import ExceptionManager
+
+    sid, bid = _failed_batch_on_archived_feed(sample_files)
+    with db.get_engine().begin() as c:
+        stg = c.execute(db.loans_staging.insert().values(batch_id=bid, row_number=1, loan_number="L1", status="FAIL", boarded=False,
+                                                          record={"loan_number": "L1"})).inserted_primary_key[0]
+        eid = db.new_id("ex")
+        c.execute(db.exceptions.insert().values(exception_id=eid, batch_id=bid, source_id=sid, loan_number="L1", staging_id=stg,
+                                                rule_id="R1", field="note_rate", tier="T3", status="resolved", blocking=True,
+                                                original_value="x", resolved_value="3.5"))
+    with pytest.raises(FeedArchivedError):
+        with db.get_engine().begin() as c:
+            ExceptionManager()._finalize_loan(c, stg, "rev")
+    assert _loaded(sid, bid)[1] == 0
+
+
+def test_migration_0008_downgrade_restores_archived_feeds_and_discarded_mappings(tmp_path, monkeypatch):
+    """Older code knows nothing of archiving: the downgrade must hand back feeds in the status they were archived
+    from (so they are not left 'retired' with no way to restore them) and no `discarded` mapping status."""
+    from alembic import command
+    from sqlalchemy import create_engine, text
+
+    from lbp import cli, config
+
+    url = f"sqlite:///{tmp_path / 'mig.db'}"
+    monkeypatch.setenv("LBP_DATABASE_URL", url)
+    monkeypatch.setenv("LBP_AUTO_CREATE_SCHEMA", "false")
+    config.reset_settings()
+    db.reset_engine()
+    cfg = cli._alembic_cfg()
+    command.upgrade(cfg, "head")
+    eng = create_engine(url)
+    with eng.begin() as c:
+        for sid, st, frm, active in (("s_live", "retired", "live", "m1"), ("s_map", "retired", "mapping", None),
+                                     ("s_null_active", "retired", None, "m3"), ("s_null", "retired", None, None),
+                                     ("s_ok", "live", None, "m5")):
+            c.execute(text("INSERT INTO sources (source_id, name, status, retired_from_status, active_mapping_id) "
+                           "VALUES (:s, :s, :st, :f, :a)"), {"s": sid, "st": st, "f": frm, "a": active})
+        c.execute(text("INSERT INTO mappings (mapping_id, source_id, version, status) VALUES "
+                       "('m_disc', 's_ok', 2, 'discarded'), ('m_ok', 's_ok', 1, 'approved')"))
+    command.downgrade(cfg, "0007")
+    with eng.connect() as c:
+        st = dict(c.execute(text("SELECT source_id, status FROM sources")).all())
+        ms_ = dict(c.execute(text("SELECT mapping_id, status FROM mappings")).all())
+    assert st == {"s_live": "live", "s_map": "mapping", "s_null_active": "live", "s_null": "mapping", "s_ok": "live"}
+    assert ms_ == {"m_disc": "rejected", "m_ok": "approved"}
+    command.upgrade(cfg, "head")
+    db.reset_engine()
+    config.reset_settings()

@@ -20,6 +20,7 @@ from sqlalchemy import and_, func, or_, select
 
 from ..ai import get_llm
 from ..ingestion.pii import TARGET_PII_TYPES, mask_record
+from ..lifecycle import FeedArchivedError
 from ..schema.sse_target import BY_NAME, risk_of
 from ..store import db
 from . import fixers
@@ -425,7 +426,7 @@ class ExceptionManager:
             try:
                 self.resolve(eid, actor, roles, value=value, use_proposal=use_proposal, comment="bulk resolve")
                 done += 1
-            except ExceptionActionError as e:
+            except (ExceptionActionError, FeedArchivedError) as e:
                 errors.append({"exception_id": eid, "error": str(e)})
         return {"matched": len(ids), "resolved": done, "errors": errors[:20]}
 
@@ -516,6 +517,12 @@ class ExceptionManager:
             return False
         action = st.action or "add"
         source_id = exs[0].source_id if exs else None
+        feed = c.execute(select(db.sources.c.name, db.sources.c.status).where(db.sources.c.source_id == source_id)).first() \
+            if source_id else None
+        if feed is not None and feed.status == "retired":  # the whole decision rolls back: nothing boards for a retired feed
+            from ..lifecycle import FeedArchivedError
+
+            raise FeedArchivedError(f"feed '{feed.name}' is archived; restore it before boarding its loans")
         if action in ("close", "close_inferred"):
             return self._finalize_close(c, st, rec, source_id, actor)
         executor = RuleExecutor(RuleRegistry().runtime_set())

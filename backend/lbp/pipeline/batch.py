@@ -424,7 +424,19 @@ def run_batch(batch_id: str, workers: int | None = None, micro_batch_size: int |
         b = c.execute(select(db.batches).where(db.batches.c.batch_id == batch_id)).first()
         if b is None:
             raise ValueError("unknown batch")
-        active = c.execute(select(db.sources.c.active_mapping_id).where(db.sources.c.source_id == b.source_id)).scalar()
+        src = c.execute(select(db.sources.c.active_mapping_id, db.sources.c.status, db.sources.c.name)
+                        .where(db.sources.c.source_id == b.source_id)).first()
+        active = src.active_mapping_id if src else None
+    if src is not None and src.status == "retired":
+        # backstop for every runner (local thread, worker, Glue/Step Functions): a retired feed loads nothing
+        from ..lifecycle import FeedArchivedError
+
+        msg = "feed archived: restore the feed before running its files"
+        with eng.begin() as c:
+            c.execute(db.batches.update().where(db.batches.c.batch_id == batch_id, db.batches.c.status.notin_(("completed", "running")))
+                      .values(status="failed", error=msg, worker_id=None))
+            db.audit(c, "pipeline", "batch.feed_archived", "batch", batch_id, {"source_id": b.source_id})
+        raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before running its files")
     # The data plane reads only the feed's published (approved, signed) configuration, never the live tables.
     try:
         cfg = load_config(b.source_id)

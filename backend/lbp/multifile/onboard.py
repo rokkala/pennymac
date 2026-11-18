@@ -8,6 +8,7 @@ refused onboarding leaves no source, mapping or vendor behind; a failure after t
 from __future__ import annotations
 
 import copy
+import logging
 import shutil
 import tempfile
 import uuid
@@ -16,11 +17,12 @@ from pathlib import Path
 from sqlalchemy import func, select
 
 from ..ingestion.parser import ParseOptions, read_sample
-from .layout import LayoutError, normalize_layout, validate_layout
-from .preview import build_joined_sample
+from .layout import LayoutError, normalize_layout, role_name_error, validate_layout
+from .preview import build_joined_sample, safe_suffix
 from .service import LayoutServiceError, _roles, propose_layout
 
 SAMPLE_ROWS = 2000
+log = logging.getLogger("lbp.multifile.onboard")
 
 
 class OnboardError(ValueError):
@@ -44,8 +46,10 @@ def inspect_files(files: dict[str, tuple[bytes, str]]) -> dict[str, dict]:
     out = {}
     tmp = Path(tempfile.mkdtemp(prefix="lbp_inspect_"))
     try:
-        for role, (data, filename) in files.items():
-            p = tmp / f"{role}{Path(filename or 'x.csv').suffix.lower() or '.csv'}"
+        for i, (role, (data, filename)) in enumerate(files.items()):
+            if role_name_error(role):
+                raise OnboardError(role_name_error(role))
+            p = tmp / f"s{i}{safe_suffix(filename)}"  # named by position, never by role
             p.write_bytes(data)
             cols, n, fmt, _ = _read(role, p)
             out[role] = {"columns": cols, "rows_sampled": n, "format": fmt}
@@ -68,6 +72,9 @@ def register_multifile_source(name: str, files: dict[str, Path], layout: dict, r
     if not isinstance(layout, dict) or not layout:
         raise OnboardError("send a layout")
     readiness = readiness or {}
+    bad = next((role_name_error(r) for r in files if role_name_error(r)), None)  # layout roles: validate_layout
+    if bad:
+        raise OnboardError(bad)
 
     spec_roles = [f.get("role") for f in layout.get("files") or [] if isinstance(f, dict)]
     dupes = sorted({r for r in spec_roles if spec_roles.count(r) > 1})
@@ -116,12 +123,20 @@ def register_multifile_source(name: str, files: dict[str, Path], layout: dict, r
         shutil.copyfile(joined, dest)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    uri = persist_upload(dest, "samples")
+    try:
+        uri = persist_upload(dest, "samples")
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
 
-    with db.get_engine().connect() as c:
-        vendor_existed = bool(vendor_id) or bool(c.execute(select(db.vendors.c.vendor_id).where(
-            func.lower(db.vendors.c.name) == name.strip().lower())).first())
-    reg = mapping_svc.register_source(name.strip(), uri, actor, description, vendor_id=vendor_id)
+    try:
+        with db.get_engine().connect() as c:
+            vendor_existed = bool(vendor_id) or bool(c.execute(select(db.vendors.c.vendor_id).where(
+                func.lower(db.vendors.c.name) == name.strip().lower())).first())
+        reg = mapping_svc.register_source(name.strip(), uri, actor, description, vendor_id=vendor_id)
+    except Exception:
+        _drop_sample(uri)
+        raise
     sid = reg["source_id"]
     try:
         profile = {**(reg["profile"] or {}), "role_columns": cols_by_role}
@@ -130,10 +145,22 @@ def register_multifile_source(name: str, files: dict[str, Path], layout: dict, r
         proposed = propose_layout(sid, layout, readiness, actor, roles)
     except Exception:
         _compensate(sid, None if vendor_existed else reg["vendor_id"], actor)
+        _drop_sample(uri)
         raise
     return {**reg, "profile": profile, "layout_draft": proposed["layout_draft"], "readiness_draft": proposed["readiness_draft"],
             "role_columns": cols_by_role, "join_summary": {k: sm[k] for k in ("per_role", "master_match_rate", "detail_match_rate",
                                                                                "exception_counts", "sampled")}}
+
+
+def _drop_sample(uri: str) -> None:
+    """A refused onboarding keeps no copy of the joined sample (it holds borrower data). Best effort: the original
+    error is what the caller sees."""
+    from ..storage import delete_stored
+
+    try:
+        delete_stored(uri)
+    except Exception:  # noqa: BLE001 - never mask the onboarding error
+        log.warning("joined sample of a failed onboarding could not be removed")
 
 
 def _compensate(source_id: str, created_vendor: str | None, actor: str) -> None:

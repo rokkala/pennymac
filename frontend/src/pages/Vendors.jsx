@@ -6,7 +6,7 @@ import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago,
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { BatchModal } from "./Imports.jsx";
 import { LayoutEditor, PreviewResult } from "./FeedLayout.jsx";
-import { emptyReadiness, starterLayout, validateLayoutForm, roleNameOk, filesToSend, stripClientIds, ensureColumnIds, checkSignature } from "../layoutModel.js";
+import { emptyReadiness, starterLayout, validateLayoutForm, roleNameOk, rolesWithoutSample, filesToSend, stripClientIds, ensureColumnIds, checkSignature } from "../layoutModel.js";
 
 export const VENDOR_TYPES = { correspondent: "Correspondent", bulk_seller: "Bulk seller", sub_servicer: "Sub-servicer", retail: "Retail channel", other: "Other" };
 const LT = { full: "full tapes", incremental: "change files", snapshot: "snapshots" };
@@ -119,7 +119,10 @@ function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
     setLayoutState(ensureColumnIds(l)); setCheck(null);
   };
   const filesByRole = filesToSend(layout || { files: [] }, Object.fromEntries(slots.map((x) => [x.role, x.file])));
-  const problems = layout ? validateLayoutForm(layout, ready, columnsByRole) : [];
+  const problems = layout ? [
+    ...validateLayoutForm(layout, ready, columnsByRole),
+    ...rolesWithoutSample(layout, filesByRole).map((r) => `The layout has a file called ${r} but no sample file was picked for it. Add it above as a detail file, then set up the join again.`),
+  ] : [];
   const sig = layout ? checkSignature(layout, ready, filesByRole) : "";
   const sigRef = useRef(sig);
   sigRef.current = sig;
@@ -170,7 +173,7 @@ function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
           {!filesReady && <span className="faint" style={{ fontSize: ".8rem" }}>Choose a sample for every file first.</span>}</div>}
       </div>
       {layout && <>
-        <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={(r) => { setReady(r); setCheck(null); }} disabled={created || busy === "check"} columnsByRole={columnsByRole} />
+        <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={(r) => { setReady(r); setCheck(null); }} disabled={created || busy === "check"} columnsByRole={columnsByRole} fixedFiles />
         {problems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><b>Fix before checking the join</b>
           <ul style={{ margin: "6px 0 0 18px" }}>{problems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
         {!check && !problems.length && <span className="faint" style={{ fontSize: ".82rem" }}>Run "Check the join" to see how the samples join. You can create the feed once it runs without errors.</span>}

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import shutil
 import tempfile
 from itertools import islice
@@ -27,7 +28,7 @@ from types import SimpleNamespace
 from ..ingestion.parser import iter_rows
 from . import joiner, stage
 from .keys import normalize_key
-from .layout import LayoutError, normalize_layout, validate_layout
+from .layout import LayoutError, normalize_layout, role_name_error, validate_layout
 
 MASTER_SAMPLE_ROWS = 2000
 ORPHAN_SAMPLE_ROWS = 2000
@@ -41,6 +42,17 @@ def _write(path: Path, columns: list[str], rows) -> None:
         w.writerow(columns)
         for r in rows:
             w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in columns])
+
+
+def safe_suffix(filename: str | None) -> str:
+    """The file's extension when it is a plain one (the readers go by it), else .csv. Never part of a path."""
+    suf = Path(filename or "x.csv").suffix.lower()
+    return suf if re.fullmatch(r"\.[a-z0-9]{1,8}", suf) else ".csv"
+
+
+def missing_samples(lay: dict, inputs) -> list[str]:
+    """Layout roles that have no sample file (a role added to the layout without a file for it)."""
+    return [f.get("role") for f in lay.get("files") or [] if isinstance(f, dict) and f.get("role") not in inputs]
 
 
 def _opts(lay: dict, role: str, parse_options: dict[str, dict]):
@@ -62,10 +74,10 @@ def _sample_files(lay: dict, inputs: dict[str, Path], parse_options: dict[str, d
     for rel in rels.values():
         joiner._require_columns("master", master_cols, [p["parent"] for p in rel["on"]])
     joiner._require_columns("master", master_cols, list(next(f for f in lay["files"] if f["role"] == "master").get("key") or []))
-    out = {"master": out_dir / "master.csv"}
+    out = {"master": out_dir / "r0.csv"}  # temp files are named by position, never by role
     _write(out["master"], master_cols, mrows)
 
-    for role, rel in rels.items():
+    for i, (role, rel) in enumerate(rels.items(), start=1):
         ops = rel["normalize"] if isinstance(rel["normalize"], list) else [rel["normalize"]]
         keys = set()
         for r in mrows:
@@ -89,7 +101,7 @@ def _sample_files(lay: dict, inputs: dict[str, Path], parse_options: dict[str, d
             else:
                 dropped = True
         read[role] = seen
-        out[role] = out_dir / f"{role}.csv"
+        out[role] = out_dir / f"r{i}.csv"
         _write(out[role], dcols, kept)
     return out, read, dropped
 
@@ -123,6 +135,9 @@ def build_joined_sample(layout: dict, readiness: dict | None, inputs: dict[str, 
     lay = normalize_layout(layout)
     if "master" not in inputs:
         raise LayoutError("no input file for role master")
+    gaps = missing_samples(lay, inputs)
+    if gaps:
+        raise LayoutError(f"no sample file was sent for the {gaps[0]} role; add its sample file or remove the role from the layout")
     out_dir = Path(out_dir)
     cap_dir, work = out_dir / "cap", out_dir / "work"
     for d in (cap_dir, work):
@@ -158,9 +173,12 @@ def preview_join(layout: dict, readiness: dict | None, samples: dict[str, tuple[
         raw_dir, cap_dir, work = tmp / "raw", tmp / "cap", tmp / "work"
         for d in (raw_dir, cap_dir, work):
             d.mkdir()
+        bad = next((role_name_error(r) for r in samples if role_name_error(r)), None)
+        if bad:
+            return {"errors": [bad]}
         inputs = {}
-        for role, (data, filename) in samples.items():
-            p = raw_dir / f"{role}{Path(filename or 'x.csv').suffix.lower() or '.csv'}"
+        for i, (role, (data, filename)) in enumerate(samples.items()):
+            p = raw_dir / f"s{i}{safe_suffix(filename)}"  # named by position, never by role
             p.write_bytes(data)
             inputs[role] = p
         if "master" not in inputs:

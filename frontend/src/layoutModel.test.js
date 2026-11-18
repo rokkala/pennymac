@@ -300,3 +300,19 @@ describe("checkSignature", () => {
     assert.notEqual(checkSignature(l, emptyReadiness(), { master: f("a.csv", 2) }), base);
   });
 });
+
+describe("role names and sample files (final review)", async () => {
+  const { roleNameOk, rolesWithoutSample } = await import("./layoutModel.js");
+  it("allows lowercase tokens up to 40 characters, like the server", () => {
+    assert.equal(roleNameOk("escrow_items"), true);
+    assert.equal(roleNameOk("a".repeat(40)), true);
+    assert.equal(roleNameOk("a".repeat(41)), false);
+    for (const bad of ["../x", "/abs/x", "", "Upper", "1abc", "layout", "files"]) assert.equal(roleNameOk(bad), false, bad);
+  });
+  it("lists the layout roles that have no sample file", () => {
+    const l = addDetail(addDetail(emptyLayout(), "details"), "fees");
+    assert.deepEqual(rolesWithoutSample(l, { master: {}, details: {} }), ["fees"]);
+    assert.deepEqual(rolesWithoutSample(l, { master: {}, details: {}, fees: {} }), []);
+    assert.deepEqual(rolesWithoutSample(null, {}), []);
+  });
+});

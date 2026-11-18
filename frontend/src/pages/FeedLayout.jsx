@@ -44,7 +44,7 @@ function FileCard({ f, onChange, onRemove, disabled, columnsByRole }) {
     <div className="callout stack" style={{ gap: 8 }}>
       <div className="row" style={{ gap: 8 }}>
         <b className="mono">{f.role}</b>{master ? <span className="pill accent">main file</span> : <span className="pill">detail file</span>}
-        {!master && !disabled && <button type="button" className="btn sm" style={{ marginLeft: "auto" }} onClick={onRemove}>Remove</button>}
+        {!master && !disabled && onRemove && <button type="button" className="btn sm" style={{ marginLeft: "auto" }} onClick={onRemove}>Remove</button>}
       </div>
       <div className="grid" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(0, 1fr)", alignItems: "end" }}>
         {lab(`fl-pat-${f.role}`, "File name pattern (regex)",
@@ -255,7 +255,8 @@ export function PreviewResult({ res, minRate }) {
 }
 
 /** Files, how the files join, and readiness. Controlled: the caller owns `layout` and `ready`. columnsByRole ({role: [column]}) feeds column suggestions. */
-export function LayoutEditor({ layout, setLayout, ready, setReady, disabled, columnsByRole }) {
+/** `fixedFiles`: the set of files is chosen elsewhere (the new-feed wizard, one sample per file), so files cannot be added or removed here. */
+export function LayoutEditor({ layout, setLayout, ready, setReady, disabled, columnsByRole, fixedFiles = false }) {
   const [newRole, setNewRole] = useState("");
   const [errs, setErrs] = useState([]);
   const dis = !!disabled;
@@ -268,11 +269,11 @@ export function LayoutEditor({ layout, setLayout, ready, setReady, disabled, col
       {errs.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><b>Fix before adding</b><ul style={{ margin: "6px 0 0 18px" }}>{errs.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
       <Panel title="Files" sub="Each file is told apart by its name.">
         <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="stack">
-          {layout.files.map((f) => <FileCard key={f.role} f={f} disabled={dis} columnsByRole={columnsByRole} onChange={(n) => setFile(f.role, n)} onRemove={() => setLayout(removeDetail(layout, f.role))} />)}
-          <div className="row" style={{ gap: 6 }}>
+          {layout.files.map((f) => <FileCard key={f.role} f={f} disabled={dis} columnsByRole={columnsByRole} onChange={(n) => setFile(f.role, n)} onRemove={fixedFiles ? undefined : () => setLayout(removeDetail(layout, f.role))} />)}
+          {!fixedFiles && <div className="row" style={{ gap: 6 }}>
             <input aria-label="New detail file role" className="input mono" value={newRole} onChange={(e) => setNewRole(e.target.value.trim())} placeholder="role name, e.g. details" />
             <button type="button" className="btn" disabled={!newRole} onClick={add}>+ Add a detail file</button>
-          </div>
+          </div>}
         </div></fieldset>
       </Panel>
       {layout.relations.length > 0 && (

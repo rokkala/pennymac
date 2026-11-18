@@ -1052,8 +1052,19 @@ def pause_batch(batch_id: str, user: User = Depends(current_user)):
     return {"batch_id": batch_id, "status": "pausing"}
 
 
+def _refuse_archived_batch(batch_id: str) -> None:
+    """409 when the batch belongs to an archived feed: nothing of a retired feed is resumed, replayed or released."""
+    from ..lifecycle import assert_not_archived
+
+    with db.get_engine().connect() as c:
+        sid = c.execute(select(db.batches.c.source_id).where(db.batches.c.batch_id == batch_id)).scalar()
+    if sid:
+        assert_not_archived(sid)
+
+
 @app.post("/api/batches/{batch_id}/resume")
 def resume_batch(batch_id: str, user: User = Depends(current_user)):
+    _refuse_archived_batch(batch_id)
     with db.get_engine().begin() as c:
         st = c.execute(select(db.batches.c.status).where(db.batches.c.batch_id == batch_id)).scalar()
         if st not in ("paused", "failed", "queued", "blocked", "waiting"):
@@ -1069,6 +1080,7 @@ class Override(BaseModel):
 
 @app.post("/api/batches/{batch_id}/override-preflight")
 def override_preflight(batch_id: str, body: Override, user: User = Depends(current_user)):
+    _refuse_archived_batch(batch_id)
     try:
         pipeline.override_preflight(batch_id, user.name, user.roles, body.reason)
     except ValueError as e:
@@ -1102,6 +1114,7 @@ def replay(batch_id: str, dry_run: bool = True, user: User = Depends(current_use
 
     if not dry_run and not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
         raise HTTPException(403, "Monitoring or Onboarding reviewer role required to replay a batch")
+    _refuse_archived_batch(batch_id)  # before the dry-run / Glue branch: an archived feed replays nothing
     if not dry_run and aws_mode():
         run_id = start_glue(get_settings().glue_feed_job, {"mode": "replay", "batch_id": batch_id, "actor": user.name})
         with db.get_engine().begin() as c:
@@ -1234,6 +1247,11 @@ async def preview_layout(source_id: str, request: Request):
         raise HTTPException(400, "send a layout, or configure one for this feed first")
     readiness = _json("readiness", src.readiness if "layout" not in form else {})
     parts = [(k, v) for k, v in form.multi_items() if hasattr(v, "filename") and hasattr(v, "file")]
+    from ..multifile.layout import role_name_error
+
+    bad = next((role_name_error(k) for k, _ in parts if role_name_error(k)), None)
+    if bad:
+        raise HTTPException(400, bad)
     roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
         if isinstance(layout, dict) else set()
     if len(parts) > len(roles):
@@ -1268,11 +1286,15 @@ _MULTIFILE_FIELDS = {"name", "description", "vendor_id", "layout", "readiness"}
 async def _multifile_form(request: Request):
     """(form fields, role -> saved upload path). Every file part is a role, named by the role; the caller deletes
     the saved files."""
+    from ..multifile.layout import role_name_error
+
     form = await request.form()
     saved: dict[str, Path] = {}
     try:
         for k, v in form.multi_items():
             if hasattr(v, "filename") and hasattr(v, "file"):
+                if role_name_error(k):
+                    raise HTTPException(400, role_name_error(k))
                 if k in saved:
                     raise HTTPException(400, f"more than one file was sent for the {k} role")
                 saved[k] = _save_upload(v)
@@ -1335,6 +1357,12 @@ async def preview_multifile(request: Request):
     if not isinstance(layout, dict) or not layout:
         raise HTTPException(400, "send a layout")
     readiness = _form_json(form, "readiness", {})
+    roles = {f.get("role") for f in (layout.get("files") or []) if isinstance(f, dict) and f.get("role")} \
+        if isinstance(layout.get("files"), list) else set()
+    # as the feed preview: one part per layout role, nothing else (a layout with no roles at all is reported as
+    # layout errors by preview_join, which writes nothing before the layout is valid)
+    if roles and any(r not in roles for r in samples_in):
+        raise HTTPException(400, f"send one file per layout role, as a part named by the role ({sorted(map(str, roles))})")
     profile: dict = {}
     if "master" in samples_in:  # no feed yet: profile the master sample so its PII columns are masked
         try:
@@ -1448,6 +1476,7 @@ def feed_publish(source_id: str, body: ReasonIn, user: User = Depends(current_us
 def batch_skip_gap(batch_id: str, body: ReasonIn, user: User = Depends(current_user)):
     from ..pipeline import sequencing
 
+    _refuse_archived_batch(batch_id)
     try:
         sequencing.skip_gap(batch_id, user.name, user.roles, body.reason)
     except sequencing.SequenceActionError as e:
@@ -1460,6 +1489,7 @@ def batch_skip_gap(batch_id: str, body: ReasonIn, user: User = Depends(current_u
 def batch_apply_ooo(batch_id: str, body: ReasonIn, user: User = Depends(current_user)):
     from ..pipeline import sequencing
 
+    _refuse_archived_batch(batch_id)
     try:
         sequencing.apply_out_of_order(batch_id, user.name, user.roles, body.reason)
     except sequencing.SequenceActionError as e:

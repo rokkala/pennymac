@@ -24,7 +24,7 @@ export const newRelation = (detail) => ({
 export function addDetail(layout, role) {
   const name = String(role || "").trim();
   if (!name) throw new Error("A file role needs a name");
-  if (name !== "master" && !roleNameOk(name)) throw new Error("Use lowercase letters, digits and underscores, starting with a letter (not layout, readiness, manifest or files)");
+  if (name !== "master" && !roleNameOk(name)) throw new Error("Use lowercase letters, digits and underscores, starting with a letter, up to 40 characters (not layout, readiness, manifest or files)");
   if (name === "master") throw new Error("master is the main file; add a different role");
   if ((layout.files || []).some((f) => f.role === name)) throw new Error(`There is already a file called ${name}`);
   const out = clone(layout);
@@ -42,7 +42,12 @@ export function removeDetail(layout, role) {
 }
 
 const RESERVED_ROLES = ["layout", "readiness", "manifest", "files", "source_id", "auto_start"];
-export const roleNameOk = (r) => /^[a-z][a-z0-9_]*$/.test(String(r || "")) && !RESERVED_ROLES.includes(r);
+export const roleNameOk = (r) => /^[a-z][a-z0-9_]{0,39}$/.test(String(r || "")) && !RESERVED_ROLES.includes(r);
+
+/** Layout roles that have no sample file in `files` ({role: file}), e.g. a role added to the layout without a file. */
+export function rolesWithoutSample(layout, files) {
+  return (layout?.files || []).map((f) => f.role).filter((r) => r && !files?.[r]);
+}
 const hasNamedGroup = (p) => /\(\?P?<(?![=!])[A-Za-z_]/.test(String(p || ""));
 
 /** Problems found on the form before it is sent. `columns` (optional): {role: [column names]} when known. */
@@ -57,7 +62,7 @@ export function validateLayoutForm(layout, readiness, columns) {
   for (const r of [...new Set(roles.filter((x, i) => roles.indexOf(x) !== i))]) errs.push(`The file ${r || "(no name)"} is listed more than once.`);
   for (const f of files) {
     if (!f.role) { errs.push("Every file needs a role name."); continue; }
-    if (f.role !== "master" && !roleNameOk(f.role)) errs.push(`The role name ${f.role} is not allowed: use lowercase letters, digits and underscores, starting with a letter (not layout, readiness, manifest or files).`);
+    if (f.role !== "master" && !roleNameOk(f.role)) errs.push(`The role name ${f.role} is not allowed: use lowercase letters, digits and underscores, starting with a letter, up to 40 characters (not layout, readiness, manifest or files).`);
     if (!String(f.name_pattern || "").trim()) errs.push(`The ${f.role} file needs a file name pattern.`);
   }
   if (masters.length === 1) {

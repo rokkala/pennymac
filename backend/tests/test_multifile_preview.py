@@ -142,3 +142,33 @@ def test_preview_endpoint_role_gate_and_parts(client, env, sample_files):
     # a part that is not a role of the layout, or more parts than roles, is a 400
     bad = client.post(url, files={**files, "extra": ("e.csv", b"a\n1\n")}, headers={"X-User": "ana", "X-Roles": "analyst"})
     assert bad.status_code == 400
+
+
+@pytest.mark.parametrize("bad", ["../x", "ABSOLUTE", "", "Upper", "a" * 41])
+def test_feed_preview_refuses_bad_role_names_and_writes_nothing_outside(client, env, sample_files, tmp_path, monkeypatch, bad):
+    """The pre-existing feed preview shares the root cause through layout roles (final review C2)."""
+    import copy
+
+    root = tmp_path / "tmproot" / "inner"
+    root.mkdir(parents=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(root))
+    (tmp_path / "outside").mkdir()
+    role = str(tmp_path / "outside" / "pwned") if bad == "ABSOLUTE" else bad
+    sid = _onboard(sample_files)
+    _configure(sid, LAYOUT, READY)
+    lay = copy.deepcopy(LAYOUT)
+    lay["files"][1]["role"] = role
+    lay["relations"][0]["detail"] = role
+    s = _samples([["1", NPI, "1"]], [["1", "a", "e@e.io"]])
+    h = {"X-User": "ana", "X-Roles": "analyst"}
+    url = f"/api/sources/{sid}/layout/preview"
+    # the layout names the bad role, and the file part is named by it
+    r = client.post(url, files={"master": (s["master"][1], s["master"][0]), role: (s["notes"][1], s["notes"][0])},
+                    data={"layout": json.dumps(lay), "readiness": json.dumps(READY)}, headers=h)
+    assert r.status_code == 400 and "is not allowed" in r.json()["detail"], r.text
+    # the layout alone (no part with that name): reported as a layout error
+    r = client.post(url, files={"master": (s["master"][1], s["master"][0])},
+                    data={"layout": json.dumps(lay), "readiness": json.dumps(READY)}, headers=h)
+    assert r.status_code == 200 and any("role name" in e for e in r.json()["errors"]), r.text
+    assert not any((tmp_path / "outside").iterdir())
+    assert list(root.iterdir()) == [] and [p.name for p in root.parent.iterdir()] == ["inner"]
