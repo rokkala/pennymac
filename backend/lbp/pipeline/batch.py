@@ -224,6 +224,10 @@ def _register_batch(c, source_id: str, file_path, filename: str, actor: str, loc
     src = c.execute(select(db.sources).where(db.sources.c.source_id == source_id)).first()
     if not src:
         raise ValueError("unknown source")
+    if src.status == "retired":
+        from ..lifecycle import FeedArchivedError
+
+        raise FeedArchivedError(f"feed '{src.name}' is archived; restore it before sending it files")
     if not src.active_mapping_id:
         raise ValueError("source has no approved mapping; complete onboarding first")
     prior = c.execute(select(db.batches.c.batch_id, db.batches.c.created_at).where(

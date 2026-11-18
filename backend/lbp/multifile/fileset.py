@@ -35,6 +35,7 @@ from typing import Literal
 
 from sqlalchemy import select
 
+from ..lifecycle import FeedArchivedError
 from ..pipeline.batch import DuplicateFileError
 from ..store import db
 
@@ -222,9 +223,11 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
     """Attach one arriving file to its set; queue the set's batch when the set becomes ready. strict=False
     (unattended arrivals) records a batch that cannot be sequenced as failed, like create_batch(strict=False)."""
     from ..ingestion.parser import estimate_rows
+    from ..lifecycle import assert_not_archived
     from ..pipeline.batch import file_sha256
     from ..storage import local_path
 
+    assert_not_archived(source_id)
     cfg = _config(source_id)
     layout, readiness = cfg.layout, cfg.readiness or {}
     if role is not None:
@@ -243,6 +246,8 @@ def attach_file(source_id: str, filename: str, file_path: Path, actor: str, role
 
     with db.get_engine().begin() as c:
         _lock_source(c, source_id)
+        if c.execute(select(db.sources.c.status).where(db.sources.c.source_id == source_id)).scalar() == "retired":
+            raise FeedArchivedError("this feed is archived; restore it before sending it files")  # archived since the check above
         q = select(fs).where(fs.c.source_id == source_id, fs.c.status == "waiting")
         if readiness.get("pairing") == "window_minutes":
             q = q.where(fs.c.opened_at >= now - timedelta(minutes=int(readiness["window_minutes"])), fs.c.opened_at <= now)
@@ -294,7 +299,7 @@ def evaluate_set(set_id: str, now: datetime | None = None) -> str:
         return _evaluate(c, s, cfg, _naive_utc(now))
 
 
-SAFE_TEXT_ERRORS = (FileSetError, DuplicateFileError)
+SAFE_TEXT_ERRORS = (FileSetError, DuplicateFileError, FeedArchivedError)
 
 
 def _safe_message(e: Exception) -> str:

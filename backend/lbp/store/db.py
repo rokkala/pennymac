@@ -90,6 +90,11 @@ sources = Table(
     Column("layout_draft", JSON),
     Column("readiness_draft", JSON),
     Column("layout_proposed_by", String(80)),
+    # Archive (status "retired"): who/when/why, and the status to restore to
+    Column("retired_at", DateTime),
+    Column("retired_by", String(80)),
+    Column("retired_reason", Text),
+    Column("retired_from_status", String(20)),
     Column("created_by", String(80)),
     Column("created_at", DateTime, default=now),
 )
@@ -99,7 +104,7 @@ mappings = Table(
     Column("mapping_id", String(40), primary_key=True),
     Column("source_id", String(40), index=True),
     Column("version", Integer, default=1),
-    Column("status", String(20), default="draft"),  # draft | in_review | approved | superseded | rejected
+    Column("status", String(20), default="draft"),  # draft | in_review | approved | superseded | rejected | discarded
     Column("fields", JSON),
     Column("stats", JSON),
     Column("entity", String(40), nullable=False, default="loan", server_default="loan"),

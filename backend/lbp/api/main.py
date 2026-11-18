@@ -36,6 +36,7 @@ from ..dispatch import aws_mode, dispatch, dispatchable, start_glue
 from ..exceptions.manager import ExceptionActionError, ExceptionManager
 from ..exceptions.policy import DEFAULT_POLICY, TIER_LABELS, PolicyError, get_policy, set_policy
 from ..ingestion.parser import read_sample
+from ..lifecycle import FeedArchivedError
 from ..ingestion.profiler import profile_rows
 from ..mapping import service as mapping_svc
 from ..mapping.engine import suggest_mappings
@@ -118,6 +119,11 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("PUT", "/api/vendors/{vendor_id}"): EDIT_MAPPING + COMPLIANCE_REVIEW,
     ("POST", "/api/sources/{source_id}/vendor"): ONBOARDING_REVIEW,
     ("POST", "/api/sources/{source_id}/publish"): ONBOARDING_REVIEW,
+    # feed lifecycle (a live feed needs the reviewer role: enforced in lbp.lifecycle)
+    ("POST", "/api/sources/{source_id}/archive"): EDIT_MAPPING,
+    ("POST", "/api/sources/{source_id}/restore"): EDIT_MAPPING,
+    ("POST", "/api/mappings/{mapping_id}/discard"): EDIT_MAPPING,
+    ("DELETE", "/api/sources/{source_id}"): ("admin",),
     # incremental loads, sequencing, delivery scheduler
     ("PUT", "/api/sources/{source_id}/delivery"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
@@ -229,6 +235,14 @@ def _start_local_scheduler():
 
 app = FastAPI(title="PennyMac Loan Boarding Platform", version="1.0.0", lifespan=lifespan, dependencies=[Depends(authorize)],
               description="Mapping, validation, exception management and analytics for SSE loan boarding.")
+
+
+@app.exception_handler(FeedArchivedError)
+async def _archived_feed(_request: Request, e: FeedArchivedError):
+    """Any intake path that reaches an archived feed answers 409 (never queued, never a 500)."""
+    return JSONResponse(status_code=409, content={"detail": str(e)})
+
+
 _origins = [o.strip() for o in get_settings().cors_origins.split(",") if o.strip()]
 if _origins:
     app.add_middleware(CORSMiddleware, allow_origins=_origins, allow_methods=["GET", "POST", "PUT", "DELETE"],
@@ -290,7 +304,9 @@ def _scope(vendor_id: str | None) -> list[str] | None:
 
 
 def _err(e: Exception, code: int = 400):
-    raise HTTPException(status_code=code, detail=str(e))
+    from ..lifecycle import FeedArchivedError
+
+    raise HTTPException(status_code=409 if isinstance(e, FeedArchivedError) else code, detail=str(e))
 
 
 def upload_dir() -> Path:
@@ -564,12 +580,13 @@ def create_source(name: str = Form(...), description: str = Form(""), file: Uplo
 
 
 @app.get("/api/sources")
-def list_sources(vendor_id: str | None = None):
+def list_sources(vendor_id: str | None = None, include_archived: bool = False):
     ids = _scope(vendor_id)
     with db.get_engine().connect() as c:
         rows = c.execute(select(db.sources.c.source_id, db.sources.c.name, db.sources.c.format, db.sources.c.status,
                                 db.sources.c.active_mapping_id, db.sources.c.created_by, db.sources.c.created_at, db.sources.c.delivery,
-                                db.sources.c.delivery_draft, db.sources.c.last_sequence, db.sources.c.vendor_id)
+                                db.sources.c.delivery_draft, db.sources.c.last_sequence, db.sources.c.vendor_id,
+                                db.sources.c.retired_at, db.sources.c.retired_reason)
                          .order_by(db.sources.c.created_at.desc())).all()
         vnames = dict(c.execute(select(db.vendors.c.vendor_id, db.vendors.c.name)).all())
         nsched = dict(c.execute(select(db.delivery_schedules.c.source_id, func.count()).where(
@@ -585,6 +602,8 @@ def list_sources(vendor_id: str | None = None):
     out = []
     for r in rows:
         if ids is not None and r.source_id not in ids:
+            continue
+        if r.status == "retired" and not include_archived:
             continue
         d = {k: v for k, v in db.row_to_dict(r).items() if k not in ("delivery", "delivery_draft", "last_sequence")}
         d["vendor_name"] = vnames.get(r.vendor_id)
@@ -610,6 +629,47 @@ def new_mapping_version(source_id: str, user: User = Depends(current_user)):
         return mapping_svc.new_version(source_id, user.name)
     except mapping_svc.MappingError as e:
         _err(e)
+
+
+class LifecycleReason(BaseModel):
+    reason: str
+
+
+def _lifecycle_call(fn, *a):
+    from ..lifecycle import LifecycleError
+
+    try:
+        return fn(*a)
+    except LifecycleError as e:
+        _err(e, 404 if "not found" in str(e) else 400)
+
+
+@app.post("/api/sources/{source_id}/archive")
+def archive_source(source_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.archive_feed, source_id, user.name, user.roles, body.reason)
+
+
+@app.post("/api/sources/{source_id}/restore")
+def restore_source(source_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.restore_feed, source_id, user.name, user.roles, body.reason)
+
+
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: str, reason: str = "", user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.delete_feed, source_id, user.name, user.roles, reason)
+
+
+@app.post("/api/mappings/{mapping_id}/discard")
+def discard_mapping(mapping_id: str, body: LifecycleReason, user: User = Depends(current_user)):
+    from .. import lifecycle
+
+    return _lifecycle_call(lifecycle.discard_mapping, mapping_id, user.name, user.roles, body.reason)
 
 
 @app.get("/api/mappings/{mapping_id}")
@@ -814,7 +874,7 @@ def _attach_uploads(source_id: str, items: list[tuple[str, Path, str | None]], u
             out.append(fileset.attach_file(source_id, name, uri, user.name, role=role or None, strict=True))
     except pipeline.DuplicateFileError as e:
         raise HTTPException(409, {"message": str(e), "duplicate_of": e.batch_id}) from None
-    except ValueError as e:
+    except ValueError as e:  # _err maps an archived feed to 409
         _err(e)
     finally:
         if auto_start:
@@ -830,8 +890,10 @@ def upload(source_id: str = Form(...), file: UploadFile = File(...), auto_start:
            role: str | None = Form(None), user: User = Depends(current_user)):
     """One file. A feed with a multi-file layout attaches it to its file set (optional `role`, else routed by
     name) and returns {set_id, role, status, batch_id}; a single-file feed registers a batch as before."""
+    from ..lifecycle import assert_not_archived
     from ..storage import persist_upload
 
+    assert_not_archived(source_id)  # 409 before the file is read or saved
     layout = _feed_layout(source_id)
     if layout:
         given = [n for n, v in (("allow_duplicate", allow_duplicate), ("reason", reason), ("load_type", load_type)) if v]
@@ -863,8 +925,10 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
     nothing: a file that routes nowhere (or any other problem found before attaching) attaches no file.
     Returns the per-file results [{set_id, role, status, batch_id}], the master last."""
     from ..config_store import load
+    from ..lifecycle import assert_not_archived
     from ..multifile.fileset import FileSetError, plan_files
 
+    assert_not_archived(source_id)  # 409 before any part is read or saved
     layout = _feed_layout(source_id)
     if not layout:
         raise HTTPException(400, "this feed has no multi-file layout; upload its file with POST /api/upload")
@@ -909,9 +973,12 @@ def upload_set(source_id: str = Form(...), files: list[UploadFile] = File(...), 
 def presign(source_id: str, filename: str, role: str | None = None, user: User = Depends(current_user)):
     """AWS: browser PUTs straight to the raw S3 zone; EventBridge starts the Step Functions pipeline.
     `role` (a multi-file feed) is passed to the arrival handler as object metadata."""
+    from ..lifecycle import assert_not_archived
+
     s = get_settings()
     if s.env != "aws" or not s.raw_bucket:
         raise HTTPException(400, "presigned upload is only available in AWS mode; use POST /api/upload locally")
+    assert_not_archived(source_id)
     import boto3
 
     key = f"incoming/{source_id}/{uuid.uuid4().hex[:8]}_{Path(filename).name}"
@@ -1420,11 +1487,12 @@ class StatusIn(BaseModel):
 
 
 def _sched_call(fn, *a, **kw):
+    from ..lifecycle import FeedArchivedError
     from ..scheduling.service import ScheduleError
 
     try:
         return fn(*a, **kw)
-    except ScheduleError as e:
+    except (ScheduleError, FeedArchivedError) as e:
         _err(e)
 
 
@@ -1472,6 +1540,15 @@ def schedules_pull(schedule_id: str, user: User = Depends(current_user)):
     if aws_mode():
         if not set(user.roles) & {"monitoring", "onboarding_reviewer", "admin"}:
             raise HTTPException(403, "requires one of: monitoring, onboarding_reviewer")
+        from ..lifecycle import assert_not_archived
+
+        with db.get_engine().connect() as c:
+            sid = c.execute(select(db.delivery_schedules.c.source_id).where(db.delivery_schedules.c.schedule_id == schedule_id)).scalar()
+        if sid:
+            try:
+                assert_not_archived(sid)
+            except ValueError as e:
+                _err(e)
         run_id = start_glue(get_settings().glue_pull_job, {"schedule_id": schedule_id})
         with db.get_engine().begin() as c:
             db.audit(c, user.name, "schedule.pull_submitted", "schedule", schedule_id, {"glue_run_id": run_id})

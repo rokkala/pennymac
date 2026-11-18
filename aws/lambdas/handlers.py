@@ -48,6 +48,16 @@ def on_file_arrival(event, _ctx):
     source_id = parts[1]
     head = s3.head_object(Bucket=bucket, Key=key)
     meta = head.get("Metadata", {})
+    from lbp.lifecycle import FeedArchivedError, assert_not_archived
+
+    try:
+        assert_not_archived(source_id)
+    except FeedArchivedError:  # an archived feed accepts nothing: alerted, never queued
+        from lbp.scheduling.alerts import notify
+
+        msg = f"{Path(key).name} was refused: feed {source_id} is archived"
+        notify("file_rejected", msg, {"source_id": source_id, "key": key})
+        return {"rejected": msg, "key": key}
     from lbp.config_store import ConfigError
     from lbp.multifile.fileset import feed_layout
 

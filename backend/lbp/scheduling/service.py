@@ -314,7 +314,10 @@ def tick(now=None, pull: bool = True) -> dict:
             log.warning("file set sweep failed: %s", e.__class__.__name__)
         t = db.deliveries
         with db.get_engine().begin() as c:
-            sch = c.execute(select(db.delivery_schedules).where(db.delivery_schedules.c.status == "active")).all()
+            # an archived feed is never expected to deliver (archiving pauses its schedules; this is the backstop)
+            sch = c.execute(select(db.delivery_schedules).where(
+                db.delivery_schedules.c.status == "active",
+                db.delivery_schedules.c.source_id.not_in(select(db.sources.c.source_id).where(db.sources.c.status == "retired")))).all()
             from ..vendors import names_by_source
 
             names = {k: (v["vendor_name"] if v["feed_name"] == v["vendor_name"] else f"{v['vendor_name']} · {v['feed_name']}")
@@ -381,8 +384,11 @@ def pull_now(schedule_id: str, actor: str, roles: list[str], now=None) -> dict:
 
     _role(roles, "monitoring", "onboarding", "onboarding_reviewer")
     now = now or _now()
+    from ..lifecycle import assert_not_archived
+
     with db.get_engine().begin() as c:
         s = _load(c, schedule_id)
+        assert_not_archived(s.source_id)  # before the status check: archiving paused the schedule, but say why
         if s.status != "active" or not effective(s.config).get("pull"):
             raise ScheduleError("schedule is not an active pull schedule")
         c.execute(db.delivery_schedules.update().where(db.delivery_schedules.c.schedule_id == schedule_id).values(last_pull_at=now))
