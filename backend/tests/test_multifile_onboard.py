@@ -252,3 +252,82 @@ def test_preview_endpoint_without_source_masks_pii_like_existing_preview(client,
     assert _counts() == before
     bad = client.post("/api/multi-file-feeds/preview", files=_parts(files), data={"layout": json.dumps({"files": [], "relations": []})}, headers=ANA)
     assert bad.status_code == 200 and bad.json()["errors"]
+
+
+# ------------------------------------------------------------------ non-CSV master / detail
+def _rewrite(src, dest, delim="|"):
+    import csv
+    with open(src, newline="") as f, open(dest, "w", newline="") as o:
+        csv.writer(o, delimiter=delim, lineterminator="\n").writerows(csv.reader(f))
+    return dest
+
+
+def _pipe_files(env, n=80):
+    f = _files(env, n)
+    return {"master": _rewrite(f["master"], env / "loans_20261117.txt"),
+            "escrow_items": _rewrite(f["escrow_items"], env / "escrow_items_20261117.txt")}
+
+
+def _layout_txt():
+    lay = copy.deepcopy(samples.master_detail_layout())
+    for f in lay["files"]:
+        f["name_pattern"] = f["name_pattern"].replace(r"\.csv", r"\.txt")
+    return lay
+
+
+def _sample_readers_work(r):
+    from lbp.mapping import inspect as minsp
+    pv = ms.preview(r["mapping_id"], 50)
+    assert pv
+    cols = [c["name"] for c in _src(r["source_id"]).profile["columns"]]
+    assert "LoanID" in cols and "tax_total" in cols and len(cols) > 10
+    assert _src(r["source_id"]).parse_options.get("delimiter") in (",", None) and _src(r["source_id"]).parse_options["format"] == "csv"
+    minsp.field_inspect(r["mapping_id"], "tax_annual_amount", 50)
+    minsp.value_coverage(r["mapping_id"], "tax_annual_amount")
+
+
+def test_pipe_delimited_files_register_and_readers_see_joined_columns(env):
+    r = _reg(_pipe_files(env), _layout_txt())
+    spec = {f["role"]: f for f in r["layout_draft"]["files"]}
+    assert spec["master"]["parse_options"]["delimiter"] == "|" and spec["escrow_items"]["parse_options"]["delimiter"] == "|"
+    _sample_readers_work(r)
+
+
+def test_xlsx_master_registers_and_readers_work(env):
+    import csv
+
+    import openpyxl
+    f = _files(env, 40)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    with open(f["master"], newline="") as fh:
+        for row in csv.reader(fh):
+            ws.append(row)
+    x = env / "loans_20261117.xlsx"
+    wb.save(x)
+    lay = copy.deepcopy(samples.master_detail_layout())
+    lay["files"][0]["name_pattern"] = r"loans_(?P<date>\d{8})\.xlsx"
+    r = _reg({"master": x, "escrow_items": f["escrow_items"]}, lay)
+    assert {f["role"]: f for f in r["layout_draft"]["files"]}["master"]["parse_options"]["format"] == "xlsx"
+    _sample_readers_work(r)
+
+
+def test_pipe_delimited_full_flow_loads(env):
+    from lbp.multifile.fileset import attach_file
+    from lbp.multifile.service import decide_layout
+    from lbp.pipeline.batch import run_batch
+
+    files = _pipe_files(env, 80)
+    r = _reg(files, _layout_txt())
+    mid, sid = r["mapping_id"], r["source_id"]
+    ms.accept_all(mid, "ana", 0.0)
+    ms.submit(mid, "ana")
+    ms.approve(mid, "rev", ["onboarding_reviewer"], True, "ok")
+    decide_layout(sid, "rev", ["onboarding_reviewer"], True, "ok")
+    attach_file(sid, files["master"].name, files["master"], "s3-auto-arrival")
+    done = attach_file(sid, files["escrow_items"].name, files["escrow_items"], "s3-auto-arrival")
+    run_batch(done["batch_id"])
+    with db.get_engine().connect() as c:
+        b = c.execute(select(db.batches).where(db.batches.c.batch_id == done["batch_id"])).first()
+    assert b.status == "completed", b.error
+    assert b.loaded > 0 and b.join_summary

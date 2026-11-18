@@ -7,6 +7,7 @@ refused onboarding leaves no source, mapping or vendor behind; a failure after t
 """
 from __future__ import annotations
 
+import copy
 import shutil
 import tempfile
 import uuid
@@ -81,15 +82,17 @@ def register_multifile_source(name: str, files: dict[str, Path], layout: dict, r
     if missing:
         raise OnboardError(f"no sample file was sent for the {missing[0]} role")
 
+    layout = copy.deepcopy(layout)
     cols_by_role: dict[str, list[str]] = {}
-    master_meta = None
     for role, path in files.items():
         spec = next(f for f in layout["files"] if f.get("role") == role)
         opts = ParseOptions(**{k: v for k, v in (spec.get("parse_options") or {}).items() if k in ParseOptions.__dataclass_fields__})
         cols, _n, fmt, delim = _read(role, Path(path), opts)
         cols_by_role[role] = cols
-        if role == "master":
-            master_meta = {"format": fmt, "delimiter": delim}
+        if not (fmt == "csv" and delim in (",", None)) and not spec.get("parse_options"):
+            # the real file's format travels with the layout (the joiner and the stage read each role with it);
+            # the source's own parse_options describe the joined sample, which is always plain CSV
+            spec["parse_options"] = {"format": fmt, **({"delimiter": delim} if delim else {})}
     errs = validate_layout(layout, readiness, cols_by_role)
     if errs:
         raise OnboardError("; ".join(errs))
@@ -123,8 +126,7 @@ def register_multifile_source(name: str, files: dict[str, Path], layout: dict, r
     try:
         profile = {**(reg["profile"] or {}), "role_columns": cols_by_role}
         with db.get_engine().begin() as c:
-            c.execute(db.sources.update().where(db.sources.c.source_id == sid).values(
-                profile=profile, parse_options={**master_meta, "format": master_meta["format"]}))
+            c.execute(db.sources.update().where(db.sources.c.source_id == sid).values(profile=profile))
         proposed = propose_layout(sid, layout, readiness, actor, roles)
     except Exception:
         _compensate(sid, None if vendor_existed else reg["vendor_id"], actor)
