@@ -112,6 +112,36 @@ def _first_exceptions(path: Path, lay: dict, cfg) -> list[dict]:
     return out
 
 
+def build_joined_sample(layout: dict, readiness: dict | None, inputs: dict[str, Path], parse_options: dict[str, dict],
+                        out_dir: Path) -> tuple[Path, dict]:
+    """Cap the sample files, join them, and return (joined CSV path, summary). Same sampling and join as
+    `preview_join`. Raises LayoutError for an invalid layout or files that cannot be joined; data problems
+    are counted in the summary (`blocked` lists relations under their match-rate floor)."""
+    errs = validate_layout(layout, readiness)
+    if errs:
+        raise LayoutError("; ".join(errs))
+    lay = normalize_layout(layout)
+    if "master" not in inputs:
+        raise LayoutError("no input file for role master")
+    out_dir = Path(out_dir)
+    cap_dir, work = out_dir / "cap", out_dir / "work"
+    for d in (cap_dir, work):
+        d.mkdir(parents=True, exist_ok=True)
+    capped, read, dropped = _sample_files(lay, inputs, parse_options, cap_dir)
+    res = joiner.join_files(lay, capped, {r: dict(_SAMPLE_OPTIONS) for r in capped}, work / "joined.csv", work)
+    summary = {
+        "columns": list(res.columns),
+        "per_role": {r: {"rows_in": s.rows_in, "matched": s.matched, "orphaned": s.orphaned, "rejected": s.rejected}
+                     for r, s in res.per_role.items()},
+        "exception_counts": dict(res.exception_counts),
+        "master_match_rate": round(res.master_match_rate, 6),
+        "detail_match_rate": {r: round(v, 6) for r, v in res.detail_match_rate.items()},
+        "blocked": res.blocked, "sampled": dropped, "rows_read": read,
+        "exceptions_path": res.exceptions_path, "layout": lay,
+    }
+    return work / "joined.csv", summary
+
+
 def preview_join(layout: dict, readiness: dict | None, samples: dict[str, tuple[bytes, str]],
                  parse_options: dict[str, dict], n: int = 10, cfg=None) -> dict:
     """Join capped copies of `samples` (role -> (bytes, filename)). `cfg` (a feed config, optional) supplies the
@@ -136,26 +166,22 @@ def preview_join(layout: dict, readiness: dict | None, samples: dict[str, tuple[
         if "master" not in inputs:
             return {"errors": ["no input file for role master"]}
         try:
-            capped, read, dropped = _sample_files(lay, inputs, parse_options, cap_dir)
-            res = joiner.join_files(lay, capped, {r: dict(_SAMPLE_OPTIONS) for r in capped}, work / "joined.csv", work)
+            joined, sm = build_joined_sample(layout, readiness, inputs, parse_options, tmp / "out")
         except LayoutError as e:
             return {"errors": [str(e)]}
         except ValueError as e:  # an unreadable or unsupported file: a safe class-level message
             return {"errors": [f"a sample file could not be read ({e.__class__.__name__})"]}
-        pii = stage.joined_pii_cols(cfg, list(res.columns))
+        pii = stage.joined_pii_cols(cfg, sm["columns"])
         rows = []
-        with (work / "joined.csv").open(encoding="utf-8", newline="") as f:
+        with joined.open(encoding="utf-8", newline="") as f:
             for r in islice(csv.DictReader(f), max(0, n)):
                 rows.append(stage._mask_row(r, pii))
         return {
-            "columns": list(res.columns), "rows": rows,
-            "per_role": {r: {"rows_in": s.rows_in, "matched": s.matched, "orphaned": s.orphaned, "rejected": s.rejected}
-                         for r, s in res.per_role.items()},
-            "exception_counts": dict(res.exception_counts),
-            "exceptions": _first_exceptions(res.exceptions_path, lay, cfg),
-            "master_match_rate": round(res.master_match_rate, 6),
-            "detail_match_rate": {r: round(v, 6) for r, v in res.detail_match_rate.items()},
-            "blocked": res.blocked, "sampled": dropped, "rows_read": read, "errors": [],
+            "columns": sm["columns"], "rows": rows, "per_role": sm["per_role"],
+            "exception_counts": sm["exception_counts"],
+            "exceptions": _first_exceptions(sm["exceptions_path"], lay, cfg),
+            "master_match_rate": sm["master_match_rate"], "detail_match_rate": sm["detail_match_rate"],
+            "blocked": sm["blocked"], "sampled": sm["sampled"], "rows_read": sm["rows_read"], "errors": [],
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

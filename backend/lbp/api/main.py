@@ -129,6 +129,9 @@ ROUTE_ROLES: dict[tuple[str, str], tuple[str, ...]] = {
     ("POST", "/api/sources/{source_id}/delivery/approve"): ONBOARDING_REVIEW,
     ("PUT", "/api/sources/{source_id}/layout"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/layout/preview"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds/inspect"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds/preview"): EDIT_MAPPING,
+    ("POST", "/api/multi-file-feeds"): EDIT_MAPPING,
     ("POST", "/api/sources/{source_id}/layout/decide"): ONBOARDING_REVIEW,
     ("POST", "/api/batches/{batch_id}/skip-gap"): ("monitoring", "onboarding_reviewer"),
     ("POST", "/api/batches/{batch_id}/apply-out-of-order"): ("onboarding_reviewer", "compliance_reviewer"),
@@ -1257,6 +1260,120 @@ async def preview_layout(source_id: str, request: Request):
     except (AttributeError, TypeError):  # a malformed layout: preview_join reports it as errors
         opts = {}
     return await run_in_threadpool(preview_join, layout, readiness, samples, opts, 10, cfg)
+
+
+_MULTIFILE_FIELDS = {"name", "description", "vendor_id", "layout", "readiness"}
+
+
+async def _multifile_form(request: Request):
+    """(form fields, role -> saved upload path). Every file part is a role, named by the role; the caller deletes
+    the saved files."""
+    form = await request.form()
+    saved: dict[str, Path] = {}
+    try:
+        for k, v in form.multi_items():
+            if hasattr(v, "filename") and hasattr(v, "file"):
+                if k in saved:
+                    raise HTTPException(400, f"more than one file was sent for the {k} role")
+                saved[k] = _save_upload(v)
+    except BaseException:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+        raise
+    return form, saved
+
+
+def _form_json(form, name: str, default=None):
+    raw = form.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return json.loads(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"{name} must be JSON") from None
+
+
+@app.post("/api/multi-file-feeds/inspect")
+async def inspect_multifile(request: Request):
+    """Columns of each sample file (multipart: one part per role, named by the role). Nothing is stored."""
+    from starlette.concurrency import run_in_threadpool
+
+    from ..multifile.onboard import OnboardError, inspect_files
+
+    _form, saved = await _multifile_form(request)
+    try:
+        files = {r: (p.read_bytes(), p.name) for r, p in saved.items()}
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+    try:
+        return await run_in_threadpool(inspect_files, files)
+    except OnboardError as e:
+        _err(e)
+
+
+@app.post("/api/multi-file-feeds/preview")
+async def preview_multifile(request: Request):
+    """Dry-run join of sample files for a layout that has no feed yet (multipart: role parts plus `layout` and
+    `readiness` JSON fields). Read-only and masked like the feed-level preview; problems come back as 200 with
+    `errors`."""
+    from types import SimpleNamespace
+
+    from starlette.concurrency import run_in_threadpool
+
+    from ..ingestion.parser import read_bytes_sample
+    from ..multifile import stage
+    from ..multifile.preview import preview_join
+
+    form, saved = await _multifile_form(request)
+    try:
+        samples_in = {r: (p.read_bytes(), p.name) for r, p in saved.items()}
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
+    layout = _form_json(form, "layout")
+    if not isinstance(layout, dict) or not layout:
+        raise HTTPException(400, "send a layout")
+    readiness = _form_json(form, "readiness", {})
+    profile: dict = {}
+    if "master" in samples_in:  # no feed yet: profile the master sample so its PII columns are masked
+        try:
+            meta, rows = read_bytes_sample(*samples_in["master"], 500)
+            profile = profile_rows(meta.columns, rows) if meta.columns and rows else {}
+        except Exception:  # noqa: BLE001 - preview_join reports an unreadable master itself
+            profile = {}
+    cfg = SimpleNamespace(profile=profile, fields=[], parse_options={})
+    try:
+        opts = stage._parse_overrides(layout, cfg)
+    except (AttributeError, TypeError):
+        opts = {}
+    return await run_in_threadpool(preview_join, layout, readiness, samples_in, opts, 10, cfg)
+
+
+@app.post("/api/multi-file-feeds")
+async def create_multifile_feed(request: Request, user: User = Depends(current_user)):
+    """Create a feed from sample files (multipart: `name`, `description`, `vendor_id`, `layout`, `readiness`, and one
+    file part per role). The draft mapping comes from the joined sample; the layout waits for approval."""
+    from starlette.concurrency import run_in_threadpool
+
+    from ..mapping.service import MappingError
+    from ..multifile.layout import LayoutError
+    from ..multifile.onboard import OnboardError, register_multifile_source
+    from ..multifile.service import LayoutServiceError
+
+    form, saved = await _multifile_form(request)
+    try:
+        layout = _form_json(form, "layout")
+        readiness = _form_json(form, "readiness", {})
+        try:
+            return await run_in_threadpool(
+                register_multifile_source, (form.get("name") or "").strip(), saved, layout, readiness, user.name, user.roles,
+                form.get("description") or "", form.get("vendor_id") or None)
+        except (OnboardError, LayoutError, LayoutServiceError, MappingError) as e:
+            _err(e)
+    finally:
+        for p in saved.values():
+            p.unlink(missing_ok=True)
 
 
 @app.post("/api/sources/{source_id}/layout/decide")
