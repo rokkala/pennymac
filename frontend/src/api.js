@@ -75,6 +75,7 @@ export const previewJoin = (sourceId, layout, readiness, filesByRole) => {
   form.append("readiness", JSON.stringify(readiness || {}));
   return api(`/api/sources/${enc(sourceId)}/layout/preview`, { method: "POST", form });
 };
+
 const roleForm = (filesByRole) => {
   const form = new FormData();
   Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) form.append(role, file, file.name); });
@@ -114,3 +115,43 @@ export const uploadSet = (sourceId, filesByRole) => {
   form.append("manifest", JSON.stringify(manifest));
   return api("/api/upload/set", { method: "POST", form });
 };
+
+/** One .zip for POST /api/upload/set (roles come from names inside or a manifest in the form). */
+export const uploadSetZip = (sourceId, zipFile, manifest) => {
+  const form = new FormData();
+  form.append("source_id", sourceId);
+  form.append("files", zipFile, zipFile.name);
+  if (manifest) form.append("manifest", JSON.stringify(manifest));
+  return api("/api/upload/set", { method: "POST", form });
+};
+
+const EXT_TYPE = { ".csv": "text/csv", ".txt": "text/plain", ".dat": "text/plain", ".psv": "text/plain",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" };
+
+export const presignUpload = (sourceId, filename, role) => {
+  const q = new URLSearchParams({ source_id: sourceId, filename });
+  if (role) q.set("role", role);
+  return api(`/api/upload/presign?${q}`, { method: "POST" });
+};
+
+export async function putPresigned(url, file) {
+  const ext = (file.name || "").slice(file.name.lastIndexOf(".")).toLowerCase();
+  const r = await fetch(url, { method: "PUT", body: file, headers: { "Content-Type": EXT_TYPE[ext] || "application/octet-stream" } });
+  if (!r.ok) throw new Error(`Direct upload failed (${r.status})`);
+}
+
+/** AWS: browser → raw S3; local/demo: POST /api/upload through the API. */
+export async function uploadOneFile(sourceId, file, { role, loadType, autoStart = true } = {}) {
+  if (DEMO) {
+    const form = new FormData();
+    form.append("source_id", sourceId);
+    form.append("file", file);
+    form.append("auto_start", autoStart ? "true" : "false");
+    if (loadType) form.append("load_type", loadType);
+    if (role) form.append("role", role);
+    return api("/api/upload", { method: "POST", form });
+  }
+  const { url, key } = await presignUpload(sourceId, file.name, role);
+  await putPresigned(url, file);
+  return { status: "submitted", presigned: true, key };
+}

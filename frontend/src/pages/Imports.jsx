@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { api, setIntent, scoped } from "../api.js";
+import { api, setIntent, scoped, uploadOneFile, uploadSet, uploadSetZip, DEMO } from "../api.js";
 import { canCap } from "../roles.js";
 import { useApi, useAction, Panel, Status, fmt, ago, Loading, Kpis, fmtCompact, human, Modal, ReasonModal, useDialog, Field, PageHeader, EmptyState } from "../ui.jsx";
 import { Segments, Sparkline } from "../charts.jsx";
@@ -40,25 +40,63 @@ export function UploadModal({ sources, onClose, onDone }) {
   const [lt, setLt] = useState("");
   const [file, setFile] = useState(null);
   const [over, setOver] = useState(false);
+  const [oneRole, setOneRole] = useState("");
+  const [setMode, setSetMode] = useState("roles");
+  const [byRole, setByRole] = useState({});
+  const [zip, setZip] = useState(null);
   const [busy, setBusy] = useState(false);
   const act = useAction();
   const curVen = ven || vendorsIn[0]?.[0];
   const live = sources.filter((s) => s.active_mapping_id && s.vendor_id === curVen);
   const feed = live.find((x) => x.source_id === (src || live[0]?.source_id));
+  const lay = useApi(feed?.source_id ? `/api/sources/${encodeURIComponent(feed.source_id)}/layout` : null, [feed?.source_id]);
+  const roles = (lay.data?.layout || lay.data?.draft)?.files?.map((f) => f.role).filter(Boolean) || [];
+  const multiLayout = !!(lay.data?.configured && roles.length > 1);
+  useEffect(() => {
+    setFile(null); setZip(null); setByRole({}); setOneRole(roles[0] || "");
+  }, [feed?.source_id, multiLayout, roles.join()]);
+  const setReady = multiLayout && (setMode === "zip" ? !!zip : roles.every((r) => byRole[r]));
+  const singleReady = !multiLayout && !!file;
   const submit = async () => {
-    const f = new FormData();
-    f.append("source_id", feed.source_id); f.append("file", file); f.append("auto_start", "true");
-    if (lt) f.append("load_type", lt);
+    if (!feed) return;
     setBusy(true);
-    const r = await act(() => api("/api/upload", { method: "POST", form: f }), "File received. Boarding has started on the feed's published configuration.");
+    let r;
+  if (multiLayout) {
+      if (setMode === "zip") {
+        r = await act(() => uploadSetZip(feed.source_id, zip), "Files received. They are attached to this delivery set.");
+      } else if (DEMO) {
+        r = await act(() => uploadSet(feed.source_id, byRole), "Files received. They are attached to this delivery set.");
+      } else {
+        const results = [];
+        for (const role of roles) {
+          const f = byRole[role];
+          if (!f) continue;
+          results.push(await uploadOneFile(feed.source_id, f, { role, autoStart: false }));
+        }
+        r = results;
+        await act(async () => r, "Files sent to the raw zone. They are paired into a delivery set as they land.");
+      }
+      setBusy(false);
+      if (r) { const batch = Array.isArray(r) ? r.find((x) => x.batch_id) : null; onDone(batch?.batch_id); }
+      return;
+    }
+    const msg = DEMO
+      ? "File received. Boarding has started on the feed's published configuration."
+      : "File sent to the raw zone. Boarding starts when it lands in storage.";
+    r = await act(() => uploadOneFile(feed.source_id, file, { loadType: lt || undefined }), msg);
     setBusy(false);
-    if (r) { onDone(r.batch_id); }
+    if (r) onDone(r.batch_id);
   };
+  const intake = multiLayout
+    ? "This feed delivers several files per run. Send the whole set at once, or add files one at a time on later visits."
+    : DEMO
+      ? "CSV, pipe / tab TXT or Excel."
+      : "CSV, pipe / tab TXT or Excel. Large tapes upload straight to the raw S3 zone.";
   return (
-    <Modal title="Upload a loan file" sub="CSV, pipe / tab TXT or Excel. Files delivered to S3 or pulled from a vendor start on their own." size="md" onClose={onClose} busy={busy}
+    <Modal title={multiLayout ? "Upload a multi-file delivery" : "Upload a loan file"} sub={intake} size="md" onClose={onClose} busy={busy}
       footer={<><span className="lead faint">{feed ? `Runs on ${feed.name}'s approved mapping${feed.active_mapping_version ? ` v${feed.active_mapping_version}` : ""}` : ""}</span>
         <button className="btn" onClick={onClose} disabled={busy}>Cancel</button>
-        <button className="btn primary" disabled={!file || !feed || busy} onClick={submit}>{busy ? "Uploading…" : "Start boarding"}</button></>}>
+        <button className="btn primary" disabled={!feed || busy || !(multiLayout ? setReady : singleReady)} onClick={submit}>{busy ? "Uploading…" : multiLayout ? "Send files" : "Start boarding"}</button></>}>
       {!vendorsIn.length ? <div className="empty">No feed is live yet. Approve a feed's mapping first.</div> : <>
         <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
           <Field id="up-ven" label="Vendor"><select id="up-ven" className="input" value={curVen || ""} onChange={(e) => { setVen(e.target.value); setSrc(""); }}>
@@ -66,16 +104,59 @@ export function UploadModal({ sources, onClose, onDone }) {
           <Field id="up-src" label="Feed"><select id="up-src" className="input" value={feed?.source_id || ""} onChange={(e) => setSrc(e.target.value)}>
             {live.map((s) => <option key={s.source_id} value={s.source_id}>{s.name} ({s.format})</option>)}</select></Field>
         </div>
-        <Field id="up-lt" label="File type"><select id="up-lt" className="input" value={lt} onChange={(e) => setLt(e.target.value)}>
-          <option value="">Vendor default ({human(feed?.load_type || "full")})</option>
-          <option value="full">Full boarding tape</option><option value="incremental">Incremental changes (add / update / close)</option>
-          <option value="snapshot">Full snapshot (compare with SSE)</option></select></Field>
-        <div className={`drop ${over ? "over" : ""}`} onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)}
-          onDrop={(e) => { e.preventDefault(); setOver(false); setFile(e.dataTransfer.files[0]); }}>
-          <b>{file ? file.name : "Drop a loan tape here"}</b>
-          <span>{file ? `${fmt(file.size / 1024, 0)} KB` : "or choose a file"}</span>
-          <input id="up-file" type="file" accept=".csv,.txt,.dat,.psv,.xlsx" onChange={(e) => setFile(e.target.files[0])} />
-        </div></>}
+        {!multiLayout && (
+          <Field id="up-lt" label="File type"><select id="up-lt" className="input" value={lt} onChange={(e) => setLt(e.target.value)}>
+            <option value="">Vendor default ({human(feed?.load_type || "full")})</option>
+            <option value="full">Full boarding tape</option><option value="incremental">Incremental changes (add / update / close)</option>
+            <option value="snapshot">Full snapshot (compare with SSE)</option></select></Field>)}
+        {multiLayout ? (
+          <div className="stack" style={{ gap: 12 }}>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+              <button type="button" className={`btn sm ${setMode === "roles" ? "primary" : ""}`} onClick={() => setSetMode("roles")}>One file per role</button>
+              <button type="button" className={`btn sm ${setMode === "zip" ? "primary" : ""}`} onClick={() => setSetMode("zip")}>One .zip</button>
+            </div>
+            {setMode === "zip" ? (
+              <Field id="up-zip" label="Zip archive">
+                <input id="up-zip" type="file" accept=".zip" className="input" onChange={(e) => setZip(e.target.files[0] || null)} />
+                <span className="faint" style={{ fontSize: ".78rem" }}>Member names must match the layout's name patterns. Send only a .zip, not individual files at the same time.</span>
+              </Field>
+            ) : (
+              <div className="stack" style={{ gap: 8 }}>
+                {roles.map((role) => (
+                  <label key={role} className="stack" style={{ gap: 4 }} htmlFor={`up-${role}`}>
+                    <span className="eyebrow">{role === "master" ? "Main file" : `${role} file`}</span>
+                    <input id={`up-${role}`} type="file" accept=".csv,.txt,.dat,.psv,.xlsx" className="input"
+                      onChange={(e) => setByRole((prev) => ({ ...prev, [role]: e.target.files[0] || null }))} />
+                  </label>))}
+              </div>)}
+            <details>
+              <summary className="eyebrow" style={{ cursor: "pointer" }}>Add just one file to a waiting set</summary>
+              <div className="stack" style={{ gap: 8, marginTop: 8 }}>
+                <Field id="up-one-role" label="File role">
+                  <select id="up-one-role" className="input" value={oneRole} onChange={(e) => setOneRole(e.target.value)}>
+                    {roles.map((r) => <option key={r} value={r}>{r}</option>)}</select></Field>
+                <input type="file" accept=".csv,.txt,.dat,.psv,.xlsx" className="input" id="up-one-file"
+                  onChange={async (e) => {
+                    const f = e.target.files[0];
+                    if (!f || !feed) return;
+                    setBusy(true);
+                    const r = await act(() => uploadOneFile(feed.source_id, f, { role: oneRole }),
+                      DEMO ? "File added to the delivery set." : "File sent to storage for this role.");
+                    setBusy(false);
+                    if (r) onDone(r.batch_id);
+                    e.target.value = "";
+                  }} />
+              </div>
+            </details>
+          </div>
+        ) : (
+          <div className={`drop ${over ? "over" : ""}`} onDragOver={(e) => { e.preventDefault(); setOver(true); }} onDragLeave={() => setOver(false)}
+            onDrop={(e) => { e.preventDefault(); setOver(false); setFile(e.dataTransfer.files[0]); }}>
+            <b>{file ? file.name : "Drop a loan tape here"}</b>
+            <span>{file ? `${fmt(file.size / 1024, 0)} KB` : "or choose a file"}</span>
+            <input id="up-file" type="file" accept=".csv,.txt,.dat,.psv,.xlsx" onChange={(e) => setFile(e.target.files[0])} />
+          </div>)}
+      </>}
     </Modal>
   );
 }

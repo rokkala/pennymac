@@ -126,9 +126,9 @@ function FieldInspector({ mappingId, field, columns, grouped, draft, catalog, lo
       sub={d ? `${d.attribute.module} · ${d.attribute.dtype}${d.attribute.length ? `(${d.attribute.length})` : ""} · ${d.attribute.risk} risk${d.attribute.required ? " · required" : ""}${d.attribute.pii ? " · PII" : ""}` : ""}
       footer={draft && !editing ? <>
         <span className="lead faint">Changes save to draft v{field._version || ""}; nothing reaches Glue until the mapping is approved.</span>
-        {field.manual || field.one_to_many || field.retargeted_from
-          ? <button className="btn danger" onClick={() => onField(field.target, { action: "remove" })}>Remove mapping</button>
-          : <button className="btn danger" disabled={field.status === "rejected"} onClick={() => onField(field.target, { action: "reject" })}>Reject</button>}
+        <button className="btn danger" onClick={() => onField(field.target, { action: "remove" })}>Remove mapping</button>
+        {field.status !== "rejected" && !field.manual && !field.one_to_many && !field.retargeted_from
+          && <button className="btn" onClick={() => onField(field.target, { action: "reject" })}>Keep row, reject suggestion</button>}
         <button className="btn primary" disabled={field.status === "accepted"} onClick={async () => { await onField(field.target, { action: "accept" }); nav?.onNext?.(); }}>{field.status === "accepted" ? "Accepted" : "Accept and next"}</button></> : null}>
       {!d ? <Loading error={base.error} /> : (
         <div className="stack" style={{ gap: 16 }}>
@@ -508,7 +508,8 @@ function Workbench({ mappingId, persona, onBack, go, initialTarget, onOpen, init
                           <td><Status s={f.status} /></td>
                           {draft && <td className="r" onClick={(e) => e.stopPropagation()}><span className="row" style={{ gap: 4, justifyContent: "flex-end", flexWrap: "nowrap" }}>
                             <button className="btn sm" onClick={() => doField(f.target, { action: "accept" })} disabled={f.status === "accepted"}>Accept</button>
-                            <button className="btn sm" onClick={() => setSel(f.target)}>Inspect</button></span></td>}
+                            <button className="btn sm" onClick={() => setSel(f.target)}>Inspect</button>
+                            <button type="button" className="btn sm danger" title="Drop this SSE mapping from the draft" onClick={() => doField(f.target, { action: "remove" })}>Remove</button></span></td>}
                         </tr>);
                     })}
                   </React.Fragment>);

@@ -352,7 +352,15 @@ export function createMockApi() {
     ["POST", /^\/api\/sources\/([^/]+)\/layout\/preview$/, () => ({ errors: ["The demo cannot preview a join of sample files."] })],
     ["GET", /^\/api\/file-sets$/, () => []],
     ["POST", /^\/api\/file-sets\/([^/]+)\/override$/, () => fail("There are no file sets in the demo.")],
-    ["POST", /^\/api\/upload\/set$/, () => fail("Multi-file uploads are not available in the demo.")],
+    ["POST", /^\/api\/upload\/set$/, (m, form, user) => {
+      const sourceId = form.get("source_id");
+      const src = s.sources.sources.find((x) => x.source_id === sourceId);
+      if (!src?.active_mapping_id) fail("source has no approved mapping; complete onboarding first");
+      const files = form.getAll("files");
+      const names = files.map((f) => f?.name || "file").join(", ");
+      log(user.id, "file_set.upload", "source", sourceId, { files: names });
+      return files.map(() => ({ set_id: uid("set"), status: "waiting", batch_id: null }));
+    }],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery\/test$/, (m, b, u, q) => filenameTest(m[1], q.get("filename") || "", q.get("draft") === "true")],
     ["GET", /^\/api\/sources\/([^/]+)\/delivery$/, (m) => s.delivery_profiles[m[1]] || { ...clone(Object.values(s.delivery_profiles)[0]), source_id: m[1], delivery: clone(Object.values(s.delivery_profiles)[0].defaults), configured: false, draft: null, proposed_by: null, last_sequence: null }],
     ["PUT", /^\/api\/sources\/([^/]+)\/delivery$/, (m, b, user) => {
