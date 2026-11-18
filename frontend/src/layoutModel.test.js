@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   emptyLayout, emptyReadiness, addDetail, validateLayoutForm, groupColumnsByRole, setStatusLabel, missingRoles,
-  matchRateBadge, previewTrust, guessPattern, starterLayout, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
+  matchRateBadge, previewTrust, guessPattern, starterLayout, checkSignature, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
 } from "./layoutModel.js";
 
 const valid = () => {
@@ -282,5 +282,21 @@ describe("starterLayout", () => {
     assert.deepEqual(r.on, [{ parent: "LoanID", detail: "LoanID" }]);
     assert.deepEqual(l.relations.find((x) => x.detail === "notes").on, []);
     assert.ok(l.files.find((f) => f.role === "details").name_pattern.startsWith("details_"));
+  });
+});
+
+describe("checkSignature", () => {
+  const f = (name, size) => ({ name, size, lastModified: 1 });
+  it("ignores client ids and is stable", () => {
+    const l = ensureColumnIds(valid());
+    assert.equal(checkSignature(l, emptyReadiness(), { master: f("a.csv", 1) }), checkSignature(stripClientIds(l), emptyReadiness(), { master: f("a.csv", 1) }));
+  });
+  it("changes when the layout, readiness or a file changes", () => {
+    const l = valid();
+    const base = checkSignature(l, emptyReadiness(), { master: f("a.csv", 1) });
+    const l2 = JSON.parse(JSON.stringify(l)); l2.files[0].name_pattern = "x";
+    assert.notEqual(checkSignature(l2, emptyReadiness(), { master: f("a.csv", 1) }), base);
+    assert.notEqual(checkSignature(l, { ...emptyReadiness(), wait_timeout_minutes: 1 }, { master: f("a.csv", 1) }), base);
+    assert.notEqual(checkSignature(l, emptyReadiness(), { master: f("a.csv", 2) }), base);
   });
 });

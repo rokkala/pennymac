@@ -247,3 +247,9 @@ export function starterLayout(roles, masterRole) {
   }
   return layout;
 }
+
+/** What a join check was run on. A result is only valid while this still equals the current one (layout, readiness, sample files). */
+export function checkSignature(layout, ready, filesByRole) {
+  const files = Object.keys(filesByRole || {}).sort().map((r) => { const f = filesByRole[r]; return [r, f?.name, f?.size, f?.lastModified]; });
+  return JSON.stringify([stripClientIds(layout || { files: [], relations: [] }), ready || {}, files]);
+}

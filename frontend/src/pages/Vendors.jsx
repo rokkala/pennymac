@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useRef, useState } from "react";
 import { api, scoped, archiveFeed, restoreFeed, deleteFeed, inspectMultiFiles, previewMultiFiles, createMultiFileFeed } from "../api.js";
 import { canCap } from "../roles.js";
 import { canArchive, canRestore, canDelete, splitFeeds, archivedLine, RESTORE_NOTE } from "../lifecycleModel.js";
@@ -6,7 +6,7 @@ import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago,
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { BatchModal } from "./Imports.jsx";
 import { LayoutEditor, PreviewResult } from "./FeedLayout.jsx";
-import { emptyReadiness, starterLayout, validateLayoutForm, roleNameOk, filesToSend, stripClientIds, ensureColumnIds } from "../layoutModel.js";
+import { emptyReadiness, starterLayout, validateLayoutForm, roleNameOk, filesToSend, stripClientIds, ensureColumnIds, checkSignature } from "../layoutModel.js";
 
 export const VENDOR_TYPES = { correspondent: "Correspondent", bulk_seller: "Bulk seller", sub_servicer: "Sub-servicer", retail: "Retail channel", other: "Other" };
 const LT = { full: "full tapes", incremental: "change files", snapshot: "snapshots" };
@@ -89,17 +89,19 @@ function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
   const [busy, setBusy] = useState("");
   const [created, setCreated] = useState(false);
   const act = useAction();
+  const fileRef = useRef({}); // latest picked file per slot, to drop a late inspect answer
   const setLayout = (u) => { setLayoutState((l) => ensureColumnIds(typeof u === "function" ? u(l) : u)); setCheck(null); };
   const patch = (id, p) => setSlots((xs) => xs.map((x) => (x.id === id ? { ...x, ...p } : x)));
   const resetLayout = () => { setLayoutState(null); setCheck(null); };
   const pick = async (slot, file) => {
     resetLayout();
-    if (!file) { patch(slot.id, { file: null, info: null, err: "" }); return; }
+    if (!file) { fileRef.current[slot.id] = null; patch(slot.id, { file: null, info: null, err: "" }); return; }
     patch(slot.id, { file, info: null, err: "" });
+    fileRef.current[slot.id] = file;
     try {
       const r = await inspectMultiFiles({ [slot.role || "file"]: file });
-      patch(slot.id, { info: Object.values(r)[0] || null });
-    } catch (e) { patch(slot.id, { err: e.message }); }
+      if (fileRef.current[slot.id] === file) patch(slot.id, { info: Object.values(r)[0] || null });
+    } catch (e) { if (fileRef.current[slot.id] === file) patch(slot.id, { err: e.message }); }
   };
   const setRole = (slot, v) => { resetLayout(); patch(slot.id, { role: v.trim() }); };
   const addSlot = () => setSlots((xs) => [...xs, { id: Math.max(...xs.map((x) => x.id)) + 1, role: nextRole(xs.map((x) => x.role)), file: null, info: null, err: "" }]);
@@ -118,11 +120,15 @@ function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
   };
   const filesByRole = filesToSend(layout || { files: [] }, Object.fromEntries(slots.map((x) => [x.role, x.file])));
   const problems = layout ? validateLayoutForm(layout, ready, columnsByRole) : [];
+  const sig = layout ? checkSignature(layout, ready, filesByRole) : "";
+  const sigRef = useRef(sig);
+  sigRef.current = sig;
   const runCheck = async () => {
+    const started = sig;
     setBusy("check");
     const r = await act(() => previewMultiFiles(stripClientIds(layout), ready, filesByRole));
     setBusy("");
-    if (r) setCheck(r);
+    if (r && sigRef.current === started) setCheck(r); // an edit made while joining makes this result stale
   };
   const checked = !!check && !check.errors?.length;
   const create = async () => {
@@ -150,21 +156,21 @@ function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
             <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
               {x.role === "master"
                 ? <><b className="mono">master</b><span className="pill accent">main file</span></>
-                : <><input aria-label="Detail file role" className="input mono" style={{ width: 160 }} value={x.role} onChange={(e) => setRole(x, e.target.value)} placeholder="role name" /><span className="pill">detail file</span></>}
-              <input aria-label={x.role === "master" ? "Main sample file" : `${x.role || "Detail"} sample file`} type="file" accept={SAMPLE_ACCEPT} onChange={(e) => pick(x, e.target.files[0] || null)} />
-              {x.role !== "master" && slots.length > 2 && <button type="button" className="btn sm" style={{ marginLeft: "auto" }} onClick={() => removeSlot(x.id)}>Remove</button>}
+                : <><input aria-label="Detail file role" disabled={busy === "check"} className="input mono" style={{ width: 160 }} value={x.role} onChange={(e) => setRole(x, e.target.value)} placeholder="role name" /><span className="pill">detail file</span></>}
+              <input aria-label={x.role === "master" ? "Main sample file" : `${x.role || "Detail"} sample file`} type="file" accept={SAMPLE_ACCEPT} disabled={busy === "check"} onChange={(e) => pick(x, e.target.files[0] || null)} />
+              {x.role !== "master" && slots.length > 2 && <button type="button" className="btn sm" style={{ marginLeft: "auto" }} disabled={busy === "check"} onClick={() => removeSlot(x.id)}>Remove</button>}
             </div>
             {x.err && <div style={{ color: "var(--fail)", fontSize: ".82rem" }}>{x.err}</div>}
             {x.info && <div className="row" style={{ gap: 4, flexWrap: "wrap" }}><span className="faint" style={{ fontSize: ".78rem" }}>{x.info.columns.length} columns found:</span>
               {x.info.columns.map((c) => <span key={c} className="chip mono">{c}</span>)}</div>}
           </div>))}
-        <div><button type="button" className="btn sm" onClick={addSlot}>+ Add a detail file</button></div>
+        <div><button type="button" className="btn sm" disabled={busy === "check"} onClick={addSlot}>+ Add a detail file</button></div>
         {slotProblems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><ul style={{ margin: "0 0 0 18px" }}>{slotProblems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
         {!layout && <div className="row"><button type="button" className="btn primary" disabled={!filesReady} onClick={setUp}>Set up the join</button>
           {!filesReady && <span className="faint" style={{ fontSize: ".8rem" }}>Choose a sample for every file first.</span>}</div>}
       </div>
       {layout && <>
-        <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={(r) => { setReady(r); setCheck(null); }} disabled={created} columnsByRole={columnsByRole} />
+        <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={(r) => { setReady(r); setCheck(null); }} disabled={created || busy === "check"} columnsByRole={columnsByRole} />
         {problems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><b>Fix before checking the join</b>
           <ul style={{ margin: "6px 0 0 18px" }}>{problems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
         {!check && !problems.length && <span className="faint" style={{ fontSize: ".82rem" }}>Run "Check the join" to see how the samples join. You can create the feed once it runs without errors.</span>}
