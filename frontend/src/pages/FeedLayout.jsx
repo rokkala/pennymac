@@ -36,7 +36,7 @@ function WhereInput({ value, onChange }) {
   );
 }
 
-function FileCard({ f, onChange, onRemove, disabled }) {
+function FileCard({ f, onChange, onRemove, disabled, columnsByRole }) {
   const master = f.role === "master";
   const po = f.parse_options || {};
   const setPo = (k, v) => { const n = { ...po }; if (v === "" || v === undefined || v === null) delete n[k]; else n[k] = v; onChange({ ...f, parse_options: n }); };
@@ -56,7 +56,7 @@ function FileCard({ f, onChange, onRemove, disabled }) {
       {master && (
         <div className="grid g2">
           {lab("fl-ent", "What one row is (optional)", <input id="fl-ent" className="input" value={f.entity || ""} onChange={(e) => onChange({ ...f, entity: e.target.value })} placeholder="e.g. loan" />)}
-          {lab("fl-key", "Key column(s)", <input id="fl-key" className="input mono" value={(f.key || []).join(", ")} onChange={(e) => onChange({ ...f, key: csv(e.target.value) })} placeholder="loan_id" />,
+          {lab("fl-key", "Key column(s)", <input id="fl-key" className="input mono" list={columnsByRole?.[f.role] ? `cols-${f.role}` : undefined} value={(f.key || []).join(", ")} onChange={(e) => onChange({ ...f, key: csv(e.target.value) })} placeholder="loan_id" />,
             "The column(s) that identify one row. Separate several with commas.")}
         </div>)}
       <details>
@@ -109,7 +109,7 @@ function AggColumns({ cols, onChange, disabled }) {
   );
 }
 
-function RelationCard({ r, onChange, disabled }) {
+function RelationCard({ r, onChange, disabled, columnsByRole }) {
   const set = (patch) => onChange({ ...r, ...patch });
   const on = r.on || [];
   const norm = Array.isArray(r.normalize) ? r.normalize : [r.normalize].filter(Boolean);
@@ -131,9 +131,9 @@ function RelationCard({ r, onChange, disabled }) {
         <span className="eyebrow">Matching columns</span>
         {on.map((p, i) => (
           <div key={i} className="row" style={{ gap: 6 }}>
-            <input aria-label={`Column in ${r.to}`} className="input mono" value={p.parent || ""} onChange={(e) => set({ on: on.map((q, j) => (j === i ? { ...q, parent: e.target.value } : q)) })} placeholder={`column in ${r.to}`} />
+            <input aria-label={`Column in ${r.to}`} className="input mono" list={columnsByRole?.[r.to] ? `cols-${r.to}` : undefined} value={p.parent || ""} onChange={(e) => set({ on: on.map((q, j) => (j === i ? { ...q, parent: e.target.value } : q)) })} placeholder={`column in ${r.to}`} />
             <span>=</span>
-            <input aria-label={`Column in ${r.detail}`} className="input mono" value={p.detail || ""} onChange={(e) => set({ on: on.map((q, j) => (j === i ? { ...q, detail: e.target.value } : q)) })} placeholder={`column in ${r.detail}`} />
+            <input aria-label={`Column in ${r.detail}`} className="input mono" list={columnsByRole?.[r.detail] ? `cols-${r.detail}` : undefined} value={p.detail || ""} onChange={(e) => set({ on: on.map((q, j) => (j === i ? { ...q, detail: e.target.value } : q)) })} placeholder={`column in ${r.detail}`} />
             {on.length > 1 && !disabled && <button type="button" className="btn sm" onClick={() => set({ on: on.filter((_, j) => j !== i) })}>Remove</button>}
           </div>))}
         <div><button type="button" className="btn sm" disabled={disabled} onClick={() => set({ on: [...on, { parent: "", detail: "" }] })}>+ Matching column</button></div>
@@ -183,7 +183,8 @@ function CountsTable({ per }) {
 
 const BADGE = { ok: ["pass", "Matches well"], warn: ["warn", "Check the match"], block: ["fail", "Below the minimum"] };
 
-function PreviewPanel({ sourceId, layout, ready, canEdit }) {
+/** `preview(layout, ready, files)` runs the dry run; it defaults to the feed's own preview route. `onResult(res | null)` reports every run and every reset. */
+export function PreviewPanel({ sourceId, layout, ready, canEdit, preview, onResult }) {
   const roles = layout.files.map((f) => f.role).filter(Boolean);
   const [files, setFiles] = useState({});
   const [res, setRes] = useState(null);
@@ -192,25 +193,36 @@ function PreviewPanel({ sourceId, layout, ready, canEdit }) {
   const toSend = filesToSend(layout, files);
   const all = roles.length > 0 && roles.every((r) => toSend[r]);
   const sig = JSON.stringify([stripClientIds(layout), ready]);
-  useEffect(() => { setRes(null); }, [sig]);
+  useEffect(() => { setRes(null); onResult?.(null); }, [sig]);
   useEffect(() => { setFiles((f) => { const keep = Object.fromEntries(Object.entries(f).filter(([r]) => roles.includes(r))); return Object.keys(keep).length === Object.keys(f).length ? f : keep; }); }, [roles.join("|")]);
   const minRate = Math.max(0, ...layout.relations.map((r) => Number(r.min_match_rate) || 0));
   const run = async () => {
     setBusy(true);
-    const r = await act(() => previewJoin(sourceId, stripClientIds(layout), ready, toSend));
+    const r = await act(() => (preview || ((l, rd, f) => previewJoin(sourceId, l, rd, f)))(stripClientIds(layout), ready, toSend));
     setBusy(false);
-    if (r) setRes(r);
+    if (r) { setRes(r); onResult?.(r); }
   };
-  const trust = previewTrust(res);
-  const [kind, badgeText] = res && !res.errors?.length && res.master_match_rate != null ? BADGE[matchRateBadge(res.master_match_rate, minRate)] : ["", ""];
   return (
     <Panel title="Try it on sample files" sub="Pick one small file per role. Nothing is stored or loaded; this only shows how the rows would join.">
       <div className="stack">
         <div className="grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
-          {roles.map((r) => lab(`pv-${r}`, `${r} sample file`, <input id={`pv-${r}`} type="file" className="input" disabled={!canEdit} onChange={(e) => { setFiles({ ...files, [r]: e.target.files[0] || null }); setRes(null); }} />))}
+          {roles.map((r) => lab(`pv-${r}`, `${r} sample file`, <input id={`pv-${r}`} type="file" className="input" disabled={!canEdit} onChange={(e) => { setFiles({ ...files, [r]: e.target.files[0] || null }); setRes(null); onResult?.(null); }} />))}
         </div>
         <div className="row"><button type="button" className="btn primary" disabled={!all || busy || !canEdit} onClick={run}>{busy ? "Joining…" : "Preview the join"}</button>
           {!all && <span className="faint" style={{ fontSize: ".8rem" }}>Choose a file for every role first.</span>}</div>
+        <PreviewResult res={res} minRate={minRate} />
+      </div>
+    </Panel>
+  );
+}
+
+/** The outcome of a join dry run: errors, match rates, counts, exception examples, joined rows. */
+export function PreviewResult({ res, minRate }) {
+  const trust = previewTrust(res);
+  const [kind, badgeText] = res && !res.errors?.length && res.master_match_rate != null ? BADGE[matchRateBadge(res.master_match_rate, minRate)] : ["", ""];
+  if (!res) return null;
+  return (
+    <div className="stack">
         {res?.errors?.length > 0 && <div className="callout t5"><b>The preview could not run</b><ul style={{ margin: "6px 0 0 18px" }}>{res.errors.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
         {res && !res.errors?.length && <>
           <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
@@ -238,8 +250,41 @@ function PreviewPanel({ sourceId, layout, ready, canEdit }) {
                   {x.message && joinCodeText(x.code) && <div className="faint" style={{ fontSize: ".78rem" }}>{x.message}</div>}
                 </div>))}</div>)}
         </>}
-      </div>
-    </Panel>
+    </div>
+  );
+}
+
+/** Files, how the files join, and readiness. Controlled: the caller owns `layout` and `ready`. columnsByRole ({role: [column]}) feeds column suggestions. */
+export function LayoutEditor({ layout, setLayout, ready, setReady, disabled, columnsByRole }) {
+  const [newRole, setNewRole] = useState("");
+  const [errs, setErrs] = useState([]);
+  const dis = !!disabled;
+  const setFile = (role, f) => setLayout((l) => ({ ...l, files: l.files.map((x) => (x.role === role ? f : x)) }));
+  const setRel = (detail, r) => setLayout((l) => ensureColumnIds({ ...l, relations: l.relations.map((x) => (x.detail === detail ? r : x)) }));
+  const add = () => { try { setLayout(addDetail(layout, newRole)); setNewRole(""); setErrs([]); } catch (e) { setErrs([e.message]); } };
+  return (
+    <>
+      {Object.entries(columnsByRole || {}).map(([role, cols]) => <datalist key={role} id={`cols-${role}`}>{cols.map((c) => <option key={c} value={c} />)}</datalist>)}
+      {errs.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><b>Fix before adding</b><ul style={{ margin: "6px 0 0 18px" }}>{errs.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
+      <Panel title="Files" sub="Each file is told apart by its name.">
+        <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="stack">
+          {layout.files.map((f) => <FileCard key={f.role} f={f} disabled={dis} columnsByRole={columnsByRole} onChange={(n) => setFile(f.role, n)} onRemove={() => setLayout(removeDetail(layout, f.role))} />)}
+          <div className="row" style={{ gap: 6 }}>
+            <input aria-label="New detail file role" className="input mono" value={newRole} onChange={(e) => setNewRole(e.target.value.trim())} placeholder="role name, e.g. details" />
+            <button type="button" className="btn" disabled={!newRole} onClick={add}>+ Add a detail file</button>
+          </div>
+        </div></fieldset>
+      </Panel>
+      {layout.relations.length > 0 && (
+        <Panel title="How the files join" sub="Rows are matched on the columns you pick. The joined file keeps the main file's order.">
+          <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="stack">
+            {layout.relations.map((r) => <RelationCard key={r.detail} r={r} disabled={dis} columnsByRole={columnsByRole} onChange={(n) => setRel(r.detail, n)} />)}
+          </div></fieldset>
+        </Panel>)}
+      <Panel title="When a delivery is complete" sub="What the platform waits for before it starts the join.">
+        <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><ReadinessCard ready={ready} onChange={setReady} layout={layout} /></fieldset>
+      </Panel>
+    </>
   );
 }
 
@@ -248,7 +293,6 @@ function Editor({ sourceId, data, persona, reload }) {
   const baseReady = data.draft ? data.readiness_draft || emptyReadiness() : data.readiness || emptyReadiness();
   const [layout, setLayout] = useState(() => ensureColumnIds(baseLayout));
   const [ready, setReady] = useState(() => ({ ...emptyReadiness(), ...clone(baseReady) }));
-  const [newRole, setNewRole] = useState("");
   const [errs, setErrs] = useState([]);
   const [busy, setBusy] = useState(false);
   const [dialog, ask] = useDialog();
@@ -258,9 +302,6 @@ function Editor({ sourceId, data, persona, reload }) {
   const canDecide = canCap(persona, "approveDelivery") && persona.id !== data.proposed_by;
   const dirty = changed(stripClientIds(layout), baseLayout) || changed(ready, { ...emptyReadiness(), ...baseReady });
   const problems = useMemo(() => validateLayoutForm(layout, ready), [layout, ready]);
-  const setFile = (role, f) => setLayout((l) => ({ ...l, files: l.files.map((x) => (x.role === role ? f : x)) }));
-  const setRel = (detail, r) => setLayout((l) => ensureColumnIds({ ...l, relations: l.relations.map((x) => (x.detail === detail ? r : x)) }));
-  const add = () => { try { setLayout(addDetail(layout, newRole)); setNewRole(""); } catch (e) { setErrs([e.message]); } };
   const propose = async () => {
     const e = validateLayoutForm(layout, ready);
     setErrs(e);
@@ -294,24 +335,7 @@ function Editor({ sourceId, data, persona, reload }) {
             <ul style={{ margin: "6px 0 0 18px" }}>{(errs.length ? errs : problems).map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
         </div>
       </Panel>
-      <Panel title="Files" sub="Each file is told apart by its name.">
-        <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="stack">
-          {layout.files.map((f) => <FileCard key={f.role} f={f} disabled={dis} onChange={(n) => setFile(f.role, n)} onRemove={() => setLayout(removeDetail(layout, f.role))} />)}
-          <div className="row" style={{ gap: 6 }}>
-            <input aria-label="New detail file role" className="input mono" value={newRole} onChange={(e) => setNewRole(e.target.value.trim())} placeholder="role name, e.g. details" />
-            <button type="button" className="btn" disabled={!newRole} onClick={add}>+ Add a detail file</button>
-          </div>
-        </div></fieldset>
-      </Panel>
-      {layout.relations.length > 0 && (
-        <Panel title="How the files join" sub="Rows are matched on the columns you pick. The joined file keeps the main file's order.">
-          <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><div className="stack">
-            {layout.relations.map((r) => <RelationCard key={r.detail} r={r} disabled={dis} onChange={(n) => setRel(r.detail, n)} />)}
-          </div></fieldset>
-        </Panel>)}
-      <Panel title="When a delivery is complete" sub="What the platform waits for before it starts the join.">
-        <fieldset disabled={dis} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}><ReadinessCard ready={ready} onChange={setReady} layout={layout} /></fieldset>
-      </Panel>
+      <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={setReady} disabled={dis} />
       <PreviewPanel sourceId={sourceId} layout={layout} ready={ready} canEdit={canEdit} />
       <span className="faint" style={{ fontSize: ".78rem" }}>Mode: {human(layout.relations.map((r) => r.mode).join(", ") || "none")}. Names in the joined table: main-file columns keep their names, detail columns appear as role.column, summaries use the name you give them.</span>
       {dialog}

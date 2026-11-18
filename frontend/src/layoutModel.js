@@ -213,3 +213,37 @@ export function stripClientIds(layout) {
   for (const r of out.relations || []) for (const c of r.aggregate?.columns || []) delete c._id;
   return out;
 }
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** A file-name regex for a sample file: an 8-digit date becomes a named group, anything else must match exactly. */
+export function guessPattern(filename) {
+  const name = String(filename || "");
+  const m = /\d{8}/.exec(name);
+  if (!m) return escapeRegex(name);
+  return `${escapeRegex(name.slice(0, m.index))}(?P<date>\\d{8})${escapeRegex(name.slice(m.index + 8))}`;
+}
+
+/** A first layout for sample files: roles = [{role, filename, columns}]. The master is required and keyed on its first id-like column (loan_id, LoanID);
+ * each detail joins the master as a one-to-one merge on the columns the two files share by name (empty when none). */
+export function starterLayout(roles, masterRole) {
+  const list = roles || [];
+  const master = list.find((r) => r.role === masterRole) || list[0];
+  const mcols = master?.columns || [];
+  const key = mcols.find((c) => /(^|_)id$/i.test(c) || /[a-z](ID|Id)$/.test(c)) || mcols[0];
+  const layout = {
+    files: [{ role: masterRole, name_pattern: guessPattern(master?.filename), required: true, entity: "", key: key ? [key] : [], parse_options: {} }],
+    relations: [],
+  };
+  for (const d of list) {
+    if (d === master) continue;
+    layout.files.push({ role: d.role, name_pattern: guessPattern(d.filename), required: true, parse_options: {} });
+    const rel = newRelation(d.role);
+    rel.to = masterRole;
+    const shared = (d.columns || []).filter((c) => mcols.includes(c));
+    const pick = shared.includes(key) ? key : shared[0];
+    rel.on = pick ? [{ parent: pick, detail: pick }] : [];
+    layout.relations.push(rel);
+  }
+  return layout;
+}

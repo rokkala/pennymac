@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
   emptyLayout, emptyReadiness, addDetail, validateLayoutForm, groupColumnsByRole, setStatusLabel, missingRoles,
-  matchRateBadge, previewTrust, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
+  matchRateBadge, previewTrust, guessPattern, starterLayout, joinCodeText, isJoinException, canAcknowledgeJoin, filesToSend, ensureColumnIds, stripClientIds,
 } from "./layoutModel.js";
 
 const valid = () => {
@@ -238,5 +238,49 @@ describe("client column ids", () => {
     assert.deepEqual(ensureColumnIds(withIds).relations[0].aggregate.columns.map((c) => c._id), ids);
     assert.deepEqual(stripClientIds(withIds), l);
     assert.equal(l.relations[0].aggregate.columns[0]._id, undefined);
+  });
+});
+
+describe("guessPattern", () => {
+  it("turns an 8-digit date into a named group", () => {
+    assert.equal(guessPattern("loans_20261117.csv"), "loans_(?P<date>\\d{8})\\.csv");
+    assert.ok(new RegExp(guessPattern("loans_20261117.csv").replace("(?P<", "(?<")).test("loans_20261118.csv"));
+  });
+  it("uses an escaped exact-name regex when there is no date", () => {
+    assert.equal(guessPattern("loans.csv"), "loans\\.csv");
+  });
+  it("escapes regex metacharacters", () => {
+    const p = guessPattern("a+b (1).csv");
+    assert.ok(new RegExp(`^${p}$`).test("a+b (1).csv"));
+    assert.ok(!new RegExp(`^${p}$`).test("aab 1.csv"));
+  });
+});
+
+describe("starterLayout", () => {
+  const roles = [
+    { role: "master", filename: "loans_20261117.csv", columns: ["Name", "LoanID", "Balance"] },
+    { role: "details", filename: "details_20261117.csv", columns: ["Fee", "LoanID", "Kind"] },
+    { role: "notes", filename: "notes_20261117.csv", columns: ["Text", "Other"] },
+  ];
+  it("makes the master required with an id-like key", () => {
+    const l = starterLayout(roles, "master");
+    const m = l.files.find((f) => f.role === "master");
+    assert.equal(m.required, true);
+    assert.deepEqual(m.key, ["LoanID"]);
+    assert.equal(m.name_pattern, "loans_(?P<date>\\d{8})\\.csv");
+  });
+  it("falls back to the first column for the key", () => {
+    const l = starterLayout([{ role: "master", filename: "m.csv", columns: ["A", "B"] }], "master");
+    assert.deepEqual(l.files[0].key, ["A"]);
+  });
+  it("builds one merge relation per detail and guesses on from shared columns", () => {
+    const l = starterLayout(roles, "master");
+    assert.equal(l.files.length, 3);
+    assert.equal(l.relations.length, 2);
+    const r = l.relations.find((x) => x.detail === "details");
+    assert.equal(r.to, "master"); assert.equal(r.mode, "merge"); assert.equal(r.join, "left"); assert.equal(r.cardinality, "one");
+    assert.deepEqual(r.on, [{ parent: "LoanID", detail: "LoanID" }]);
+    assert.deepEqual(l.relations.find((x) => x.detail === "notes").on, []);
+    assert.ok(l.files.find((f) => f.role === "details").name_pattern.startsWith("details_"));
   });
 });

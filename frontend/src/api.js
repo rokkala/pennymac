@@ -75,6 +75,30 @@ export const previewJoin = (sourceId, layout, readiness, filesByRole) => {
   form.append("readiness", JSON.stringify(readiness || {}));
   return api(`/api/sources/${enc(sourceId)}/layout/preview`, { method: "POST", form });
 };
+const roleForm = (filesByRole) => {
+  const form = new FormData();
+  Object.entries(filesByRole || {}).forEach(([role, file]) => { if (file) form.append(role, file, file.name); });
+  return form;
+};
+/** Sample files of a feed that does not exist yet. filesByRole: {role: File} → {role: {columns, rows_sampled, format}}. Nothing is stored. */
+export const inspectMultiFiles = (filesByRole) => api("/api/multi-file-feeds/inspect", { method: "POST", form: roleForm(filesByRole) });
+/** Dry-run join for a layout with no feed yet; problems come back as `errors` on a normal response. */
+export const previewMultiFiles = (layout, readiness, filesByRole) => {
+  const form = roleForm(filesByRole);
+  form.append("layout", JSON.stringify(layout));
+  form.append("readiness", JSON.stringify(readiness || {}));
+  return api("/api/multi-file-feeds/preview", { method: "POST", form });
+};
+/** Creates the feed, its vendor link and a draft mapping from the sample files; the layout waits for approval. */
+export const createMultiFileFeed = ({ name, description, vendorId, layout, readiness, filesByRole }) => {
+  const form = roleForm(filesByRole);
+  form.append("name", name);
+  form.append("description", description || "");
+  if (vendorId) form.append("vendor_id", vendorId);
+  form.append("layout", JSON.stringify(layout));
+  form.append("readiness", JSON.stringify(readiness || {}));
+  return api("/api/multi-file-feeds", { method: "POST", form });
+};
 export const listFileSets = (params = {}) => {
   const q = Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== "").map(([k, v]) => `${k}=${enc(v)}`).join("&");
   return api(`/api/file-sets${q ? `?${q}` : ""}`);

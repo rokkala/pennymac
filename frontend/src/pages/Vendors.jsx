@@ -1,10 +1,12 @@
 import React, { useState } from "react";
-import { api, scoped, archiveFeed, restoreFeed, deleteFeed } from "../api.js";
+import { api, scoped, archiveFeed, restoreFeed, deleteFeed, inspectMultiFiles, previewMultiFiles, createMultiFileFeed } from "../api.js";
 import { canCap } from "../roles.js";
 import { canArchive, canRestore, canDelete, splitFeeds, archivedLine, RESTORE_NOTE } from "../lifecycleModel.js";
 import { useApi, useAction, Panel, Status, Modal, Loading, Tabs, Kpis, fmt, ago, human, Tier, Field, PageHeader, ActionBar, useDialog } from "../ui.jsx";
 import { FeedConfigChip } from "./FeedConfig.jsx";
 import { BatchModal } from "./Imports.jsx";
+import { LayoutEditor, PreviewResult } from "./FeedLayout.jsx";
+import { emptyReadiness, starterLayout, validateLayoutForm, roleNameOk, filesToSend, stripClientIds, ensureColumnIds } from "../layoutModel.js";
 
 export const VENDOR_TYPES = { correspondent: "Correspondent", bulk_seller: "Bulk seller", sub_servicer: "Sub-servicer", retail: "Retail channel", other: "Other" };
 const LT = { full: "full tapes", incremental: "change files", snapshot: "snapshots" };
@@ -41,7 +43,7 @@ export function VendorModal({ initial, onClose, onSaved }) {
   );
 }
 
-export function FeedModal({ vendor, onClose, onCreated }) {
+function OneFileFeed({ vendor, onClose, onCreated, modeSwitch }) {
   const [name, setName] = useState("");
   const [file, setFile] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -55,6 +57,7 @@ export function FeedModal({ vendor, onClose, onCreated }) {
   };
   return (
     <Modal title={`Add a feed for ${vendor.name}`} onClose={onClose} footer={<button className="btn primary" disabled={!name || !file || busy} onClick={go}>{busy ? "Profiling…" : "Profile and suggest mappings"}</button>}>
+      {modeSwitch}
       <p className="muted">A feed is one file layout this vendor sends (for example a boarding tape, a daily change file or a monthly snapshot). Each feed has its own mapping, delivery profile and schedule. Upload a sample: IntelliMap profiles every column, flags PII and proposes the mapping to SSE.</p>
       <label className="stack" style={{ gap: 4 }} htmlFor="fd-name"><span className="eyebrow">Feed name</span>
         <input id="fd-name" className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Boarding tape, Daily changes" /></label>
@@ -62,6 +65,120 @@ export function FeedModal({ vendor, onClose, onCreated }) {
         <input id="fd-file" type="file" accept=".csv,.txt,.xlsx,.dat,.psv" onChange={(e) => setFile(e.target.files[0])} /></label>
     </Modal>
   );
+}
+
+
+const nextRole = (taken) => { for (let i = 1; ; i++) { const r = i === 1 ? "details" : `details${i}`; if (!taken.includes(r)) return r; } };
+const SAMPLE_ACCEPT = ".csv,.txt,.xlsx,.dat,.psv";
+
+function ModeSwitch({ mode, setMode }) {
+  return (
+    <div className="row" role="group" aria-label="How many files does this feed have" style={{ gap: 4 }}>
+      {[["one", "One file"], ["several", "Several files"]].map(([k, t]) => <button key={k} type="button" className={`btn sm ${mode === k ? "primary" : ""}`} aria-pressed={mode === k} onClick={() => setMode(k)}>{t}</button>)}
+    </div>
+  );
+}
+
+/** Add a feed from sample files: one main file plus detail files, joined before anything loads. */
+function SeveralFilesFeed({ vendor, onClose, onCreated, modeSwitch }) {
+  const [name, setName] = useState("");
+  const [slots, setSlots] = useState([{ id: 1, role: "master", file: null, info: null, err: "" }, { id: 2, role: "details", file: null, info: null, err: "" }]);
+  const [layout, setLayoutState] = useState(null);
+  const [ready, setReady] = useState(emptyReadiness());
+  const [check, setCheck] = useState(null);
+  const [busy, setBusy] = useState("");
+  const [created, setCreated] = useState(false);
+  const act = useAction();
+  const setLayout = (u) => { setLayoutState((l) => ensureColumnIds(typeof u === "function" ? u(l) : u)); setCheck(null); };
+  const patch = (id, p) => setSlots((xs) => xs.map((x) => (x.id === id ? { ...x, ...p } : x)));
+  const resetLayout = () => { setLayoutState(null); setCheck(null); };
+  const pick = async (slot, file) => {
+    resetLayout();
+    if (!file) { patch(slot.id, { file: null, info: null, err: "" }); return; }
+    patch(slot.id, { file, info: null, err: "" });
+    try {
+      const r = await inspectMultiFiles({ [slot.role || "file"]: file });
+      patch(slot.id, { info: Object.values(r)[0] || null });
+    } catch (e) { patch(slot.id, { err: e.message }); }
+  };
+  const setRole = (slot, v) => { resetLayout(); patch(slot.id, { role: v.trim() }); };
+  const addSlot = () => setSlots((xs) => [...xs, { id: Math.max(...xs.map((x) => x.id)) + 1, role: nextRole(xs.map((x) => x.role)), file: null, info: null, err: "" }]);
+  const removeSlot = (id) => { resetLayout(); setSlots((xs) => xs.filter((x) => x.id !== id)); };
+  const roles = slots.map((x) => x.role);
+  const slotProblems = [
+    ...roles.filter((r, i) => r && roles.indexOf(r) !== i).map((r) => `Two files are called ${r}.`),
+    ...slots.filter((x) => x.role !== "master" && !roleNameOk(x.role)).map((x) => `The file name ${x.role || "(empty)"} is not allowed: use lowercase letters, digits and underscores, starting with a letter.`),
+  ];
+  const filesReady = slots.length >= 2 && slots.every((x) => x.file && x.info) && !slotProblems.length;
+  const columnsByRole = Object.fromEntries(slots.filter((x) => x.info).map((x) => [x.role, x.info.columns]));
+  const setUp = () => {
+    const l = starterLayout(slots.map((x) => ({ role: x.role, filename: x.file.name, columns: x.info.columns })), "master");
+    for (const r of l.relations) if (!r.on.length) r.on = [{ parent: "", detail: "" }]; // no shared column name: show an empty pair to fill in
+    setLayoutState(ensureColumnIds(l)); setCheck(null);
+  };
+  const filesByRole = filesToSend(layout || { files: [] }, Object.fromEntries(slots.map((x) => [x.role, x.file])));
+  const problems = layout ? validateLayoutForm(layout, ready, columnsByRole) : [];
+  const runCheck = async () => {
+    setBusy("check");
+    const r = await act(() => previewMultiFiles(stripClientIds(layout), ready, filesByRole));
+    setBusy("");
+    if (r) setCheck(r);
+  };
+  const checked = !!check && !check.errors?.length;
+  const create = async () => {
+    setBusy("create");
+    const r = await act(() => createMultiFileFeed({ name: name.trim(), vendorId: vendor.vendor_id, layout: stripClientIds(layout), readiness: ready, filesByRole }),
+      "Feed created. The layout needs a second person's approval before files use it.");
+    setBusy("");
+    if (r) { setCreated(true); onCreated(r.mapping_id); }
+  };
+  const minRate = Math.max(0, ...(layout?.relations || []).map((r) => Number(r.min_match_rate) || 0));
+  return (
+    <Modal title={`Add a feed for ${vendor.name}`} onClose={onClose} size="lg"
+      footer={<>
+        <button type="button" className="btn" onClick={onClose}>Cancel</button>
+        {layout && <button type="button" className="btn" disabled={!!busy || created || !!problems.length} onClick={runCheck}>{busy === "check" ? "Joining…" : "Check the join"}</button>}
+        {layout && <button type="button" className="btn primary" disabled={!name.trim() || !checked || !!busy || created || !!problems.length} onClick={create}>{busy === "create" ? "Creating…" : "Create feed and draft mapping"}</button>}
+      </>}>
+      {modeSwitch}
+      <p className="muted">One main file plus detail files, joined into one table before anything loads. Pick one small sample of each. Nothing is stored until you create the feed, and the layout then waits for a second person's approval.</p>
+      <label className="stack" style={{ gap: 4 }} htmlFor="mf-name"><span className="eyebrow">Feed name</span>
+        <input id="mf-name" className="input" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Boarding tape with loan details" /></label>
+      <div className="stack">
+        {slots.map((x) => (
+          <div key={x.id} className="callout stack" style={{ gap: 6 }}>
+            <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+              {x.role === "master"
+                ? <><b className="mono">master</b><span className="pill accent">main file</span></>
+                : <><input aria-label="Detail file role" className="input mono" style={{ width: 160 }} value={x.role} onChange={(e) => setRole(x, e.target.value)} placeholder="role name" /><span className="pill">detail file</span></>}
+              <input aria-label={x.role === "master" ? "Main sample file" : `${x.role || "Detail"} sample file`} type="file" accept={SAMPLE_ACCEPT} onChange={(e) => pick(x, e.target.files[0] || null)} />
+              {x.role !== "master" && slots.length > 2 && <button type="button" className="btn sm" style={{ marginLeft: "auto" }} onClick={() => removeSlot(x.id)}>Remove</button>}
+            </div>
+            {x.err && <div style={{ color: "var(--fail)", fontSize: ".82rem" }}>{x.err}</div>}
+            {x.info && <div className="row" style={{ gap: 4, flexWrap: "wrap" }}><span className="faint" style={{ fontSize: ".78rem" }}>{x.info.columns.length} columns found:</span>
+              {x.info.columns.map((c) => <span key={c} className="chip mono">{c}</span>)}</div>}
+          </div>))}
+        <div><button type="button" className="btn sm" onClick={addSlot}>+ Add a detail file</button></div>
+        {slotProblems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><ul style={{ margin: "0 0 0 18px" }}>{slotProblems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
+        {!layout && <div className="row"><button type="button" className="btn primary" disabled={!filesReady} onClick={setUp}>Set up the join</button>
+          {!filesReady && <span className="faint" style={{ fontSize: ".8rem" }}>Choose a sample for every file first.</span>}</div>}
+      </div>
+      {layout && <>
+        <LayoutEditor layout={layout} setLayout={setLayout} ready={ready} setReady={(r) => { setReady(r); setCheck(null); }} disabled={created} columnsByRole={columnsByRole} />
+        {problems.length > 0 && <div className="callout t5" style={{ fontSize: ".84rem" }}><b>Fix before checking the join</b>
+          <ul style={{ margin: "6px 0 0 18px" }}>{problems.map((e, i) => <li key={i}>{e}</li>)}</ul></div>}
+        {!check && !problems.length && <span className="faint" style={{ fontSize: ".82rem" }}>Run "Check the join" to see how the samples join. You can create the feed once it runs without errors.</span>}
+        <PreviewResult res={check} minRate={minRate} />
+      </>}
+    </Modal>
+  );
+}
+
+export function FeedModal({ vendor, onClose, onCreated }) {
+  const [mode, setMode] = useState("one");
+  const sw = <ModeSwitch mode={mode} setMode={setMode} />;
+  return mode === "one" ? <OneFileFeed vendor={vendor} onClose={onClose} onCreated={onCreated} modeSwitch={sw} />
+    : <SeveralFilesFeed vendor={vendor} onClose={onClose} onCreated={onCreated} modeSwitch={sw} />;
 }
 
 export function VendorList({ persona, onOpen, onCreated }) {
