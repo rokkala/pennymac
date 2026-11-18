@@ -282,11 +282,14 @@ def test_s3_arrival_for_archived_feed_is_rejected(sample_files, monkeypatch):
     boto3 = types.ModuleType("boto3")
     boto3.client = lambda *a, **k: types.SimpleNamespace(head_object=lambda **kw: {"Metadata": {}})
     monkeypatch.setitem(sys.modules, "boto3", boto3)
-    sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parents[2] / "aws" / "lambdas"))
-    try:
-        import handlers
-    finally:
-        sys.path.pop(0)
+    import importlib.util
+    from pathlib import Path
+
+    # load a fresh copy under the stub: a cached `handlers` from another test holds that test's own S3 client
+    spec = importlib.util.spec_from_file_location("handlers", Path(__file__).resolve().parents[2] / "aws" / "lambdas" / "handlers.py")
+    handlers = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "handlers", handlers)
+    spec.loader.exec_module(handlers)
     sid = _live_feed(sample_files)
     lifecycle.archive_feed(sid, "rev", REVIEWER, WHY)
     ev = {"detail": {"bucket": {"name": "raw"}, "object": {"key": f"incoming/{sid}/x_a.csv"}}}
