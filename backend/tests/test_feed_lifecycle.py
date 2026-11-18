@@ -89,6 +89,14 @@ def test_archive_hides_feed_and_pauses_schedule(sample_files):
         lifecycle.archive_feed(sid, "ona", REVIEWER, WHY)
 
 
+def test_vendor_detail_reports_who_archived_the_feed(sample_files):
+    sid = _live_feed(sample_files)
+    lifecycle.archive_feed(sid, "ona", REVIEWER, WHY)
+    vid = _src(sid).vendor_id
+    f = next(x for x in vendor_svc.get_vendor(vid)["feeds"] if x["source_id"] == sid)
+    assert f["status"] == "retired" and f["retired_by"] == "ona" and f["retired_reason"] == WHY and f["retired_at"]
+
+
 @pytest.mark.parametrize("status", ["running", "claimed", "pausing", "waiting", "queued", "staged", "paused"])
 def test_archive_refused_while_batch_in_progress(sample_files, status):
     sid = _live_feed(sample_files)

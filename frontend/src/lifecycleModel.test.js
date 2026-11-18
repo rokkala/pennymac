@@ -38,9 +38,9 @@ describe("canDelete", () => {
 });
 
 describe("canDiscardMapping", () => {
-  it("is for draft or rejected mappings of a feed that is not archived", () => {
+  it("is for draft mappings only, on a feed that is not archived", () => {
     assert.equal(canDiscardMapping(u("onboarding"), { status: "draft" }, { status: "mapping" }), true);
-    assert.equal(canDiscardMapping(u("onboarding"), { status: "rejected" }, { status: "mapping" }), true);
+    assert.equal(canDiscardMapping(u("onboarding"), { status: "rejected" }, { status: "mapping" }), false);
     assert.equal(canDiscardMapping(u("onboarding"), { status: "approved" }, { status: "live" }), false);
     assert.equal(canDiscardMapping(u("onboarding"), { status: "in_review" }, { status: "mapping" }), false);
     assert.equal(canDiscardMapping(u("monitoring"), { status: "draft" }, { status: "mapping" }), false);

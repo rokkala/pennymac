@@ -15,7 +15,7 @@ export const canRestore = (user, feed) => !!feed && archived(feed) && canCap(use
 /** Admin only, and never when the row says the feed has history. The server refuses any feed that was used. */
 export const canDelete = (user, feed) => !!feed && archived(feed) && !feed.has_history && canCap(user, "deleteFeed");
 
-export const canDiscardMapping = (user, mapping, source) => !!mapping && ["draft", "rejected"].includes(mapping.status)
+export const canDiscardMapping = (user, mapping, source) => !!mapping && mapping.status === "draft"
   && !archived(source) && canCap(user, "archiveFeed");
 
 export const splitFeeds = (feeds) => ({ active: (feeds || []).filter((f) => !archived(f)), archived: (feeds || []).filter(archived) });

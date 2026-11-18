@@ -243,6 +243,7 @@ def get_vendor(vendor_id: str) -> dict:
             "last_file": last[f.source_id].isoformat() + "Z" if last.get(f.source_id) else None,
             "columns": len((f.profile or {}).get("columns", [])), "created_by": f.created_by,
             "retired_at": f.retired_at.isoformat() + "Z" if f.retired_at else None, "retired_reason": f.retired_reason,
+            "retired_by": f.retired_by,
             "mappings": [{"mapping_id": m.mapping_id, "version": m.version, "status": m.status,
                           "auto_mapped_pct": (m.stats or {}).get("auto_mapped_pct"), "approved_by": m.approved_by}
                          for m in maps if m.source_id == f.source_id],
