@@ -33,7 +33,8 @@ export function useApi(path, deps = [], { poll } = {}) {
   const [state, setState] = useState({ data: null, error: null, loading: true });
   const load = useCallback(async () => {
     if (!path) { setState({ data: null, error: null, loading: false }); return; }
-    setState((s) => ({ ...s, loading: true, error: null }));
+    // ponytail: keep showing stale data on poll/refresh — avoids home/overview flicker and wasted main-thread work
+    setState((s) => ({ ...s, loading: s.data == null, error: null }));
     try { const data = await api(path); setState({ data, error: null, loading: false }); }
     catch (e) { setState((s) => ({ ...s, error: e.message, loading: false })); }
   }, [path]);

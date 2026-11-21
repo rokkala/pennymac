@@ -128,11 +128,12 @@ function DeliveryWatch({ delivery, persona, onClose, onOpenBatch, go, onChanged 
 
 export default function Overview({ go, persona }) {
   const who = persona || getPersona();
-  const batchesApi = useApi(scoped("/api/batches"), [], { poll: 2000 });
+  const batchesApi = useApi(scoped("/api/batches?days=7"), [], { poll: 2000 });
   const delivApi = useApi(scoped("/api/deliveries?days_back=2&days_ahead=2"), [], { poll: 15000 });
-  const ex = useApi(scoped("/api/analytics/executive"));
-  const ea = useApi(scoped("/api/analytics/exceptions"));
-  const cfg = useApi("/api/config");
+  const [portfolioOpen, setPortfolioOpen] = useState(false);
+  const ex = useApi(portfolioOpen ? scoped("/api/analytics/executive") : null);
+  const ea = useApi(portfolioOpen ? scoped("/api/analytics/exceptions") : null);
+  const cfg = useApi(canCap(who, "demoSetup") ? "/api/config" : null);
   const { data: summary } = useApi(scoped("/api/exceptions/summary"), [], { poll: 15000 });
   const { data: ntf } = useApi("/api/notifications", [who?.id], { poll: 20000 });
   const [batchId, setBatchId] = useState(null);
@@ -325,10 +326,11 @@ export default function Overview({ go, persona }) {
         )}
       </section>
 
-      {e && a && (
-        <details className="panel" style={{ padding: "12px 16px" }}>
-          <summary style={{ cursor: "pointer", fontWeight: 600 }}>Portfolio signal</summary>
-          <p className="faint" style={{ fontSize: ".84rem", margin: "6px 0 12px" }}>Executive KPIs and exception charts — deep dive stays on Analytics.</p>
+      <details className="panel" style={{ padding: "12px 16px" }} onToggle={(ev) => setPortfolioOpen(ev.currentTarget.open)}>
+        <summary style={{ cursor: "pointer", fontWeight: 600 }}>Portfolio signal</summary>
+        <p className="faint" style={{ fontSize: ".84rem", margin: "6px 0 12px" }}>Executive KPIs and exception charts — deep dive stays on Analytics.</p>
+        {!portfolioOpen ? null : (!e || !a ? <Loading error={ex.error || ea.error} /> : (
+          <>
           <Kpis items={[
             { label: "Loans boarded", value: fmt(e.loans_boarded_total), detail: `${fmtMoney(e.upb_boarded)} UPB` },
             { label: "Straight-through", value: `${fmt(e.straight_through_rate, 1)}%`, detail: `of ${fmt(e.loans_processed)} processed` },
@@ -368,8 +370,9 @@ export default function Overview({ go, persona }) {
               <HBars items={Object.entries(e.by_investor).sort((x, y) => y[1] - x[1]).map(([k, v]) => ({ label: k, value: v }))} color="var(--chart-3)" />
             </Panel>
           </div>
-        </details>
-      )}
+          </>
+        ))}
+      </details>
 
       {batchId && (
         <BatchModal
